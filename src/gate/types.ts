@@ -10,11 +10,52 @@
 // Gate behaviors
 // ---------------------------------------------------------------------------
 
+/**
+ * Token-bucket configuration for the `rate_limit` behavior.
+ *
+ * Each matching event consumes one token; events that arrive with an empty
+ * bucket are denied (decision: trigger=false). Tokens regenerate at one per
+ * `refillIntervalMs`, capped at `tokens`. Buckets are partitioned by the
+ * value of `keyBy` resolved against event metadata — so a per-user limit
+ * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`,
+ * etc. With no `keyBy` (or when the resolved value is missing), one shared
+ * bucket is used for the policy.
+ */
+export interface RateLimitConfig {
+  /** Max bucket capacity, also the initial fill. Must be > 0. */
+  tokens: number;
+  /** Milliseconds between token regenerations. Must be > 0. */
+  refillIntervalMs: number;
+  /**
+   * Metadata field name to partition buckets by. If absent or the metadata
+   * field is missing on a given event, all events share one bucket.
+   */
+  keyBy?: string;
+}
+
+/**
+ * Counter configuration for the `passive_sample` behavior.
+ *
+ * Increments a counter on every match. When the counter reaches `every`,
+ * the policy fires (trigger=true) and the counter resets to zero. Useful
+ * for "decide whether to act every Nth observation" — chat passive
+ * sampling, periodic analysis of sensor streams, etc. Counters are
+ * partitioned by `keyBy` the same way `rate_limit` buckets are.
+ */
+export interface PassiveSampleConfig {
+  /** Trigger every N-th match. Must be > 0. */
+  every: number;
+  /** Optional metadata field name for separate per-key counters. */
+  keyBy?: string;
+}
+
 /** How a matching policy affects inference triggering. */
 export type GateBehavior =
   | 'always'    // Trigger inference immediately
   | 'skip'      // Don't trigger inference (event still enters context)
-  | { debounce: number };  // Batch events per-policy, deliver after delay (ms)
+  | { debounce: number }                  // Batch events per-policy, deliver after delay (ms)
+  | { rate_limit: RateLimitConfig }       // Token bucket per `keyBy`; deny when empty
+  | { passive_sample: PassiveSampleConfig };  // Fire every Nth match
 
 // ---------------------------------------------------------------------------
 // Policy match criteria
@@ -40,6 +81,13 @@ export interface GatePolicyMatch {
    * Supports `*` wildcard; not full gitignore syntax.
    */
   pathGlob?: string;
+  /**
+   * Match when ANY listed metadata field is truthy (Boolean(metadata[name])).
+   * Useful for OR-ing flag-style metadata, e.g.:
+   *   metadataTrue: ["isMention", "isPrivate", "isReplyToBot"]
+   * matches if any of those is set. Empty/omitted = no metadata constraint.
+   */
+  metadataTrue?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +99,13 @@ export interface GatePolicy {
   name: string;
   match: GatePolicyMatch;
   behavior: GateBehavior;
+  /**
+   * Names of other policies whose state to clear when THIS policy fires
+   * (decision.trigger === true). Lets you express interactions like "a
+   * direct invocation should reset the passive-sample counter", without
+   * coupling the behaviors to each other in code. Unknown names are ignored.
+   */
+  resets?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +167,16 @@ export interface GatePolicyStats {
   debounceState?: {
     pendingCount: number;
     nextDeliveryMs: number | null;
+  };
+  /** Present for `rate_limit` behaviors. */
+  rateLimitState?: {
+    bucketCount: number;
+    deniedCount: number;
+  };
+  /** Present for `passive_sample` behaviors. */
+  passiveSampleState?: {
+    counterCount: number;
+    fireCount: number;
   };
 }
 
