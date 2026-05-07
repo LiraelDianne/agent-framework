@@ -147,6 +147,17 @@ function formatBehavior(b: import('./types.js').GateBehavior): string {
   return 'unknown';
 }
 
+/**
+ * Stable fingerprint for a GateBehavior, used during reload to detect
+ * config changes that invalidate per-policy state. JSON.stringify is
+ * deterministic for our small, flat behavior shapes — keys appear in
+ * declaration order — so this is enough to spot any change in tokens,
+ * refillIntervalMs, keyBy, every, or debounce duration.
+ */
+function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
+  return typeof b === 'string' ? b : JSON.stringify(b);
+}
+
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
@@ -455,35 +466,37 @@ export class EventGate {
       const newConfig = this.loadConfig();
       if (!newConfig) return; // Parse error — keep previous config
 
-      // Clean up debounce timers for removed policies
+      // Capture old policies' behavior fingerprints before any state
+      // mutation — needed to detect kept policies whose parameters changed.
+      const oldBehaviorByName = new Map<string, string>();
+      for (const p of this.config.policies) {
+        oldBehaviorByName.set(p.name, behaviorFingerprint(p.behavior));
+      }
+
+      // Clean up state for REMOVED policies (gone from new config entirely).
       const newPolicyNames = new Set(newConfig.policies.map(p => p.name));
-      for (const [name, state] of this.debounceTimers) {
-        if (!newPolicyNames.has(name)) {
-          clearTimeout(state.timer);
-          if (state.events.length > 0) {
-            this.deliverEvents(state.events);
-          }
-          this.debounceTimers.delete(name);
+      const removedPolicies: string[] = [];
+      for (const oldName of oldBehaviorByName.keys()) {
+        if (!newPolicyNames.has(oldName)) {
+          this.clearPolicyState(oldName, { deliverPendingDebounce: true });
+          this.stats.delete(oldName);
+          removedPolicies.push(oldName);
         }
       }
 
-      // Reset stats and per-policy state for removed policies
-      for (const name of this.stats.keys()) {
-        if (!newPolicyNames.has(name)) {
-          this.stats.delete(name);
+      // Clean up state for KEPT policies whose behavior parameters changed.
+      // Without this, a tokens 100→5 edit (or keyBy switch, or every 10→3,
+      // etc.) wouldn't take effect until existing buckets/counters drained.
+      // Stats are preserved — matchCount is historical, not live state.
+      const stateClearedPolicies: string[] = [];
+      for (const newPolicy of newConfig.policies) {
+        const oldHash = oldBehaviorByName.get(newPolicy.name);
+        if (oldHash === undefined) continue; // new policy, no state to clear
+        const newHash = behaviorFingerprint(newPolicy.behavior);
+        if (oldHash !== newHash) {
+          this.clearPolicyState(newPolicy.name, { deliverPendingDebounce: true });
+          stateClearedPolicies.push(newPolicy.name);
         }
-      }
-      for (const name of this.rateLimitBuckets.keys()) {
-        if (!newPolicyNames.has(name)) this.rateLimitBuckets.delete(name);
-      }
-      for (const name of this.passiveSampleCounters.keys()) {
-        if (!newPolicyNames.has(name)) this.passiveSampleCounters.delete(name);
-      }
-      for (const name of this.rateLimitDenied.keys()) {
-        if (!newPolicyNames.has(name)) this.rateLimitDenied.delete(name);
-      }
-      for (const name of this.passiveSampleFires.keys()) {
-        if (!newPolicyNames.has(name)) this.passiveSampleFires.delete(name);
       }
 
       this.config = newConfig;
@@ -494,6 +507,9 @@ export class EventGate {
         type: 'gate:config-reloaded',
         configPath: this.configPath,
         policyCount: newConfig.policies.length,
+        removedPolicies: removedPolicies.length > 0 ? removedPolicies : undefined,
+        stateClearedPolicies:
+          stateClearedPolicies.length > 0 ? stateClearedPolicies : undefined,
         timestamp: now,
       });
     } catch {
@@ -749,6 +765,31 @@ export class EventGate {
       this.rateLimitBuckets.delete(target);
       this.passiveSampleCounters.delete(target);
     }
+  }
+
+  /**
+   * Clear ALL per-policy state (debounce timer, rate-limit buckets,
+   * passive-sample counters, denial / fire counters) for one policy.
+   * Used by reloadIfChanged when a policy is removed or its behavior
+   * params change. Stats (matchCount, lastMatchTimestamp) are preserved
+   * — those are historical and shouldn't reset on a config edit.
+   */
+  private clearPolicyState(
+    name: string,
+    options: { deliverPendingDebounce: boolean },
+  ): void {
+    const debounce = this.debounceTimers.get(name);
+    if (debounce) {
+      clearTimeout(debounce.timer);
+      if (options.deliverPendingDebounce && debounce.events.length > 0) {
+        this.deliverEvents(debounce.events);
+      }
+      this.debounceTimers.delete(name);
+    }
+    this.rateLimitBuckets.delete(name);
+    this.passiveSampleCounters.delete(name);
+    this.rateLimitDenied.delete(name);
+    this.passiveSampleFires.delete(name);
   }
 
   // =========================================================================
