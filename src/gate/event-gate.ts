@@ -71,6 +71,17 @@ interface DebounceState {
   events: PendingEvent[];
 }
 
+/** Token bucket for one (policy, key) pair under a rate_limit behavior. */
+interface RateBucket {
+  /** Tokens currently available. */
+  tokens: number;
+  /** Last epoch-ms timestamp the bucket was refilled. */
+  lastRefill: number;
+}
+
+/** Synthetic key used when a policy has no `keyBy` or the field is missing. */
+const SHARED_BUCKET_KEY = '__shared__';
+
 interface CompiledPolicy {
   policy: GatePolicy;
   filterRegex?: RegExp;
@@ -105,6 +116,46 @@ function compileGlob(pattern: string): RegExp {
     return new RegExp('^' + escaped + '$');
   }
   return new RegExp('^' + escaped.replace(/\*/g, '.*') + '$');
+}
+
+/**
+ * Truthiness for `metadataTrue` matching. Stricter than JS `Boolean(x)`:
+ * empty strings, empty arrays, and empty objects all count as false, so
+ * `metadataTrue: ["mentionIds"]` doesn't match every event that happens
+ * to carry an empty `mentionIds: []` array.
+ */
+function isMetadataTruthy(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return Boolean(value);
+}
+
+/** Compact, log-friendly serialization of a GateBehavior. */
+function formatBehavior(b: import('./types.js').GateBehavior): string {
+  if (typeof b === 'string') return b;
+  if ('debounce' in b) return `debounce:${b.debounce}`;
+  if ('rate_limit' in b) {
+    const k = b.rate_limit.keyBy ? `,keyBy:${b.rate_limit.keyBy}` : '';
+    return `rate_limit:${b.rate_limit.tokens}/${b.rate_limit.refillIntervalMs}ms${k}`;
+  }
+  if ('passive_sample' in b) {
+    const k = b.passive_sample.keyBy ? `,keyBy:${b.passive_sample.keyBy}` : '';
+    return `passive_sample:${b.passive_sample.every}${k}`;
+  }
+  return 'unknown';
+}
+
+/**
+ * Stable fingerprint for a GateBehavior, used during reload to detect
+ * config changes that invalidate per-policy state. JSON.stringify is
+ * deterministic for our small, flat behavior shapes — keys appear in
+ * declaration order — so this is enough to spot any change in tokens,
+ * refillIntervalMs, keyBy, every, or debounce duration.
+ */
+function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
+  return typeof b === 'string' ? b : JSON.stringify(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +201,10 @@ function validatePolicy(raw: unknown): GatePolicy {
     behavior = obj.behavior;
   } else if (obj.behavior && typeof obj.behavior === 'object') {
     const b = obj.behavior as Record<string, unknown>;
-    if (typeof b.debounce === 'number' && b.debounce > 0) {
+    if ('debounce' in b) {
+      if (typeof b.debounce !== 'number' || b.debounce <= 0) {
+        throw new Error(`Policy "${obj.name}": debounce must be a positive number`);
+      }
       if (b.debounce < MIN_DEBOUNCE_MS) {
         throw new Error(`Policy "${obj.name}": debounce must be >= ${MIN_DEBOUNCE_MS}ms, got ${b.debounce}`);
       }
@@ -158,8 +212,42 @@ function validatePolicy(raw: unknown): GatePolicy {
         throw new Error(`Policy "${obj.name}": debounce must be <= ${MAX_DEBOUNCE_MS}ms, got ${b.debounce}`);
       }
       behavior = { debounce: b.debounce };
+    } else if ('rate_limit' in b) {
+      const rl = b.rate_limit;
+      if (!rl || typeof rl !== 'object') {
+        throw new Error(`Policy "${obj.name}": rate_limit must be an object`);
+      }
+      const conf = rl as Record<string, unknown>;
+      if (typeof conf.tokens !== 'number' || !Number.isFinite(conf.tokens) || conf.tokens <= 0) {
+        throw new Error(`Policy "${obj.name}": rate_limit.tokens must be a positive number`);
+      }
+      if (typeof conf.refillIntervalMs !== 'number' || !Number.isFinite(conf.refillIntervalMs) || conf.refillIntervalMs <= 0) {
+        throw new Error(`Policy "${obj.name}": rate_limit.refillIntervalMs must be a positive number`);
+      }
+      const out: { tokens: number; refillIntervalMs: number; keyBy?: string } = {
+        tokens: conf.tokens,
+        refillIntervalMs: conf.refillIntervalMs,
+      };
+      if (typeof conf.keyBy === 'string' && conf.keyBy.length > 0) {
+        out.keyBy = conf.keyBy;
+      }
+      behavior = { rate_limit: out };
+    } else if ('passive_sample' in b) {
+      const ps = b.passive_sample;
+      if (!ps || typeof ps !== 'object') {
+        throw new Error(`Policy "${obj.name}": passive_sample must be an object`);
+      }
+      const conf = ps as Record<string, unknown>;
+      if (typeof conf.every !== 'number' || !Number.isInteger(conf.every) || conf.every <= 0) {
+        throw new Error(`Policy "${obj.name}": passive_sample.every must be a positive integer`);
+      }
+      const out: { every: number; keyBy?: string } = { every: conf.every };
+      if (typeof conf.keyBy === 'string' && conf.keyBy.length > 0) {
+        out.keyBy = conf.keyBy;
+      }
+      behavior = { passive_sample: out };
     } else {
-      throw new Error(`Policy "${obj.name}": debounce must be a positive number`);
+      throw new Error(`Policy "${obj.name}": unknown behavior — expected always | skip | { debounce } | { rate_limit } | { passive_sample }`);
     }
   } else {
     behavior = 'always';
@@ -174,6 +262,10 @@ function validatePolicy(raw: unknown): GatePolicy {
     if (typeof m.channel === 'string') match.channel = m.channel;
     if (typeof m.mount === 'string') match.mount = m.mount;
     if (typeof m.pathGlob === 'string') match.pathGlob = m.pathGlob;
+    if (Array.isArray(m.metadataTrue)) {
+      const fields = m.metadataTrue.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      if (fields.length > 0) match.metadataTrue = fields;
+    }
     if (m.filter && typeof m.filter === 'object') {
       const f = m.filter as Record<string, unknown>;
       if ((f.type === 'text' || f.type === 'regex') && typeof f.pattern === 'string') {
@@ -187,7 +279,17 @@ function validatePolicy(raw: unknown): GatePolicy {
     }
   }
 
-  return { name: obj.name, match, behavior };
+  // Validate resets (optional list of policy names; unknown names are ignored
+  // at runtime so reload races don't blow up).
+  let resets: string[] | undefined;
+  if (Array.isArray(obj.resets)) {
+    const names = obj.resets.filter((s): s is string => typeof s === 'string' && s.length > 0);
+    if (names.length > 0) resets = names;
+  }
+
+  const policy: GatePolicy = { name: obj.name, match, behavior };
+  if (resets) policy.resets = resets;
+  return policy;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +309,14 @@ export class EventGate {
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
 
+  // Rate-limit state — policy name → key → bucket.
+  private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
+  // Passive-sample state — policy name → key → counter (count since last fire).
+  private passiveSampleCounters = new Map<string, Map<string, number>>();
+  // Per-policy denial / fire counters for status reporting.
+  private rateLimitDenied = new Map<string, number>();
+  private passiveSampleFires = new Map<string, number>();
+
   // Inference buffering
   private inferring = new Set<string>();
   private inferenceBuffer: PendingEvent[] = [];
@@ -225,6 +335,9 @@ export class EventGate {
   private addMessageFn: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string) => void;
   private getAgentNamesFn: () => string[];
+  /** Clock injection — keeps the new rate_limit / passive_sample paths
+   *  testable without monkey-patching Date.now globally. */
+  private now: () => number;
 
   constructor(opts: {
     configPath: string;
@@ -233,12 +346,15 @@ export class EventGate {
     addMessage: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
     requestInference: (agentName: string, reason: string, source: string) => void;
     getAgentNames: () => string[];
+    /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
+    now?: () => number;
   }) {
     this.configPath = opts.configPath;
     this.emitTrace = opts.emitTrace;
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.now = opts.now ?? (() => Date.now());
 
     // Seed or reconcile the on-disk config.
     //
@@ -350,22 +466,36 @@ export class EventGate {
       const newConfig = this.loadConfig();
       if (!newConfig) return; // Parse error — keep previous config
 
-      // Clean up debounce timers for removed policies
+      // Capture old policies' behavior fingerprints before any state
+      // mutation — needed to detect kept policies whose parameters changed.
+      const oldBehaviorByName = new Map<string, string>();
+      for (const p of this.config.policies) {
+        oldBehaviorByName.set(p.name, behaviorFingerprint(p.behavior));
+      }
+
+      // Clean up state for REMOVED policies (gone from new config entirely).
       const newPolicyNames = new Set(newConfig.policies.map(p => p.name));
-      for (const [name, state] of this.debounceTimers) {
-        if (!newPolicyNames.has(name)) {
-          clearTimeout(state.timer);
-          if (state.events.length > 0) {
-            this.deliverEvents(state.events);
-          }
-          this.debounceTimers.delete(name);
+      const removedPolicies: string[] = [];
+      for (const oldName of oldBehaviorByName.keys()) {
+        if (!newPolicyNames.has(oldName)) {
+          this.clearPolicyState(oldName, { deliverPendingDebounce: true });
+          this.stats.delete(oldName);
+          removedPolicies.push(oldName);
         }
       }
 
-      // Reset stats for removed policies
-      for (const name of this.stats.keys()) {
-        if (!newPolicyNames.has(name)) {
-          this.stats.delete(name);
+      // Clean up state for KEPT policies whose behavior parameters changed.
+      // Without this, a tokens 100→5 edit (or keyBy switch, or every 10→3,
+      // etc.) wouldn't take effect until existing buckets/counters drained.
+      // Stats are preserved — matchCount is historical, not live state.
+      const stateClearedPolicies: string[] = [];
+      for (const newPolicy of newConfig.policies) {
+        const oldHash = oldBehaviorByName.get(newPolicy.name);
+        if (oldHash === undefined) continue; // new policy, no state to clear
+        const newHash = behaviorFingerprint(newPolicy.behavior);
+        if (oldHash !== newHash) {
+          this.clearPolicyState(newPolicy.name, { deliverPendingDebounce: true });
+          stateClearedPolicies.push(newPolicy.name);
         }
       }
 
@@ -377,6 +507,9 @@ export class EventGate {
         type: 'gate:config-reloaded',
         configPath: this.configPath,
         policyCount: newConfig.policies.length,
+        removedPolicies: removedPolicies.length > 0 ? removedPolicies : undefined,
+        stateClearedPolicies:
+          stateClearedPolicies.length > 0 ? stateClearedPolicies : undefined,
         timestamp: now,
       });
     } catch {
@@ -445,6 +578,15 @@ export class EventGate {
       }
     }
 
+    // Metadata-truthy check — match if ANY listed field is truthy.
+    // Uses isMetadataTruthy so empty arrays / strings / objects are treated
+    // as falsy (matches user expectation, not raw JS Boolean coercion).
+    if (match.metadataTrue && match.metadataTrue.length > 0) {
+      const md = info.metadata ?? {};
+      const anyTrue = match.metadataTrue.some(field => isMetadataTruthy(md[field]));
+      if (!anyTrue) return false;
+    }
+
     return true;
   }
 
@@ -479,8 +621,8 @@ export class EventGate {
       channelId: info.channelId || undefined,
       matchedPolicy: decision.policyName,
       trigger: decision.trigger,
-      behavior: typeof decision.behavior === 'object' ? `debounce:${decision.behavior.debounce}` : decision.behavior,
-      timestamp: Date.now(),
+      behavior: formatBehavior(decision.behavior),
+      timestamp: this.now(),
     });
 
     return decision;
@@ -495,17 +637,17 @@ export class EventGate {
     // Record stats
     const policyStats = this.stats.get(policy.name) ?? { matchCount: 0, lastMatchTimestamp: null };
     policyStats.matchCount++;
-    policyStats.lastMatchTimestamp = Date.now();
+    policyStats.lastMatchTimestamp = this.now();
     this.stats.set(policy.name, policyStats);
 
     // Legacy trace kept for backward compatibility with existing consumers.
     this.emitTrace({
       type: 'gate:policy-matched',
       policyName: policy.name,
-      behavior: typeof policy.behavior === 'object' ? `debounce:${policy.behavior.debounce}` : policy.behavior,
+      behavior: formatBehavior(policy.behavior),
       eventType: info.eventType,
       source: info.serverId || undefined,
-      timestamp: Date.now(),
+      timestamp: this.now(),
     });
 
     if (policy.behavior === 'skip') {
@@ -513,12 +655,141 @@ export class EventGate {
     }
 
     if (policy.behavior === 'always') {
+      this.applyResets(policy);
       return { trigger: true, policyName: policy.name, behavior: 'always' };
     }
 
-    // Debounce
-    this.handleDebounce(policy, info);
+    if (typeof policy.behavior === 'object') {
+      if ('debounce' in policy.behavior) {
+        this.handleDebounce(policy, info);
+        return { trigger: false, policyName: policy.name, behavior: policy.behavior };
+      }
+      if ('rate_limit' in policy.behavior) {
+        return this.applyRateLimit(policy, info, policy.behavior.rate_limit);
+      }
+      if ('passive_sample' in policy.behavior) {
+        return this.applyPassiveSample(policy, info, policy.behavior.passive_sample);
+      }
+    }
+
+    // Unknown behavior shape — should be unreachable thanks to validation,
+    // but be defensive: treat as skip rather than crash on a bad config.
+    return { trigger: false, policyName: policy.name, behavior: 'skip' };
+  }
+
+  // =========================================================================
+  // rate_limit + passive_sample + resets
+  // =========================================================================
+
+  /** Resolve the partition key for keyBy-style behaviors. */
+  private resolveKey(metadata: Record<string, unknown> | undefined, keyBy: string | undefined): string {
+    if (!keyBy) return SHARED_BUCKET_KEY;
+    const value = metadata?.[keyBy];
+    if (value === undefined || value === null || value === '') return SHARED_BUCKET_KEY;
+    return String(value);
+  }
+
+  private applyRateLimit(
+    policy: GatePolicy,
+    info: GateEventInfo,
+    config: { tokens: number; refillIntervalMs: number; keyBy?: string },
+  ): GateDecision {
+    const key = this.resolveKey(info.metadata, config.keyBy);
+    let buckets = this.rateLimitBuckets.get(policy.name);
+    if (!buckets) {
+      buckets = new Map();
+      this.rateLimitBuckets.set(policy.name, buckets);
+    }
+
+    const now = this.now();
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { tokens: config.tokens, lastRefill: now };
+      buckets.set(key, bucket);
+    } else if (bucket.tokens < config.tokens) {
+      const elapsed = now - bucket.lastRefill;
+      if (elapsed > 0) {
+        const tokensToAdd = Math.floor(elapsed / config.refillIntervalMs);
+        if (tokensToAdd > 0) {
+          bucket.tokens = Math.min(config.tokens, bucket.tokens + tokensToAdd);
+          bucket.lastRefill += tokensToAdd * config.refillIntervalMs;
+        }
+      }
+    } else {
+      // Bucket already full — keep the refill clock fresh so the next
+      // drain starts from "now" rather than ancient history.
+      bucket.lastRefill = now;
+    }
+
+    if (bucket.tokens > 0) {
+      bucket.tokens -= 1;
+      this.applyResets(policy);
+      return { trigger: true, policyName: policy.name, behavior: policy.behavior };
+    }
+
+    this.rateLimitDenied.set(policy.name, (this.rateLimitDenied.get(policy.name) ?? 0) + 1);
     return { trigger: false, policyName: policy.name, behavior: policy.behavior };
+  }
+
+  private applyPassiveSample(
+    policy: GatePolicy,
+    info: GateEventInfo,
+    config: { every: number; keyBy?: string },
+  ): GateDecision {
+    const key = this.resolveKey(info.metadata, config.keyBy);
+    let counters = this.passiveSampleCounters.get(policy.name);
+    if (!counters) {
+      counters = new Map();
+      this.passiveSampleCounters.set(policy.name, counters);
+    }
+
+    const next = (counters.get(key) ?? 0) + 1;
+    if (next >= config.every) {
+      counters.set(key, 0);
+      this.passiveSampleFires.set(policy.name, (this.passiveSampleFires.get(policy.name) ?? 0) + 1);
+      this.applyResets(policy);
+      return { trigger: true, policyName: policy.name, behavior: policy.behavior };
+    }
+    counters.set(key, next);
+    return { trigger: false, policyName: policy.name, behavior: policy.behavior };
+  }
+
+  /**
+   * Clear bucket / counter state for the policies named in `policy.resets`.
+   * Called when a policy fires (decision.trigger === true). Unknown names
+   * are silently ignored — gate.json reload could remove them.
+   */
+  private applyResets(policy: GatePolicy): void {
+    if (!policy.resets || policy.resets.length === 0) return;
+    for (const target of policy.resets) {
+      this.rateLimitBuckets.delete(target);
+      this.passiveSampleCounters.delete(target);
+    }
+  }
+
+  /**
+   * Clear ALL per-policy state (debounce timer, rate-limit buckets,
+   * passive-sample counters, denial / fire counters) for one policy.
+   * Used by reloadIfChanged when a policy is removed or its behavior
+   * params change. Stats (matchCount, lastMatchTimestamp) are preserved
+   * — those are historical and shouldn't reset on a config edit.
+   */
+  private clearPolicyState(
+    name: string,
+    options: { deliverPendingDebounce: boolean },
+  ): void {
+    const debounce = this.debounceTimers.get(name);
+    if (debounce) {
+      clearTimeout(debounce.timer);
+      if (options.deliverPendingDebounce && debounce.events.length > 0) {
+        this.deliverEvents(debounce.events);
+      }
+      this.debounceTimers.delete(name);
+    }
+    this.rateLimitBuckets.delete(name);
+    this.passiveSampleCounters.delete(name);
+    this.rateLimitDenied.delete(name);
+    this.passiveSampleFires.delete(name);
   }
 
   // =========================================================================
@@ -687,6 +958,18 @@ export class EventGate {
           nextDeliveryMs: null, // Timer internals not easily inspectable
         };
       }
+      if (typeof p.behavior === 'object' && 'rate_limit' in p.behavior) {
+        result.rateLimitState = {
+          bucketCount: this.rateLimitBuckets.get(p.name)?.size ?? 0,
+          deniedCount: this.rateLimitDenied.get(p.name) ?? 0,
+        };
+      }
+      if (typeof p.behavior === 'object' && 'passive_sample' in p.behavior) {
+        result.passiveSampleState = {
+          counterCount: this.passiveSampleCounters.get(p.name)?.size ?? 0,
+          fireCount: this.passiveSampleFires.get(p.name) ?? 0,
+        };
+      }
       return result;
     });
 
@@ -718,6 +1001,10 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    this.rateLimitBuckets.clear();
+    this.passiveSampleCounters.clear();
+    this.rateLimitDenied.clear();
+    this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
   }
 }
