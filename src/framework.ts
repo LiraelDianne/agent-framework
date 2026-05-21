@@ -1827,6 +1827,18 @@ export class AgentFramework {
               type: 'inference:tokens',
               agentName: agent.name,
               content: event.content,
+              blockType: event.meta?.type,
+              blockIndex: event.meta?.blockIndex,
+            });
+            break;
+
+          case 'block':
+            this.emitTrace({
+              type: 'inference:content_block',
+              agentName: agent.name,
+              event: event.event.event,
+              blockType: event.event.block.type,
+              blockIndex: event.event.index,
             });
             break;
 
