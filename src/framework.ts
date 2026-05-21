@@ -1827,20 +1827,22 @@ export class AgentFramework {
               type: 'inference:tokens',
               agentName: agent.name,
               content: event.content,
-              blockType: event.meta?.type,
-              blockIndex: event.meta?.blockIndex,
+              blockType: event.meta.type,
+              blockIndex: event.meta.blockIndex,
             });
             break;
 
-          case 'block':
+          case 'block': {
+            const { event: phase, index, block } = event.event;
             this.emitTrace({
               type: 'inference:content_block',
               agentName: agent.name,
-              event: event.event.event,
-              blockType: event.event.block.type,
-              blockIndex: event.event.index,
+              phase,
+              blockType: block.type,
+              blockIndex: index,
             });
             break;
+          }
 
           case 'tool-calls': {
             hadToolCalls = true;

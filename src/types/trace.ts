@@ -72,9 +72,9 @@ export type TraceEvent =
        * membrane's ChunkMeta. Consumers that want to render thinking content
        * distinctly from regular text should switch on this.
        */
-      blockType?: 'text' | 'thinking' | 'tool_call' | 'tool_result';
+      blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
-      blockIndex?: number;
+      blockIndex: number;
     })
   | (TraceEventBase & {
       /**
@@ -85,7 +85,7 @@ export type TraceEvent =
        */
       type: 'inference:content_block';
       agentName: string;
-      event: 'block_start' | 'block_complete';
+      phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
     })
