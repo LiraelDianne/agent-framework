@@ -67,6 +67,27 @@ export type TraceEvent =
       type: 'inference:tokens';
       agentName: string;
       content: string;
+      /**
+       * Which membrane block produced this chunk. Carried verbatim from the
+       * membrane's ChunkMeta. Consumers that want to render thinking content
+       * distinctly from regular text should switch on this.
+       */
+      blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
+      /** 0-indexed block position in the current assistant turn. */
+      blockIndex: number;
+    })
+  | (TraceEventBase & {
+      /**
+       * Structural boundary inside the assistant turn — emitted on every
+       * block_start / block_complete from the membrane. Use this to switch
+       * render lanes (e.g. open a dim "thinking" element on block_start
+       * with blockType='thinking', close it on block_complete).
+       */
+      type: 'inference:content_block';
+      agentName: string;
+      phase: 'block_start' | 'block_complete';
+      blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
+      blockIndex: number;
     })
   | (TraceEventBase & {
       type: 'inference:tool_calls_yielded';
