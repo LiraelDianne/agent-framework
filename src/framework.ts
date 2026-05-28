@@ -3708,11 +3708,27 @@ export class AgentFramework {
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
+              const durationMs = Date.now() - startTime;
               agent.reset();
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: `Stream aborted: ${reason}`,
+              });
+              // Postmortem 2026-05-28 P2 #7: persist the abort to the
+              // inference log so future investigations can attribute the
+              // terminal cause without relying on live in-memory reducer
+              // state. Without this, abort-terminated inferences are
+              // invisible to forensic queries (only request-side telemetry
+              // via llm-calls.jsonl shows them, and only by absence).
+              this.logInference({
+                timestamp: startTime,
+                agentName: agent.name,
+                requestId,
+                success: false,
+                error: `Stream aborted: ${reason}`,
+                request: compiledRequest ?? { note: 'streaming request aborted' },
+                durationMs,
               });
               this.eventGate?.onInferenceEnded(agent.name);
             }
@@ -3738,6 +3754,7 @@ export class AgentFramework {
       // Stream itself threw (unexpected) — no retry path here, so also emit
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
+      const durationMs = Date.now() - startTime;
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -3748,6 +3765,18 @@ export class AgentFramework {
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
+      });
+      // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
+      // threw) were previously only visible via in-memory trace listeners.
+      // Persist to inference log for forensic attribution.
+      this.logInference({
+        timestamp: startTime,
+        agentName: agent.name,
+        requestId,
+        success: false,
+        error: `Stream threw: ${err.message}`,
+        request: compiledRequest ?? { note: 'streaming request threw' },
+        durationMs,
       });
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
