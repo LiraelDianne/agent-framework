@@ -2382,8 +2382,8 @@ export class AgentFramework {
       return;
     }
 
-    // Route gate:status tool
-    if (enrichedCall.name === 'gate:status' && this.eventGate) {
+    // Route gate_status tool
+    if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
       return;
     }
