@@ -183,6 +183,12 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
+  /** Per-agent count of consecutive exhausted inferences (reset on any success).
+   *  Drives hard-down escalation — see noteInferenceExhausted. */
+  private consecutiveInferenceFailures: Map<string, number> = new Map();
+  /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
+   *  escalated loudly to stderr. */
+  private readonly inferenceFailureEscalationThreshold = 3;
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -2559,6 +2565,27 @@ export class AgentFramework {
   }
 
   private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+    // Centralized inference-health observability. Every terminal failure path
+    // funnels through an `inference:exhausted` trace and every successful model
+    // response through `inference:completed`, so intercepting here is the one
+    // place that reliably sees all outcomes regardless of which code path
+    // produced them. In headless/daemon mode no trace client is attached, so
+    // without this the only durable record of a failed inference is a field in
+    // llm-calls.jsonl — invisible to operator, agent, and monitoring.
+    if (event.type === 'inference:exhausted') {
+      this.noteInferenceExhausted(
+        (event.agentName as string) ?? 'unknown',
+        (event.error as string) ?? 'unknown error',
+      );
+    } else if (event.type === 'inference:completed') {
+      // A successful response — even mid-turn between tool calls — proves the
+      // agent isn't hard-down; clear its consecutive-failure streak.
+      const name = event.agentName as string | undefined;
+      if (name && this.consecutiveInferenceFailures.get(name)) {
+        this.consecutiveInferenceFailures.set(name, 0);
+      }
+    }
+
     const traceEvent = {
       ...event,
       timestamp: Date.now(),
@@ -2570,6 +2597,59 @@ export class AgentFramework {
       } catch (error) {
         console.error('Trace listener error:', error);
       }
+    }
+  }
+
+  /**
+   * Handle a fully-exhausted inference (the agent could not produce a response
+   * this turn, after retries). Severity here is high — the agent can't think
+   * at all — yet historically the only durable record was a buried field in
+   * llm-calls.jsonl. This surfaces it three ways:
+   *
+   *   1. stderr  — always, with the underlying API reason. The place an
+   *      operator greps; previously empty in headless mode.
+   *   2. chronicle marker — a `[inference-failed]` message so the agent itself
+   *      learns its turn failed and why (otherwise it's an experiential blank,
+   *      indistinguishable from "not addressed"). addMessage does NOT request
+   *      inference, so this never causes a retry/wake loop.
+   *   3. escalation — after N consecutive failures the agent is hard-down;
+   *      log that loudly (a repeated identical failure is the textbook signal).
+   */
+  private noteInferenceExhausted(agentName: string, reason: string): void {
+    const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
+    this.consecutiveInferenceFailures.set(agentName, streak);
+
+    // (1) Durable stderr line — works in headless/daemon mode with no client.
+    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+
+    // (2) Agent-facing chronicle marker (no inference triggered → no loop).
+    const agent = this.agents.get(agentName);
+    if (agent) {
+      try {
+        agent.getContextManager().addMessage(
+          'user',
+          [{
+            type: 'text',
+            text:
+              `[inference-failed] Your previous turn did not complete: the model ` +
+              `call failed and produced no response, so nothing was sent. Reason: ` +
+              `${reason}. If this recurs with the same cause, change approach ` +
+              `rather than retrying identically (e.g. drop an oversized attachment ` +
+              `or an unsupported setting).`,
+          }],
+          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+        );
+      } catch (err) {
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+      }
+    }
+
+    // (3) Hard-down escalation on repeated identical failure.
+    if (streak >= this.inferenceFailureEscalationThreshold) {
+      console.error(
+        `[inference-hard-down] agent=${agentName} has FAILED ${streak} consecutive ` +
+        `inferences — it cannot complete a turn. Last reason: ${reason}`,
+      );
     }
   }
 

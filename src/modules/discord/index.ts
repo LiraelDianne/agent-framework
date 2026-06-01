@@ -18,6 +18,7 @@ import type {
   ToolCall,
   ToolResult,
   SpeechContext,
+  TraceEvent,
 } from '../../types/index.js';
 import type {
   DiscordModuleConfig,
@@ -55,6 +56,24 @@ const DEFAULT_CONFIG: Partial<DiscordModuleConfig> = {
   autoTyping: true,
   historyScrollback: 50,
 };
+
+// Re-trigger the Discord typing indicator on this interval. Discord's
+// indicator auto-expires after ~10s, so we refresh comfortably inside that.
+const TYPING_REFRESH_MS = 8_000;
+
+// Absolute safety cap on a single typing keepalive. If a terminal trace event
+// is somehow missed (crash, dropped stream), this guarantees typing can't get
+// stuck on forever.
+const TYPING_MAX_MS = 5 * 60_000;
+
+// Trace event types that terminate an agent's turn — any of these stops the
+// typing keepalive. They fire once per turn, after all tool-call cycles.
+const TURN_TERMINAL_TRACES = new Set([
+  'inference:turn_ended',
+  'inference:aborted',
+  'inference:failed',
+  'inference:exhausted',
+]);
 
 // Image MIME types that Claude can process
 const SUPPORTED_IMAGE_TYPES = [
@@ -95,6 +114,15 @@ export class DiscordModule implements Module {
   // Last message sent by a tool (for thought-editing)
   private lastSentMessage: { channelId: string; messageId: string } | null = null;
 
+  // Typing keepalive: agentName -> { interval, deadline }. Started on
+  // inference:started, stopped on the turn's terminal trace event. Discord's
+  // typing indicator auto-expires after ~10s, so we re-trigger on an interval
+  // to keep it alive for the whole turn (including tool-call cycles).
+  private typingLoops: Map<string, { interval: ReturnType<typeof setInterval>; deadline: number }> = new Map();
+
+  // Unsubscribe handle for the trace subscription (cleared in stop()).
+  private unsubscribeTrace: (() => void) | null = null;
+
   constructor(client: DiscordClientInterface, config: DiscordModuleConfig) {
     this.client = client;
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -113,6 +141,22 @@ export class DiscordModule implements Module {
 
     // Register as speech handler
     ctx.registerSpeechHandler('*');
+
+    // Typing keepalive: bracket the indicator between an agent starting
+    // inference and its turn ending, so it stays alive for the whole turn
+    // (including tool-call cycles) and stops cleanly whether the agent
+    // responds, errors, or decides to stay silent.
+    if (this.config.autoTyping) {
+      this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
+        const agentName = (event as { agentName?: string }).agentName;
+        if (!agentName) return;
+        if (event.type === 'inference:started') {
+          this.startTypingLoop(agentName);
+        } else if (TURN_TERMINAL_TRACES.has(event.type)) {
+          this.stopTypingLoop(agentName);
+        }
+      });
+    }
 
     // Set up Discord event handlers
     this.client.onMessage((message) => this.handleDiscordMessage(message));
@@ -146,8 +190,57 @@ export class DiscordModule implements Module {
       this.ctx.setState(this.state);
     }
 
+    // Tear down typing keepalive: drop the trace subscription and clear any
+    // in-flight intervals so nothing leaks across teardown/recreate.
+    this.unsubscribeTrace?.();
+    this.unsubscribeTrace = null;
+    for (const { interval } of this.typingLoops.values()) {
+      clearInterval(interval);
+    }
+    this.typingLoops.clear();
+
     await this.client.disconnect();
     this.ctx = null;
+  }
+
+  /**
+   * Start (or refresh) the typing keepalive for an agent's reply channel.
+   * Idempotent: a fresh `inference:started` resets the safety deadline and
+   * restarts the interval. No-op if we can't resolve a channel for the agent.
+   */
+  private startTypingLoop(agentName: string): void {
+    const replyCtx = this.replyContexts.get(agentName) ?? this.replyContexts.get('default');
+    if (!replyCtx) return;
+    const channel = replyCtx.threadId ?? replyCtx.channelId;
+
+    // Restart cleanly if one is already running for this agent.
+    this.stopTypingLoop(agentName);
+
+    const deadline = Date.now() + TYPING_MAX_MS;
+    const fire = () => {
+      if (Date.now() >= deadline) {
+        this.stopTypingLoop(agentName);
+        return;
+      }
+      this.client.sendTyping(channel).catch((err) => {
+        console.warn('Discord: Failed to send typing indicator:', err);
+      });
+    };
+
+    fire(); // immediate feedback, don't wait a full interval
+    const interval = setInterval(fire, TYPING_REFRESH_MS);
+    // Don't keep the process alive solely for a typing indicator.
+    (interval as { unref?: () => void }).unref?.();
+    this.typingLoops.set(agentName, { interval, deadline });
+  }
+
+  /** Stop the typing keepalive for an agent, if one is running. */
+  private stopTypingLoop(agentName: string): void {
+    const loop = this.typingLoops.get(agentName);
+    if (loop) {
+      clearInterval(loop.interval);
+      this.typingLoops.delete(agentName);
+    }
   }
 
   getTools(): ToolDefinition[] {
