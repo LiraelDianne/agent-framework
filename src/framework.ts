@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
@@ -2216,17 +2216,49 @@ export class AgentFramework {
   }
 
   private toMembraneToolResult(callId: string, afResult: ToolResult, maxChars?: number): MembraneToolResult {
-    let content: string;
     if (afResult.isError) {
-      content = afResult.error ?? 'Unknown error';
-    } else {
-      content = JSON.stringify(afResult.data);
-      if (maxChars && content.length > maxChars) {
-        content = safeSlice(content, 0, maxChars)
-          + '\n\n[truncated — original was ' + content.length + ' chars]';
-      }
+      return { toolUseId: callId, content: afResult.error ?? 'Unknown error', isError: true };
+    }
+    // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
+    // blocks natively rather than JSON-stringifying them away. Anything else
+    // (objects, scalars) falls through to JSON.
+    const blocks = this.tryNativeToolResultContent(afResult.data);
+    if (blocks) {
+      return { toolUseId: callId, content: blocks, isError: afResult.isError };
+    }
+    let content = JSON.stringify(afResult.data);
+    if (maxChars && content.length > maxChars) {
+      content = safeSlice(content, 0, maxChars)
+        + '\n\n[truncated — original was ' + content.length + ' chars]';
     }
     return { toolUseId: callId, content, isError: afResult.isError };
+  }
+
+  /**
+   * If `data` is an MCP tool-result content array carrying at least one image,
+   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
+   * the array is text-only (let JSON path handle it; saves a code path).
+   */
+  private tryNativeToolResultContent(data: unknown): ToolResultContentBlock[] | null {
+    if (!Array.isArray(data)) return null;
+    let hasImage = false;
+    const blocks: ToolResultContentBlock[] = [];
+    for (const b of data) {
+      if (!b || typeof b !== 'object') return null;
+      const type = (b as any).type;
+      if (type === 'text' && typeof (b as any).text === 'string') {
+        blocks.push({ type: 'text', text: (b as any).text });
+      } else if (type === 'image' && typeof (b as any).data === 'string' && typeof (b as any).mimeType === 'string') {
+        hasImage = true;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', data: (b as any).data, mediaType: (b as any).mimeType },
+        });
+      } else {
+        return null; // unknown shape — bail to JSON path
+      }
+    }
+    return hasImage ? blocks : null;
   }
 
   private getMaxToolResultChars(agent: Agent): number | undefined {
@@ -2887,11 +2919,22 @@ export class AgentFramework {
           }
         }
 
-        // Convert MCP tool result to framework ToolResult
+        // Convert MCP tool result to framework ToolResult.
+        // When the result contains non-text blocks (e.g. images from an MCP
+        // tool like zulip-mcp's fetch_attachment), pass the full content array
+        // through so toMembraneToolResult can preserve image blocks natively.
+        // Text-only results still collapse to a joined string for backward
+        // compatibility with callers that expect data to be string-ish.
         const textContent = result.content
           ?.filter((c) => c.type === 'text' && c.text)
           .map((c) => c.text!)
           .join('\n');
+        const hasNonText = result.content?.some((c) => c.type !== 'text');
+        const data = result.isError
+          ? undefined
+          : hasNonText
+            ? result.content
+            : (textContent || undefined);
 
         this.pushEvent({
           type: 'tool-result',
@@ -2900,7 +2943,7 @@ export class AgentFramework {
           moduleName: `mcpl:${serverId}`,
           result: {
             success: !result.isError,
-            data: result.isError ? undefined : textContent || undefined,
+            data,
             error: result.isError ? (textContent || 'Tool call failed') : undefined,
             isError: result.isError ?? false,
           },
