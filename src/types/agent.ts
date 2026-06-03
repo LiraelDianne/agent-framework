@@ -41,6 +41,10 @@ export interface AgentConfig {
   /** Max input tokens before framework breaks a yielding stream and
    *  restarts with recompiled (compressed) context. Default: 150000. */
   maxStreamTokens?: number;
+
+  /** Per-agent context compile budget (input tokens). When unset, the
+   *  ContextManager's built-in default (100k) applies. */
+  contextBudgetTokens?: number;
 }
 
 /**

@@ -43,6 +43,10 @@ export class Agent {
   private _streamId = 0;
   lastStreamInputTokens = 0;
   maxStreamTokens: number;
+  /** Per-agent context compile budget (input tokens). When unset, the
+   * ContextManager's built-in default applies. reserveForResponse uses
+   * this agent's maxTokens. */
+  contextBudgetTokens?: number;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -59,6 +63,7 @@ export class Agent {
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
+    this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
     this.membrane = membrane;
   }
@@ -118,8 +123,16 @@ export class Agent {
    * Step 1 of the inference pipeline — callers can inspect/modify the result
    * before building a request.
    */
+  /** Resolve the compile budget: explicit arg wins, else the per-agent
+   * configured context budget (if any), else the ContextManager default. */
+  private resolveBudget(budget?: TokenBudget): TokenBudget | undefined {
+    if (budget) return budget;
+    if (this.contextBudgetTokens === undefined) return undefined;
+    return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    return this.contextManager.compile(budget);
+    return this.contextManager.compile(this.resolveBudget(budget));
   }
 
   /**
@@ -131,7 +144,7 @@ export class Agent {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    return this.contextManager.compile(budget, injections);
+    return this.contextManager.compile(this.resolveBudget(budget), injections);
   }
 
   // ==========================================================================
