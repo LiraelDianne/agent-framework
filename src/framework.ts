@@ -2084,18 +2084,24 @@ export class AgentFramework {
               }
             } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
               // Tool-call turn that also produced prose. Per design, route the
-              // prose to the locus as a reply UNLESS the turn used a "silencing"
-              // tool:
-              //   - `think`         — deliberate silence
-              //   - an explicit send/publish (channel_publish, *--send_message,
-              //     *--reply_message, *--send_dm) — already delivered; routing
-              //     again would double-post.
-              // Non-sending tools (shell, workspace, etc.) still let the agent
-              // speak in the same turn. The global speech/thoughts split is left
-              // untouched (module/TUI rendering unaffected) — this only governs
-              // what reaches the channel.
+              // prose to the locus as a reply UNLESS the turn used an explicit
+              // send/publish tool (channel_publish, *--send_message,
+              // *--reply_message, *--send_dm) — already delivered, so routing
+              // again would double-post. `think` and other non-sending tools
+              // (shell, workspace, etc.) still let the agent speak in the same
+              // turn. The global speech/thoughts split is left untouched
+              // (module/TUI rendering unaffected) — this only governs what
+              // reaches the channel.
+              // Only EXPLICIT delivery tools silence trailing prose: they already
+              // sent the message, so routing it again would double-post. `think`
+              // is deliberately NOT here — it is silent *reasoning*, but trailing
+              // prose written AFTER a think (in the same turn cycle) is the agent's
+              // actual reply and must be delivered. A think-*only* turn has no
+              // trailing prose and stays silent via the `!t` check below. (Bug:
+              // replies were dropped whenever the agent thought about a message —
+              // e.g. an image — and then answered in the same turn.)
               const SILENCING = new Set([
-                'think', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
+                'channel_publish', 'send_message', 'reply_message', 'send_dm',
               ]);
               const bare = (n: string) => (n.includes('--') ? n.split('--').pop()! : n);
               const toolNames = response.content
