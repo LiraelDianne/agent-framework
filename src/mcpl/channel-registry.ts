@@ -177,18 +177,35 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'think',
     description:
-      'Record a private thought and DELIBERATELY STAY SILENT this turn — nothing is ' +
-      'sent to any channel or surface. Use this when you have read messages but choose ' +
-      'not to reply, or when you just want to reason privately. Normally, plain text you ' +
-      'write on a turn with no tool call is auto-posted to the current channel; calling ' +
-      'think() makes this a non-speaking turn, so your words stay in your own context ' +
-      'instead. To actually speak, write normally (no tool call) or use channel_publish.',
+      'Reason privately. The content stays in your own context and is NOT sent to any ' +
+      'channel or surface. This does NOT end or silence your turn: if you also write ' +
+      'plain text this turn, that text is still posted as your reply. Use think() purely ' +
+      'to work things out before (or instead of) speaking. To deliberately NOT reply this ' +
+      'turn, call skip_reply instead.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: {
           type: 'string',
           description: 'Your private thought / reasoning (optional; not sent anywhere).',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'skip_reply',
+    description:
+      'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
+      'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
+      'nothing to add, or you are waiting. Any plain text you wrote this turn stays private ' +
+      'and is NOT posted. To reply instead, just write plain text (no tool call).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Optional private note on why you are not replying (not sent anywhere).',
         },
       },
       required: [],
@@ -658,6 +675,9 @@ export class ChannelRegistry {
       case 'think':
         return this.handleToolThink(input as { content?: string });
 
+      case 'skip_reply':
+        return this.handleToolSkipReply(input as { reason?: string });
+
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
     }
@@ -956,22 +976,38 @@ export class ChannelRegistry {
   }
 
   /**
-   * Handle the synthesized `think` tool. This is a deliberate no-op as far as
-   * any surface is concerned: it sends nothing. Its only effect is that the
-   * agent invoked a tool, which makes the turn a non-speaking one (see
-   * framework speech/thoughts split) — so the host's output routing won't
-   * auto-publish the agent's text. The thought stays in the agent's own
-   * context/chronicle. This is the surface-agnostic "deliberation channel"
-   * realized as a host tool.
+   * Handle the synthesized `think` tool — a private reasoning scratchpad. It
+   * sends nothing, and (unlike before) does NOT silence the turn: trailing
+   * plain text is still routed as the reply. The thought stays in the agent's
+   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
    */
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
       success: true,
       data: {
         noted: true,
-        silent: true,
-        note: 'Stayed silent this turn — nothing was sent to any channel. Your thought remains in your context.',
+        note:
+          'Thought recorded (private — not sent anywhere). This did NOT silence your turn: ' +
+          'write plain text to reply, or call skip_reply to end the turn without replying.',
         content: typeof input?.content === 'string' ? input.content : undefined,
+      },
+    };
+  }
+
+  /**
+   * Handle the synthesized `skip_reply` tool — the deliberate "stay silent"
+   * signal. A no-op as far as any surface is concerned (sends nothing); its
+   * effect is that the framework's output routing treats this as a silencing
+   * tool, so any trailing prose this turn is NOT posted. Replaces the old
+   * overloaded use of `think` for staying silent.
+   */
+  private handleToolSkipReply(input: { reason?: string }): ToolResult {
+    return {
+      success: true,
+      data: {
+        skipped: true,
+        note: 'Ended the turn without replying — nothing was sent to any channel.',
+        reason: typeof input?.reason === 'string' ? input.reason : undefined,
       },
     };
   }

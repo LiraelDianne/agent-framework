@@ -2092,16 +2092,19 @@ export class AgentFramework {
               // turn. The global speech/thoughts split is left untouched
               // (module/TUI rendering unaffected) — this only governs what
               // reaches the channel.
-              // Only EXPLICIT delivery tools silence trailing prose: they already
-              // sent the message, so routing it again would double-post. `think`
-              // is deliberately NOT here — it is silent *reasoning*, but trailing
-              // prose written AFTER a think (in the same turn cycle) is the agent's
-              // actual reply and must be delivered. A think-*only* turn has no
-              // trailing prose and stays silent via the `!t` check below. (Bug:
-              // replies were dropped whenever the agent thought about a message —
-              // e.g. an image — and then answered in the same turn.)
+              // Tools whose presence suppresses the trailing prose, for two
+              // distinct reasons:
+              //   - `skip_reply` — the agent EXPLICITLY chose not to reply this
+              //     turn (the deliberate "stay silent" signal).
+              //   - explicit delivery tools (channel_publish / *send_message /
+              //     *reply_message / *send_dm) — already sent the message, so
+              //     routing it again would double-post.
+              // `think` is deliberately NOT here: it is silent *reasoning*, but
+              // prose written after a think is the agent's actual reply and must
+              // be delivered. (A think-only turn has no trailing prose and stays
+              // silent via the `!t` check below.)
               const SILENCING = new Set([
-                'channel_publish', 'send_message', 'reply_message', 'send_dm',
+                'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
               ]);
               const bare = (n: string) => (n.includes('--') ? n.split('--').pop()! : n);
               const toolNames = response.content
@@ -2410,10 +2413,11 @@ export class AgentFramework {
       return;
     }
 
-    // Route synthesized 'think' tool (deliberation / stay-silent) — handled by
-    // the channel registry like the other synthesized channel tools, but it
-    // isn't `channel_`-prefixed so it needs an explicit route here.
-    if (enrichedCall.name === 'think' && this.channelRegistry) {
+    // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
+    // stay-silent) tools — handled by the channel registry like the other
+    // synthesized channel tools, but they aren't `channel_`-prefixed so they
+    // need an explicit route here.
+    if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       this.dispatchChannelToolCall(agentName, enrichedCall);
       return;
     }
