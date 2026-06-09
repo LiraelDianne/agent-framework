@@ -853,7 +853,10 @@ describe('Streaming lifecycle', () => {
     assert.strictEqual(results.length, 1);
     assert.strictEqual(results[0].toolUseId, 'call_conv');
     assert.strictEqual(results[0].content, JSON.stringify({ echoed: 'convert' }));
-    assert.strictEqual(results[0].isError, undefined);
+    // Non-error results are now explicitly `isError: false` (the error path
+    // returns early, so the previous `isError: afResult.isError` was always
+    // falsy and misleading to read).
+    assert.strictEqual(results[0].isError, false);
 
     await framework.stop();
     rmSync(tempDir, { recursive: true });
