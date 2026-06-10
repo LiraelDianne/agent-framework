@@ -4,6 +4,7 @@ import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
 import type { ProcessEvent } from './events.js';
 import type { McplServerConfig, InferenceRoutingPolicy } from '../mcpl/types.js';
+import type { ConversationRouterConfig } from '../mcpl/conversation-router.js';
 import type { GateOptions } from '../gate/types.js';
 
 // Re-export trace types
@@ -66,6 +67,14 @@ export interface FrameworkConfig {
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
+
+  /**
+   * Per-channel conversation routing. When set, incoming MCPL channel
+   * messages route to per-channel fork agents spawned from the template
+   * agent instead of the primary conversation. If omitted, behavior is
+   * unchanged (all messages go to the primary agent).
+   */
+  conversations?: ConversationRouterConfig;
 }
 
 /**

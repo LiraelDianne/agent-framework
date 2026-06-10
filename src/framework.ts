@@ -50,6 +50,7 @@ import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
+import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
@@ -219,6 +220,18 @@ export class AgentFramework {
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
+  /** Per-channel conversation routing (null unless config.conversations set). */
+  private conversationRouter: ConversationRouter | null = null;
+  /** Agent configs by name — fork agents are built from the template's config. */
+  private agentConfigs: Map<string, AgentConfig> = new Map();
+  /**
+   * Fork agent → its home channel. Permanent (unlike router bindings, which
+   * expire): publish/injection scoping must survive unbinding so the closure
+   * turn still lands in the right channel.
+   */
+  private conversationAgentHomes: Map<string, string> = new Map();
+  /** Last idle-TTL sweep timestamp. */
+  private lastConversationSweep = 0;
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
@@ -350,6 +363,17 @@ export class AgentFramework {
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
+    }
+
+    // Initialize per-channel conversation routing (if configured)
+    if (config.conversations) {
+      if (!framework.agents.has(config.conversations.templateAgent)) {
+        throw new Error(
+          `conversations.templateAgent "${config.conversations.templateAgent}" ` +
+          `is not a configured agent`
+        );
+      }
+      framework.conversationRouter = new ConversationRouter(config.conversations);
     }
 
     // Initialize EventGate if configured (before MCPL so it can be wired as trigger filter)
@@ -538,6 +562,14 @@ export class AgentFramework {
    */
   getAllAgents(): Agent[] {
     return Array.from(this.agents.values());
+  }
+
+  /**
+   * Get the per-channel conversation router (null unless config.conversations
+   * was set). Exposed for modules/UIs that surface active engagements.
+   */
+  getConversationRouter(): ConversationRouter | null {
+    return this.conversationRouter;
   }
 
   /**
@@ -1307,6 +1339,7 @@ export class AgentFramework {
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.agents.set(config.name, agent);
+    this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
     if (!this.primaryAgentName) {
@@ -1333,6 +1366,9 @@ export class AgentFramework {
     if (event) {
       await this.handleProcessEvent(event);
     }
+
+    // Close idle conversation forks (no-op unless conversations configured)
+    this.sweepExpiredConversations();
 
     // Check for inference requests
     await this.processInferenceRequests();
@@ -1482,7 +1518,7 @@ export class AgentFramework {
     // These events are protocol-level (spec Sections 9 & 14) and always
     // represent content intended for the model's context window.
     if (event.type === 'mcpl:channel-incoming') {
-      this.handleMcplChannelIncoming(event as unknown as {
+      await this.handleMcplChannelIncoming(event as unknown as {
         type: 'mcpl:channel-incoming';
         serverId: string;
         channelId: string;
@@ -1578,9 +1614,11 @@ export class AgentFramework {
         if (!decision.trigger) return;
       }
 
+      // Broadcast requests exclude conversation forks — they are driven by
+      // their own channel's messages, not by framework-wide events.
       const targetAgents =
         response.requestInference === true
-          ? Array.from(this.agents.keys())
+          ? Array.from(this.agents.keys()).filter((n) => !this.conversationAgentHomes.has(n))
           : response.requestInference;
 
       for (const agentName of targetAgents) {
@@ -1605,7 +1643,7 @@ export class AgentFramework {
    * Convert an incoming MCPL channel message to a context message.
    * This replaces the old MCPLModule.onProcess() message conversion.
    */
-  private handleMcplChannelIncoming(event: {
+  private async handleMcplChannelIncoming(event: {
     type: 'mcpl:channel-incoming';
     serverId: string;
     channelId: string;
@@ -1616,7 +1654,7 @@ export class AgentFramework {
     timestamp: string;
     metadata?: Record<string, unknown>;
     triggerInference?: boolean;
-  }): void {
+  }): Promise<void> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
       channelId: event.channelId,
@@ -1626,6 +1664,14 @@ export class AgentFramework {
       serverId: event.serverId,
     };
     if (event.threadId) metadata.threadId = event.threadId;
+
+    // Per-channel conversation routing: messages go to the channel's fork
+    // agent (spawned from the template on first qualifying message), never
+    // to the primary conversation.
+    if (this.conversationRouter) {
+      await this.routeConversationIncoming(event, metadata);
+      return;
+    }
 
     const id = this.addMessage('user', event.content, metadata);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
@@ -1639,6 +1685,201 @@ export class AgentFramework {
           timestamp: Date.now(),
         });
       }
+    }
+  }
+
+  /**
+   * Route an incoming channel message through the ConversationRouter:
+   * deliver to the channel's bound fork agent, spawning it from the template
+   * agent first when the bind policy matches. Unrouted messages are dropped —
+   * the template ("trunk") is a dormant warm checkpoint, not a listener.
+   */
+  private async routeConversationIncoming(
+    event: {
+      serverId: string;
+      channelId: string;
+      messageId: string;
+      author: { id: string; name: string };
+      content: ContentBlock[];
+      metadata?: Record<string, unknown>;
+      triggerInference?: boolean;
+    },
+    messageMetadata: Record<string, unknown>,
+  ): Promise<void> {
+    const router = this.conversationRouter!;
+    const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
+
+    const decision = router.route({
+      channelId: event.channelId,
+      mentioned: event.metadata?.mentioned === true,
+      isDm: ConversationRouter.isDmChannel(descriptor, event.metadata),
+    });
+
+    if (decision.kind === 'unbound') {
+      this.emitTrace({
+        type: 'mcpl:conversation-unrouted',
+        channelId: event.channelId,
+        messageId: event.messageId,
+      });
+      return;
+    }
+
+    let agent: Agent | undefined;
+    if (decision.kind === 'spawn') {
+      try {
+        agent = await this.createConversationAgent(decision.agentName, event.channelId);
+        router.bind(event.channelId, decision.agentName, decision.generation);
+        this.emitTrace({
+          type: 'mcpl:conversation-spawned',
+          channelId: event.channelId,
+          agentName: decision.agentName,
+          generation: decision.generation,
+          template: router.templateAgent,
+        });
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        console.error(`Failed to spawn conversation agent for ${event.channelId}:`, err);
+        this.emitTrace({
+          type: 'mcpl:conversation-spawn-failed',
+          channelId: event.channelId,
+          agentName: decision.agentName,
+          error: err.message,
+        });
+        return; // next qualifying message proposes the same spawn again
+      }
+    } else {
+      agent = this.agents.get(decision.agentName);
+      if (!agent) {
+        // Bound agent vanished (e.g. external reset) — unbind so the next
+        // qualifying message respawns a fresh fork.
+        router.unbind(event.channelId);
+        this.emitTrace({
+          type: 'mcpl:conversation-binding-orphaned',
+          channelId: event.channelId,
+          agentName: decision.agentName,
+        });
+        return;
+      }
+    }
+
+    // Respect an explicit server-config-level veto (shouldTriggerInference)
+    // on top of the router's own trigger policy.
+    const trigger = decision.trigger && event.triggerInference !== false;
+    messageMetadata.triggered = trigger;
+
+    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+
+    if (trigger) {
+      this.pendingRequests.push({
+        agentName: agent.name,
+        reason: 'mcpl:channel-incoming',
+        source: event.serverId,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Spawn a persistent per-channel conversation agent ("fork") from the
+   * template agent: own ContextManager under `conversations/{name}`, seeded
+   * with a copy of the template's compiled context (the SubagentModule
+   * wholesale-copy pattern), registered in the event loop like any agent —
+   * but never primary.
+   */
+  private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
+    const router = this.conversationRouter!;
+    const templateConfig = this.agentConfigs.get(router.templateAgent);
+    const template = this.agents.get(router.templateAgent);
+    if (!template || !templateConfig) {
+      throw new Error(`conversation template agent "${router.templateAgent}" not found`);
+    }
+
+    const contextManager = await ContextManager.open({
+      store: this.store,
+      namespace: `conversations/${name}`,
+      isolate: true,
+      // Strategy instances are stateful — never share the template's.
+      strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
+      membrane: this.membrane,
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
+    });
+
+    // Seed with the template's compiled context, renaming the template
+    // participant so the fork reads its inheritance as its own history.
+    const { messages: compiled } = await template.getContextManager().compile();
+    for (const msg of compiled) {
+      const participant = msg.participant === template.name ? name : msg.participant;
+      contextManager.addMessage(participant, msg.content);
+    }
+
+    const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
+    const agent = new Agent(config, contextManager, this.membrane);
+    this.agents.set(name, agent);
+    this.agentConfigs.set(name, config);
+    this.conversationAgentHomes.set(name, channelId);
+    return agent;
+  }
+
+  /**
+   * Scope MCPL context injections for a conversation-bound agent: drop
+   * injections that are another open channel's context (injection namespace
+   * = channelId by adapter convention), keep its own channel and anything
+   * that isn't channel context.
+   */
+  private scopeInjectionsForAgent(
+    agentName: string,
+    injections: ContextInjection[],
+  ): ContextInjection[] {
+    const home = this.conversationAgentHomes.get(agentName);
+    if (!home || !this.channelRegistry || injections.length === 0) {
+      return injections;
+    }
+    const openChannelIds = new Set(
+      this.channelRegistry.getOpenChannels().map((e) => e.descriptor.id),
+    );
+    return injections.filter((inj) => {
+      const ns = inj.namespace;
+      if (!ns || !openChannelIds.has(ns)) return true;
+      return ns === home;
+    });
+  }
+
+  /**
+   * Idle-TTL sweep for conversation bindings (runs at most once per minute
+   * from the event loop). Expired forks get a final system-initiated closure
+   * turn — publish scoping still works because the agent's home channel
+   * mapping is permanent — and the channel unbinds immediately, so the next
+   * qualifying message spawns a fresh fork from the current template.
+   */
+  private sweepExpiredConversations(): void {
+    if (!this.conversationRouter) return;
+    const now = Date.now();
+    if (now - this.lastConversationSweep < 60_000) return;
+    this.lastConversationSweep = now;
+
+    for (const binding of this.conversationRouter.expired(now)) {
+      this.conversationRouter.unbind(binding.channelId);
+      this.emitTrace({
+        type: 'mcpl:conversation-closed',
+        channelId: binding.channelId,
+        agentName: binding.agentName,
+        reason: 'idle-ttl',
+      });
+
+      const agent = this.agents.get(binding.agentName);
+      if (!agent) continue;
+      agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text: this.conversationRouter.closurePrompt }],
+        { channelId: binding.channelId, conversationClosure: true },
+      );
+      this.pendingRequests.push({
+        agentName: binding.agentName,
+        reason: 'conversation:closure',
+        source: 'framework',
+        timestamp: now,
+      });
     }
   }
 
@@ -1658,7 +1899,9 @@ export class AgentFramework {
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
     if (event.triggerInference) {
-      const targetAgents = event.targetAgents ?? [...this.agents.keys()];
+      // Default broadcast excludes conversation forks (channel-driven).
+      const targetAgents = event.targetAgents
+        ?? [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n));
       for (const agentName of targetAgents) {
         this.pendingRequests.push({
           agentName,
@@ -1766,7 +2009,10 @@ export class AgentFramework {
       if (this.hookOrchestrator) {
         try {
           const hookParams = this.buildBeforeInferenceParams(agent, trigger);
-          const hookInjections = await this.hookOrchestrator.beforeInference(hookParams);
+          const hookInjections = this.scopeInjectionsForAgent(
+            agent.name,
+            await this.hookOrchestrator.beforeInference(hookParams),
+          );
           if (hookInjections.length > 0) {
             injections = injections ? [...injections, ...hookInjections] : hookInjections;
           }
@@ -2927,6 +3173,33 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+    // Conversation forks publish only to their home channel: a missing
+    // channelId defaults to it, an explicit foreign channelId is rejected.
+    const home = this.conversationAgentHomes.get(agentName);
+    if (home && call.name === 'channel_publish') {
+      const input = (call.input ?? {}) as { channelId?: string };
+      if (!input.channelId) {
+        call = { ...call, input: { ...input, channelId: home } };
+      } else if (input.channelId !== home) {
+        this.emitTrace({
+          type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
+          error: `conversation agent ${agentName} attempted publish to ${input.channelId}`,
+        });
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: 'channels',
+          result: {
+            success: false,
+            error: `This conversation is bound to channel ${home}; publishing to ${input.channelId} is not allowed.`,
+            isError: true,
+          },
+        });
+        return;
+      }
+    }
+
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 

@@ -130,5 +130,16 @@ export { InferenceRouter } from './inference-router.js';
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
 
+// Per-channel conversation routing (fork-per-channel agents)
+export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
+export type {
+  ConversationRouterConfig,
+  ConversationBinding,
+  RoutingDecision,
+  IncomingMessageFacts,
+  BindRule,
+  TriggerRule,
+} from './conversation-router.js';
+
 // State management (Section 8, checkpoint trees + JSON Patch)
 export { CheckpointManager, applyJsonPatch } from './checkpoint-manager.js';
