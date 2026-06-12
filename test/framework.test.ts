@@ -54,13 +54,25 @@ class MockYieldingStream implements YieldingStream {
       return;
     }
 
-    // Emit tokens
+    // Emit block lifecycle + tokens. Mirroring the membrane's native yielding
+    // path (block_start → tokens → block_complete) so tests exercise the
+    // framework's 'block' case-arm + the blockType/blockIndex tagging on
+    // tokens. Real membrane emits 'block' on every block transition; we emit
+    // one text block per response, which is enough to cover the trace plumbing.
     const text = response.rawAssistantText;
     if (text) {
+      this.events.push({
+        type: 'block',
+        event: { event: 'block_start', index: 0, block: { type: 'text' } },
+      } as StreamEvent);
       this.events.push({
         type: 'tokens',
         content: text,
         meta: { type: 'text', visible: true, blockIndex: 0 },
+      } as StreamEvent);
+      this.events.push({
+        type: 'block',
+        event: { event: 'block_complete', index: 0, block: { type: 'text', content: text } },
       } as StreamEvent);
     }
 
@@ -630,6 +642,54 @@ describe('Streaming lifecycle', () => {
     // Agent should be idle after completion
     const agent = framework.getAgent('assistant')!;
     assert.strictEqual(agent.state.status, 'idle');
+
+    await framework.stop();
+    rmSync(tempDir, { recursive: true });
+  });
+
+  it('should tag inference:tokens with block metadata and emit content_block boundaries', async () => {
+    const testModule = new TestModule();
+    type TraceEvent = { type: string; [k: string]: unknown };
+    const captured: TraceEvent[] = [];
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'thinking ⊕ text' }]));
+
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test' }],
+      modules: [testModule],
+    });
+
+    framework.onTrace((e) => captured.push(e as unknown as TraceEvent));
+
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: 'Hi',
+      metadata: {},
+    });
+
+    await framework.runUntilIdle();
+
+    const tokenEvents = captured.filter((e) => e.type === 'inference:tokens');
+    assert.ok(tokenEvents.length > 0, 'expected at least one inference:tokens event');
+    for (const t of tokenEvents) {
+      assert.strictEqual(t.blockType, 'text', 'tokens carry blockType from ChunkMeta');
+      assert.strictEqual(t.blockIndex, 0, 'tokens carry blockIndex from ChunkMeta');
+    }
+
+    const blockEvents = captured.filter((e) => e.type === 'inference:content_block');
+    const phases = blockEvents.map((e) => e.phase);
+    assert.deepStrictEqual(
+      phases,
+      ['block_start', 'block_complete'],
+      'content_block boundary events fire in lifecycle order'
+    );
+    for (const b of blockEvents) {
+      assert.strictEqual(b.blockType, 'text');
+      assert.strictEqual(b.blockIndex, 0);
+    }
 
     await framework.stop();
     rmSync(tempDir, { recursive: true });

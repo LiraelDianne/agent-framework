@@ -45,6 +45,16 @@ export interface AgentConfig {
   /** Per-agent context compile budget (input tokens). When unset, the
    *  ContextManager's built-in default (100k) applies. */
   contextBudgetTokens?: number;
+  /**
+   * Extended thinking config. When `enabled: true`, the agent runs with
+   * Anthropic's native extended thinking; responses include `thinking` blocks
+   * with cryptographic signatures, and the API enforces `temperature: 1`
+   * (Membrane handles this). Omit or set `enabled: false` to disable.
+   */
+  thinking?: {
+    enabled: boolean;
+    budgetTokens?: number;
+  };
 }
 
 /**

@@ -37,6 +37,12 @@ export class Agent {
    * return HTTP 400 if it's set, even to 1.
    */
   readonly temperature: number | undefined;
+  /**
+   * Extended thinking config. When set with `enabled: true`, Membrane will
+   * request native thinking from the provider. Signatures on response thinking
+   * blocks are preserved through Chronicle.
+   */
+  readonly thinking: { enabled: boolean; budgetTokens?: number } | undefined;
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -62,6 +68,7 @@ export class Agent {
     this.triggerSources = config.triggerSources ?? 'all';
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature;
+    this.thinking = config.thinking;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -200,6 +207,7 @@ export class Agent {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
+        ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
       tools: tools.length > 0 ? tools : undefined,
       assistantParticipant: this.name,
@@ -329,6 +337,7 @@ export class Agent {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
+        ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: true,
