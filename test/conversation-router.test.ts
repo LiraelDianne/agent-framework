@@ -15,7 +15,7 @@ function makeRouter(overrides: Partial<ConstructorParameters<typeof Conversation
 
 test('DM message binds without a mention (default dm bind: always)', () => {
   const router = makeRouter();
-  const decision = router.route({ channelId: 'slack:D1', mentioned: false, isDm: true, now: T0 });
+  const decision = router.route({ channelId: 'slack:D1', mentioned: false, kind: 'dm', now: T0 });
   assert.equal(decision.kind, 'spawn');
   if (decision.kind === 'spawn') {
     assert.equal(decision.generation, 1);
@@ -26,19 +26,19 @@ test('DM message binds without a mention (default dm bind: always)', () => {
 
 test('channel message without mention stays unbound (default channel bind: mention)', () => {
   const router = makeRouter();
-  const decision = router.route({ channelId: 'slack:C1', mentioned: false, isDm: false, now: T0 });
+  const decision = router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel', now: T0 });
   assert.equal(decision.kind, 'unbound');
 });
 
 test('channel mention spawns a fork', () => {
   const router = makeRouter();
-  const decision = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 });
+  const decision = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 });
   assert.equal(decision.kind, 'spawn');
 });
 
 test('bind rule never keeps DMs unbound', () => {
   const router = makeRouter({ bind: { dm: 'never' } });
-  const decision = router.route({ channelId: 'slack:D1', mentioned: true, isDm: true, now: T0 });
+  const decision = router.route({ channelId: 'slack:D1', mentioned: true, kind: 'dm', now: T0 });
   assert.equal(decision.kind, 'unbound');
 });
 
@@ -48,17 +48,17 @@ test('bind rule never keeps DMs unbound', () => {
 
 test('spawn decision does not create the binding until bind() is called', () => {
   const router = makeRouter();
-  const d1 = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 });
+  const d1 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 });
   assert.equal(d1.kind, 'spawn');
   assert.equal(router.getBinding('slack:C1'), undefined);
 
   // Framework failed to spawn → next mention proposes the same generation.
-  const d2 = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 + 1 });
+  const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 + 1 });
   assert.equal(d2.kind, 'spawn');
   if (d2.kind === 'spawn') assert.equal(d2.generation, 1);
 
   if (d2.kind === 'spawn') router.bind('slack:C1', d2.agentName, d2.generation, T0 + 1);
-  const d3 = router.route({ channelId: 'slack:C1', mentioned: false, isDm: false, now: T0 + 2 });
+  const d3 = router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel', now: T0 + 2 });
   assert.equal(d3.kind, 'existing');
 });
 
@@ -70,11 +70,11 @@ test('bound channel: non-mentions land without triggering, mentions trigger', ()
   const router = makeRouter();
   router.bind('slack:C1', 'conversation-slack-C1-g1', 1, T0);
 
-  const ambient = router.route({ channelId: 'slack:C1', mentioned: false, isDm: false, now: T0 + 1 });
+  const ambient = router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel', now: T0 + 1 });
   assert.equal(ambient.kind, 'existing');
   if (ambient.kind === 'existing') assert.equal(ambient.trigger, false);
 
-  const mention = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 + 2 });
+  const mention = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 + 2 });
   assert.equal(mention.kind, 'existing');
   if (mention.kind === 'existing') assert.equal(mention.trigger, true);
 });
@@ -82,7 +82,7 @@ test('bound channel: non-mentions land without triggering, mentions trigger', ()
 test('bound DM: every message triggers', () => {
   const router = makeRouter();
   router.bind('slack:D1', 'conversation-slack-D1-g1', 1, T0);
-  const decision = router.route({ channelId: 'slack:D1', mentioned: false, isDm: true, now: T0 + 1 });
+  const decision = router.route({ channelId: 'slack:D1', mentioned: false, kind: 'dm', now: T0 + 1 });
   assert.equal(decision.kind, 'existing');
   if (decision.kind === 'existing') assert.equal(decision.trigger, true);
 });
@@ -96,20 +96,20 @@ test('expired() respects lastActivity refresh from route()', () => {
   router.bind('slack:C1', 'conversation-slack-C1-g1', 1, T0);
 
   // Ambient traffic keeps the binding alive even without triggering.
-  router.route({ channelId: 'slack:C1', mentioned: false, isDm: false, now: T0 + 900 });
+  router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel', now: T0 + 900 });
   assert.deepEqual(router.expired(T0 + 1500), []);
   assert.equal(router.expired(T0 + 1901).length, 1);
 });
 
 test('rebind after expiry gets a fresh generation and agent name', () => {
   const router = makeRouter({ idleTtlMs: 1000 });
-  const d1 = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 });
+  const d1 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 });
   if (d1.kind !== 'spawn') assert.fail('expected spawn');
   router.bind('slack:C1', d1.agentName, d1.generation, T0);
 
   router.unbind('slack:C1'); // framework does this after the closure turn
 
-  const d2 = router.route({ channelId: 'slack:C1', mentioned: true, isDm: false, now: T0 + 5000 });
+  const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 + 5000 });
   assert.equal(d2.kind, 'spawn');
   if (d2.kind === 'spawn') {
     assert.equal(d2.generation, 2);
@@ -126,22 +126,59 @@ test('channelForAgent reverse lookup', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DM classification
+// Channel classification
 // ---------------------------------------------------------------------------
 
-test('isDmChannel reads descriptor metadata and message channel_type', () => {
+test('classifyChannel reads descriptor metadata and message channel_type', () => {
   const im: ChannelDescriptor = {
     id: 'slack:D1', type: 'slack', label: 'DM: @alice', direction: 'bidirectional',
     address: {}, metadata: { is_im: true },
+  };
+  const mpim: ChannelDescriptor = {
+    id: 'slack:G1', type: 'slack', label: 'Group DM', direction: 'bidirectional',
+    address: {}, metadata: { is_mpim: true },
   };
   const channel: ChannelDescriptor = {
     id: 'slack:C1', type: 'slack', label: '#general', direction: 'bidirectional',
     address: {}, metadata: { is_member: true },
   };
-  assert.equal(ConversationRouter.isDmChannel(im), true);
-  assert.equal(ConversationRouter.isDmChannel(channel), false);
-  assert.equal(ConversationRouter.isDmChannel(undefined, { channel_type: 'im' }), true);
-  assert.equal(ConversationRouter.isDmChannel(undefined, { channel_type: 'mpim' }), true);
-  assert.equal(ConversationRouter.isDmChannel(undefined, { channel_type: 'channel' }), false);
-  assert.equal(ConversationRouter.isDmChannel(undefined, undefined), false);
+  assert.equal(ConversationRouter.classifyChannel(im), 'dm');
+  assert.equal(ConversationRouter.classifyChannel(mpim), 'groupDm');
+  assert.equal(ConversationRouter.classifyChannel(channel), 'channel');
+  assert.equal(ConversationRouter.classifyChannel(undefined, { channel_type: 'im' }), 'dm');
+  assert.equal(ConversationRouter.classifyChannel(undefined, { channel_type: 'mpim' }), 'groupDm');
+  assert.equal(ConversationRouter.classifyChannel(undefined, { channel_type: 'channel' }), 'channel');
+  assert.equal(ConversationRouter.classifyChannel(undefined, undefined), 'channel');
+});
+
+test('group DMs bind on any message but trigger only on mention by default', () => {
+  const router = new ConversationRouter({ templateAgent: 'main' });
+  const ambient = router.route({ channelId: 'slack:G1', mentioned: false, kind: 'groupDm', now: T0 });
+  assert.equal(ambient.kind, 'spawn', 'group DM binds without a mention');
+  assert.equal((ambient as { trigger: boolean }).trigger, false, 'no firehose replies in group DMs');
+
+  const mention = router.route({ channelId: 'slack:G2', mentioned: true, kind: 'groupDm', now: T0 });
+  assert.equal(mention.kind, 'spawn');
+  assert.equal((mention as { trigger: boolean }).trigger, true, 'mention triggers');
+});
+
+test('generation counters export/hydrate round-trips and never regresses', () => {
+  const router = new ConversationRouter({ templateAgent: 'main' });
+  router.bind('slack:C1', 'conversation-slack-C1-g3', 3, T0);
+  router.bind('slack:D1', 'conversation-slack-D1-g1', 1, T0);
+  const exported = router.exportGenerations();
+  assert.deepEqual(exported, { 'slack:C1': 3, 'slack:D1': 1 });
+
+  const restored = new ConversationRouter({ templateAgent: 'main' });
+  restored.hydrateGenerations(exported);
+  const decision = restored.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel', now: T0 });
+  assert.equal(decision.kind, 'spawn');
+  assert.equal((decision as { generation: number }).generation, 4, 'restart must not reuse generation names');
+
+  // Hydration never regresses a counter that advanced in the meantime.
+  restored.bind('slack:D1', 'conversation-slack-D1-g5', 5, T0);
+  restored.hydrateGenerations(exported);
+  const d1 = restored.route({ channelId: 'slack:D2', mentioned: false, kind: 'dm', now: T0 });
+  assert.equal(d1.kind, 'spawn', 'sanity');
+  assert.equal(restored.exportGenerations()['slack:D1'], 5);
 });

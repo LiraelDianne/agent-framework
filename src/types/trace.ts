@@ -265,6 +265,11 @@ export type TraceEvent =
       channelId: string;
       agentName: string;
       reason: 'idle-ttl';
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-disposed';
+      agentName: string;
+      channelId?: string;
     });
 
 /**

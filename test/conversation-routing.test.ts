@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import type { ProcessEvent } from '../src/index.js';
+import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function incomingEvent(overrides: {
@@ -49,16 +49,28 @@ describe('Conversation routing', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function makeFramework(conversations: Record<string, unknown> = {}) {
+  async function makeFramework(
+    conversations: Partial<ConversationRouterConfig> = {},
+    storeFile = 'test.chronicle',
+  ) {
     return AgentFramework.create({
-      storePath: join(tempDir, 'test.chronicle'),
+      storePath: join(tempDir, storeFile),
       membrane: membrane.asMembrane(),
       agents: [
         { name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' },
       ],
       modules: [],
-      conversations: { templateAgent: 'trunk', ...conversations } as never,
+      conversations: { templateAgent: 'trunk', ...conversations },
     });
+  }
+
+  /** Make a binding look idle past the TTL and re-arm the sweep throttle —
+   * deterministic expiry instead of racing a 1ms TTL against the wall clock. */
+  function forceExpiry(framework: AgentFramework, channelId: string, idleTtlMs: number) {
+    const binding = framework.getConversationRouter()!.getBinding(channelId);
+    assert.ok(binding, `binding for ${channelId} should exist before forcing expiry`);
+    binding!.lastActivity = Date.now() - idleTtlMs - 1_000;
+    (framework as unknown as { lastConversationSweep: number }).lastConversationSweep = 0;
   }
 
   it('rejects an unknown template agent at creation', async () => {
@@ -169,19 +181,20 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
-  it('idle TTL runs a closure turn, unbinds, and the next message spawns g2', async () => {
+  it('idle TTL runs a closure turn, unbinds, disposes the fork, and the next message spawns g2', async () => {
+    const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
-    const framework = await makeFramework({ idleTtlMs: 1 });
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'hi', channelType: 'im' }));
     await framework.runUntilIdle();
     const router = framework.getConversationRouter()!;
-    assert.ok(router.getBinding('slack:D3'));
+    assert.ok(router.getBinding('slack:D3'), 'spawn should leave a live binding');
+    const g1 = framework.getAgent('conversation-slack-D3-g1');
+    assert.ok(g1, 'g1 fork should exist after spawn');
 
-    // Let the TTL elapse, re-arm the sweep throttle, and provide the
-    // closure-turn response.
-    await new Promise((r) => setTimeout(r, 5));
-    (framework as unknown as { lastConversationSweep: number }).lastConversationSweep = 0;
+    // Force expiry deterministically and provide the closure-turn response.
+    forceExpiry(framework, 'slack:D3', IDLE_TTL_MS);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
 
     // Nudge the loop so the sweep runs.
@@ -189,11 +202,14 @@ describe('Conversation routing', () => {
     await framework.runUntilIdle();
 
     assert.equal(router.getBinding('slack:D3'), undefined, 'binding should be gone after TTL');
-    const g1 = framework.getAgent('conversation-slack-D3-g1')!;
-    const { messages } = await g1.getContextManager().compile();
+    const { messages } = await g1!.getContextManager().compile();
     assert.ok(
       messages.some((m) => JSON.stringify(m.content).includes('engagement is closing')),
       'closure prompt should be in the fork context',
+    );
+    assert.equal(
+      framework.getAgent('conversation-slack-D3-g1'), null,
+      'closed fork should be disposed once its closure turn finished',
     );
 
     // Next DM spawns a fresh generation.
@@ -201,6 +217,70 @@ describe('Conversation routing', () => {
     framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'back again', channelType: 'im' }));
     await framework.runUntilIdle();
     assert.ok(framework.getAgent('conversation-slack-D3-g2'), 'rebind spawns generation 2');
+
+    await framework.stop();
+  });
+
+  it('restart does not reuse generation names or re-seed an existing namespace', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+    const fw1 = await makeFramework({}, 'restart.chronicle');
+    fw1.getAgent('trunk')!.getContextManager().addMessage('user', [
+      { type: 'text', text: 'HANDBOOK-V1: always check the logs first.' },
+    ]);
+
+    fw1.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'case one', channelType: 'im' }));
+    await fw1.runUntilIdle();
+    assert.ok(fw1.getAgent('conversation-slack-D9-g1'), 'first engagement spawns g1');
+    await fw1.stop();
+
+    // Restart: same store, fresh framework. The generation counter must come
+    // back from Chronicle so the next engagement is g2 in a fresh namespace.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'fresh' }]));
+    const fw2 = await makeFramework({}, 'restart.chronicle');
+    fw2.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'case two', channelType: 'im' }));
+    await fw2.runUntilIdle();
+
+    assert.equal(fw2.getAgent('conversation-slack-D9-g1'), null, 'g1 must not be resurrected');
+    const g2 = fw2.getAgent('conversation-slack-D9-g2');
+    assert.ok(g2, 'restart spawns the next generation, not generation 1 again');
+
+    const { messages } = await g2!.getContextManager().compile();
+    const handbookCopies = messages.filter(
+      (m) => JSON.stringify(m.content).includes('HANDBOOK-V1'),
+    ).length;
+    assert.equal(handbookCopies, 1, 'fresh namespace is seeded with exactly one template copy');
+    assert.ok(
+      !messages.some((m) => JSON.stringify(m.content).includes('case one')),
+      'a new generation must not inherit the previous engagement history',
+    );
+
+    await fw2.stop();
+  });
+
+  it('forks cannot open channels or close foreign ones', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    framework.pushEvent(incomingEvent({ channelId: 'slack:C7', text: 'bot, help', mentioned: true }));
+    await framework.runUntilIdle();
+    const forkName = 'conversation-slack-C7-g1';
+    assert.ok(framework.getAgent(forkName), 'fork should exist');
+
+    const failures: Array<{ tool: string; error: string }> = [];
+    framework.onTrace((e: TraceEvent) => {
+      if (e.type === 'tool:failed') {
+        failures.push({ tool: (e as { tool: string }).tool, error: (e as { error: string }).error });
+      }
+    });
+
+    const fw = framework as unknown as {
+      dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: Record<string, unknown> }): void;
+    };
+    fw.dispatchChannelToolCall(forkName, { id: 't1', name: 'channel_open', input: { channelId: 'slack:C8' } });
+    fw.dispatchChannelToolCall(forkName, { id: 't2', name: 'channel_close', input: { channelId: 'slack:C8' } });
+
+    assert.equal(failures.length, 2, 'both foreign channel operations should be rejected');
+    assert.ok(failures[0]!.error.includes('cannot open channels'), 'channel_open is rejected outright');
+    assert.ok(failures[1]!.error.includes('closing slack:C8 is not allowed'), 'foreign channel_close is rejected');
 
     await framework.stop();
   });

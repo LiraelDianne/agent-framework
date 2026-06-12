@@ -21,9 +21,12 @@
  * that channel spawns a *fresh* fork (generation + 1) from the current
  * trunk, so handbook/template updates propagate between engagements.
  *
- * The binding table is in-memory. Fork agent context lives in Chronicle
- * under its own namespace and survives restarts; bindings themselves are
- * re-established by the next qualifying message.
+ * The binding table is in-memory — bindings are re-established by the next
+ * qualifying message after a restart. The generation counters, by contrast,
+ * are persisted by the framework (exportGenerations/hydrateGenerations):
+ * a restarted host must NOT reuse generation 1's agent name, or it would
+ * reopen the previous engagement's Chronicle namespace and re-seed the
+ * template context on top of the old history.
  */
 
 import type { ContextStrategy } from '@animalabs/context-manager';
@@ -40,15 +43,23 @@ export type BindRule = 'always' | 'mention' | 'never';
  * the fork's context). */
 export type TriggerRule = 'always' | 'mention';
 
+/** How a channel is classified for bind/trigger rules. Group DMs are their
+ * own kind: the bot was added deliberately (so they bind like DMs) but they
+ * host multi-human chatter (so they trigger like channels by default —
+ * inferring on every message of a four-human group DM is a firehose). */
+export type ChannelKind = 'dm' | 'groupDm' | 'channel';
+
 export interface ConversationRouterConfig {
   /** Agent whose context seeds new forks (the "trunk"/warm checkpoint). */
   templateAgent: string;
 
-  /** Bind rules per channel kind. Defaults: dm 'always', channel 'mention'. */
-  bind?: { dm?: BindRule; channel?: BindRule };
+  /** Bind rules per channel kind.
+   * Defaults: dm 'always', groupDm 'always', channel 'mention'. */
+  bind?: { dm?: BindRule; groupDm?: BindRule; channel?: BindRule };
 
-  /** Trigger rules per channel kind. Defaults: dm 'always', channel 'mention'. */
-  trigger?: { dm?: TriggerRule; channel?: TriggerRule };
+  /** Trigger rules per channel kind.
+   * Defaults: dm 'always', groupDm 'mention', channel 'mention'. */
+  trigger?: { dm?: TriggerRule; groupDm?: TriggerRule; channel?: TriggerRule };
 
   /** Idle time before a binding expires and the fork is closed. Default 12h. */
   idleTtlMs?: number;
@@ -82,8 +93,8 @@ export interface IncomingMessageFacts {
   channelId: string;
   /** Personal mention of the bot (metadata.mentioned from the adapter). */
   mentioned: boolean;
-  /** DM or group-DM channel (see isDmChannel). */
-  isDm: boolean;
+  /** Channel classification (see classifyChannel). */
+  kind: ChannelKind;
   /** Clock injection for tests; defaults to Date.now(). */
   now?: number;
 }
@@ -156,9 +167,8 @@ export class ConversationRouter {
       };
     }
 
-    const bindRule = facts.isDm
-      ? (this.config.bind?.dm ?? 'always')
-      : (this.config.bind?.channel ?? 'mention');
+    const bindRule = this.config.bind?.[facts.kind]
+      ?? (facts.kind === 'channel' ? 'mention' : 'always');
 
     const binds =
       bindRule === 'always' || (bindRule === 'mention' && facts.mentioned);
@@ -224,25 +234,43 @@ export class ConversationRouter {
   // ==========================================================================
 
   /**
-   * Classify a channel as DM-like from its descriptor and/or message
-   * metadata. Slack marks DMs/group DMs with is_im/is_mpim on the channel
-   * descriptor and channel_type on each message; other platforms can adopt
-   * either convention.
+   * Classify a channel from its descriptor and/or message metadata. Slack
+   * marks DMs/group DMs with is_im/is_mpim on the channel descriptor and
+   * channel_type on each message; other platforms can adopt either
+   * convention.
    */
-  static isDmChannel(
+  static classifyChannel(
     descriptor?: ChannelDescriptor,
     messageMetadata?: Record<string, unknown>,
-  ): boolean {
+  ): ChannelKind {
     const meta = descriptor?.metadata as Record<string, unknown> | undefined;
-    if (meta?.is_im === true || meta?.is_mpim === true) return true;
+    if (meta?.is_im === true) return 'dm';
+    if (meta?.is_mpim === true) return 'groupDm';
     const channelType = messageMetadata?.channel_type;
-    return channelType === 'im' || channelType === 'mpim';
+    if (channelType === 'im') return 'dm';
+    if (channelType === 'mpim') return 'groupDm';
+    return 'channel';
+  }
+
+  /** Export the per-channel engagement counters for persistence — they must
+   * survive restarts, or a re-engaged channel reuses generation 1's name and
+   * reopens (and re-seeds) the previous engagement's Chronicle namespace. */
+  exportGenerations(): Record<string, number> {
+    return Object.fromEntries(this.generations);
+  }
+
+  /** Restore persisted engagement counters (see exportGenerations). */
+  hydrateGenerations(generations: Record<string, number>): void {
+    for (const [channelId, generation] of Object.entries(generations)) {
+      if (typeof generation === 'number' && generation > (this.generations.get(channelId) ?? 0)) {
+        this.generations.set(channelId, generation);
+      }
+    }
   }
 
   private shouldTrigger(facts: IncomingMessageFacts): boolean {
-    const rule = facts.isDm
-      ? (this.config.trigger?.dm ?? 'always')
-      : (this.config.trigger?.channel ?? 'mention');
+    const rule = this.config.trigger?.[facts.kind]
+      ?? (facts.kind === 'dm' ? 'always' : 'mention');
     return rule === 'always' || facts.mentioned;
   }
 

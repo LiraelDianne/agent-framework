@@ -139,6 +139,7 @@ export type {
   IncomingMessageFacts,
   BindRule,
   TriggerRule,
+  ChannelKind,
 } from './conversation-router.js';
 
 // State management (Section 8, checkpoint trees + JSON Patch)

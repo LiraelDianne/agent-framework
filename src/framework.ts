@@ -75,6 +75,7 @@ import type {
 import type { ContextInjection } from '@animalabs/context-manager';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
@@ -232,6 +233,10 @@ export class AgentFramework {
   private conversationAgentHomes: Map<string, string> = new Map();
   /** Last idle-TTL sweep timestamp. */
   private lastConversationSweep = 0;
+
+  /** Forks whose TTL closure turn has been queued — disposed (removed from
+   * agents/agentConfigs/conversationAgentHomes) when their stream ends. */
+  private closingConversationAgents: Set<string> = new Set();
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
@@ -374,6 +379,24 @@ export class AgentFramework {
         );
       }
       framework.conversationRouter = new ConversationRouter(config.conversations);
+
+      // Generation counters persist across restarts — reusing generation 1's
+      // agent name after a restart would reopen (and re-seed) the previous
+      // engagement's Chronicle namespace.
+      try {
+        store.registerState({ id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
+      } catch {
+        // Already registered
+      }
+      try {
+        const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
+          { generations?: Record<string, number> } | null;
+        if (data?.generations) {
+          framework.conversationRouter.hydrateGenerations(data.generations);
+        }
+      } catch {
+        // No persisted state yet
+      }
     }
 
     // Initialize EventGate if configured (before MCPL so it can be wired as trigger filter)
@@ -1712,7 +1735,7 @@ export class AgentFramework {
     const decision = router.route({
       channelId: event.channelId,
       mentioned: event.metadata?.mentioned === true,
-      isDm: ConversationRouter.isDmChannel(descriptor, event.metadata),
+      kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
     });
 
     if (decision.kind === 'unbound') {
@@ -1729,6 +1752,7 @@ export class AgentFramework {
       try {
         agent = await this.createConversationAgent(decision.agentName, event.channelId);
         router.bind(event.channelId, decision.agentName, decision.generation);
+        this.persistConversationRouterState();
         this.emitTrace({
           type: 'mcpl:conversation-spawned',
           channelId: event.channelId,
@@ -1807,10 +1831,17 @@ export class AgentFramework {
 
     // Seed with the template's compiled context, renaming the template
     // participant so the fork reads its inheritance as its own history.
-    const { messages: compiled } = await template.getContextManager().compile();
-    for (const msg of compiled) {
-      const participant = msg.participant === template.name ? name : msg.participant;
-      contextManager.addMessage(participant, msg.content);
+    // Guard: only seed a genuinely fresh namespace. Generation counters are
+    // persisted precisely so names aren't reused, but if this namespace has
+    // history anyway (counter state lost, crash between spawn and persist),
+    // seeding again would stack another template copy on top of it.
+    const { messages: existing } = await contextManager.compile();
+    if (existing.length === 0) {
+      const { messages: compiled } = await template.getContextManager().compile();
+      for (const msg of compiled) {
+        const participant = msg.participant === template.name ? name : msg.participant;
+        contextManager.addMessage(participant, msg.content);
+      }
     }
 
     const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
@@ -1819,6 +1850,37 @@ export class AgentFramework {
     this.agentConfigs.set(name, config);
     this.conversationAgentHomes.set(name, channelId);
     return agent;
+  }
+
+  /** Persist the router's generation counters (see hydration in create()). */
+  private persistConversationRouterState(): void {
+    if (!this.conversationRouter) return;
+    try {
+      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, {
+        generations: this.conversationRouter.exportGenerations(),
+      });
+    } catch (error) {
+      console.error('Failed to persist conversation router state:', error);
+    }
+  }
+
+  /**
+   * Remove a closed conversation fork from the framework: its closure turn
+   * has finished, so the home mapping has served its purpose and keeping the
+   * agent registered would just grow every agent scan and broadcast filter
+   * forever. The fork's context stays in Chronicle for investigation.
+   */
+  private disposeConversationAgent(agentName: string): void {
+    this.closingConversationAgents.delete(agentName);
+    const channelId = this.conversationAgentHomes.get(agentName);
+    this.agents.delete(agentName);
+    this.agentConfigs.delete(agentName);
+    this.conversationAgentHomes.delete(agentName);
+    this.emitTrace({
+      type: 'mcpl:conversation-disposed',
+      agentName,
+      channelId,
+    });
   }
 
   /**
@@ -1868,7 +1930,13 @@ export class AgentFramework {
       });
 
       const agent = this.agents.get(binding.agentName);
-      if (!agent) continue;
+      if (!agent) {
+        // Agent vanished (external reset) — nothing to close, just make sure
+        // its bookkeeping doesn't linger.
+        this.agentConfigs.delete(binding.agentName);
+        this.conversationAgentHomes.delete(binding.agentName);
+        continue;
+      }
       agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
@@ -1880,6 +1948,21 @@ export class AgentFramework {
         source: 'framework',
         timestamp: now,
       });
+      // Disposed when the closure stream ends (driveStream finally), with
+      // the reaper below as fallback.
+      this.closingConversationAgents.add(binding.agentName);
+    }
+
+    // Fallback reaper: a closing fork whose closure inference never ran
+    // (request dropped as stale, inference policy veto) would otherwise stay
+    // registered forever. No active stream + no pending request = done.
+    for (const agentName of [...this.closingConversationAgents]) {
+      if (
+        !this.activeStreams.has(agentName) &&
+        !this.pendingRequests.some((r) => r.agentName === agentName)
+      ) {
+        this.disposeConversationAgent(agentName);
+      }
     }
   }
 
@@ -1996,6 +2079,11 @@ export class AgentFramework {
       let injections: ContextInjection[] | undefined;
 
       // Module gatherContext (fail-open, 5s timeout per module)
+      // NOTE: module injections are NOT channel-scoped — only the MCPL hook
+      // injections below pass through scopeInjectionsForAgent (channel
+      // context arrives via beforeInference hooks by adapter convention). A
+      // module that starts emitting per-channel context must scope it per
+      // agent itself, or conversation forks will see cross-channel content.
       try {
         const moduleInjections = await this.moduleRegistry.gatherContext(agent.name);
         if (moduleInjections.length > 0) {
@@ -2395,6 +2483,12 @@ export class AgentFramework {
     } finally {
       this.activeStreams.delete(agent.name);
       this.pendingAssistantBlocks.delete(agent.name);
+
+      // A conversation fork whose TTL closure turn just finished is done for
+      // good — dispose it so the agent map doesn't grow monotonically.
+      if (this.closingConversationAgents.has(agent.name)) {
+        this.disposeConversationAgent(agent.name);
+      }
 
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
       if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
@@ -3173,30 +3267,40 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
-    // Conversation forks publish only to their home channel: a missing
-    // channelId defaults to it, an explicit foreign channelId is rejected.
+    // Conversation forks act only on their home channel. channel_publish and
+    // channel_close default a missing channelId to home and reject foreign
+    // ones; channel_open is rejected outright — opening channels mutates
+    // framework-global state (the open-channel set every agent's injections
+    // are scoped against), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
-    if (home && call.name === 'channel_publish') {
-      const input = (call.input ?? {}) as { channelId?: string };
-      if (!input.channelId) {
-        call = { ...call, input: { ...input, channelId: home } };
-      } else if (input.channelId !== home) {
+    if (home) {
+      const reject = (error: string): void => {
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
-          error: `conversation agent ${agentName} attempted publish to ${input.channelId}`,
+          error: `conversation agent ${agentName}: ${error}`,
         });
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
           agentName,
           moduleName: 'channels',
-          result: {
-            success: false,
-            error: `This conversation is bound to channel ${home}; publishing to ${input.channelId} is not allowed.`,
-            isError: true,
-          },
+          result: { success: false, error, isError: true },
         });
+      };
+
+      if (call.name === 'channel_open') {
+        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`);
         return;
+      }
+      if (call.name === 'channel_publish' || call.name === 'channel_close') {
+        const input = (call.input ?? {}) as { channelId?: string };
+        if (!input.channelId) {
+          call = { ...call, input: { ...input, channelId: home } };
+        } else if (input.channelId !== home) {
+          const verb = call.name === 'channel_publish' ? 'publishing to' : 'closing';
+          reject(`This conversation is bound to channel ${home}; ${verb} ${input.channelId} is not allowed.`);
+          return;
+        }
       }
     }
 
