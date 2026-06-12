@@ -54,6 +54,14 @@ export interface AgentConfig {
   thinking?: {
     enabled: boolean;
     budgetTokens?: number;
+    /** 'enabled' (explicit budget, default) or 'adaptive' (model-managed) */
+    type?: 'enabled' | 'adaptive';
+    /**
+     * How thinking content is returned: 'summarized' (readable summary) or
+     * 'omitted' (empty thinking field, signature only). Fable 5 / Opus 4.7+
+     * default to 'omitted' — set 'summarized' to receive thinking text.
+     */
+    display?: 'summarized' | 'omitted';
   };
 }
 

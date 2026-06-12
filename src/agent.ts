@@ -42,7 +42,7 @@ export class Agent {
    * request native thinking from the provider. Signatures on response thinking
    * blocks are preserved through Chronicle.
    */
-  readonly thinking: { enabled: boolean; budgetTokens?: number } | undefined;
+  readonly thinking: AgentConfig['thinking'];
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;

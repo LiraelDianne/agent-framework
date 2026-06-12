@@ -1946,13 +1946,27 @@ export class AgentFramework {
               calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
 
-            // Build assistant content blocks from preamble text + tool_use blocks
-            const assistantBlocks: ContentBlock[] = [];
-            if (event.context.preamble) {
-              assistantBlocks.push({ type: 'text', text: event.context.preamble });
-            }
-            for (const c of event.calls) {
-              assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+            // Build assistant content blocks for this round. Prefer the
+            // membrane's verbatim round content (membrane ≥0.5.64): it
+            // preserves native thinking / redacted_thinking blocks with
+            // their signatures IN ORDER — the API requires signed thinking
+            // to precede its tool_use in the same assistant turn, so
+            // rebuilding from preamble + calls would break thinking+tools.
+            const roundContent = (event.context as { roundContent?: ContentBlock[] }).roundContent;
+            let assistantBlocks: ContentBlock[];
+            if (roundContent && roundContent.length > 0) {
+              assistantBlocks = roundContent.filter(
+                (b) => b.type !== 'tool_result'
+              );
+            } else {
+              // Fallback (older membrane / XML tool mode): preamble + calls
+              assistantBlocks = [];
+              if (event.context.preamble) {
+                assistantBlocks.push({ type: 'text', text: event.context.preamble });
+              }
+              for (const c of event.calls) {
+                assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+              }
             }
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
@@ -2011,18 +2025,20 @@ export class AgentFramework {
             }
 
             // Add assistant response to context.
-            // If we had tool calls, the tool_use blocks were already stored as
-            // pendingAssistantBlocks and flushed when tool results arrived.
-            // Only store trailing content (text after the last tool round) to
-            // avoid double-storing tool_use blocks.
-            const hadToolCalls = response.content.some(
-              (b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'
+            // If we had tool calls, each round's blocks (thinking + text +
+            // tool_use) were already stored as pendingAssistantBlocks and
+            // flushed when tool results arrived. Only store TRAILING content
+            // — blocks after the last tool block. A type-based filter would
+            // double-store earlier rounds' text/thinking AND detach signed
+            // thinking blocks from their tool_use turn (the API requires
+            // thinking to precede tool_use in the same assistant turn).
+            const lastToolIdx = response.content.reduce(
+              (last: number, b: ContentBlock, i: number) =>
+                b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
+              -1
             );
-            if (hadToolCalls) {
-              // Filter to only trailing text/thinking blocks (no tool_use — those are already stored)
-              const trailingContent = response.content.filter(
-                (block: ContentBlock) => block.type !== 'tool_use' && block.type !== 'tool_result'
-              );
+            if (lastToolIdx >= 0) {
+              const trailingContent = response.content.slice(lastToolIdx + 1);
               if (trailingContent.length > 0) {
                 agent.addAssistantResponse(trailingContent);
               }

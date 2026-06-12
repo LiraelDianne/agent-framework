@@ -44,7 +44,7 @@
   "dependencies": {
     "@animalabs/chronicle": "^0.2.0",
     "@animalabs/context-manager": "^0.5.3",
-    "@animalabs/membrane": "^0.5.49",
+    "@animalabs/membrane": "^0.5.64",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
     "ws": "^8.18.0"
