@@ -129,6 +129,13 @@ export interface GateOptions {
   configPath?: string;
   /** Initial config, seeded to gate.json if the file doesn't exist. */
   config?: GateConfig;
+  /**
+   * Path to a JSON file listing user ids that may wake the agent even while
+   * it is asleep (`sleep` tool). The file is either a bare array of id
+   * strings or `{ "userIds": [...] }`. Hot-reloaded on change. When unset or
+   * missing, no one bypasses sleep.
+   */
+  privilegedUsersPath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,5 +208,15 @@ export interface GateStatus {
     triggered: number;
     skipped: number;
     byEventType: Record<string, { triggered: number; skipped: number }>;
+  };
+  /** Present when the agent is currently asleep (sleep tool). */
+  sleep?: {
+    until: number;
+    remainingMs: number;
+    note?: string;
+    /** How many wake events have been suppressed during the current sleep. */
+    suppressed: number;
+    /** Count of privileged user ids that may wake through sleep. */
+    privilegedCount: number;
   };
 }

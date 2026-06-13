@@ -180,6 +180,24 @@ function extractGateFields(event: ProcessEvent): {
 /**
  * The main agent framework.
  */
+/** Params for a `host/command` request from an MCPL surface server. */
+interface HostCommandParams {
+  command?: string;
+  agentName?: string;
+  turns?: number;
+  /** Message-granular undo: branch the chronicle so the last N messages
+   *  (regardless of participant) are no longer on the active branch.
+   *  Mutually exclusive with `turns`. */
+  messages?: number;
+  /** For the `hide` command: Discord message id of the (first) message to
+   *  remove. With `toMessageId`, removes the inclusive range between them. */
+  fromMessageId?: string;
+  /** For the `hide` command: Discord message id ending an inclusive range. */
+  toMessageId?: string;
+  requesterId?: string;
+  requesterName?: string;
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -368,6 +386,7 @@ export class AgentFramework {
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
+        privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m) => framework.addMessage(p, c, m as MessageMetadata),
         requestInference: (agentName, reason, source) => {
@@ -582,7 +601,9 @@ export class AgentFramework {
   getAllTools(): import('./types/index.js').ToolDefinition[] {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
-    const gateTools = this.eventGate ? [this.eventGate.getToolDefinition()] : [];
+    const gateTools = this.eventGate
+      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS]
+      : [];
     if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
       return moduleTools;
     }
@@ -927,6 +948,313 @@ export class AgentFramework {
    * Query inference logs.
    * Returns entries with summary info (doesn't resolve blobs).
    */
+  /** Synthesized sleep/wake tool definitions (present when a gate is wired). */
+  private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'sleep',
+      description:
+        'Go quiet: suppress external pings and wakes for a number of seconds. ' +
+        'Messages still accumulate in your context — you just won’t be woken to ' +
+        'respond to them until the window passes. Your heartbeat still beats: you’ll ' +
+        'briefly rouse on each tick and can keep resting or call `wake` to get up early. ' +
+        'Privileged users can also still reach you. By default announces in your current channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          seconds: { type: 'number', description: 'How long to stay asleep, in seconds.' },
+          announce: {
+            type: 'boolean',
+            description: 'Announce the sleep in the current sticky channel (default true).',
+          },
+          message: {
+            type: 'string',
+            description: 'Optional custom announcement text (overrides the default).',
+          },
+        },
+        required: ['seconds'],
+      },
+    },
+    {
+      name: 'wake',
+      description: 'End your current sleep early, resuming normal wakes immediately.',
+      inputSchema: { type: 'object' },
+    },
+  ];
+
+  /** Refusal category → Discord reaction emoji. Unknown categories get 🛑. */
+  private static readonly REFUSAL_REACTIONS: Record<string, string> = {
+    bio: '☣️',
+    chem: '🧪',
+    nuclear: '☢️',
+    cyber: '💻',
+    reasoning_extraction: '🧠',
+  };
+
+  /**
+   * Mark an inference refusal visibly: react on the message that holds the
+   * conversational locus (the most recent incoming channel message) with a
+   * category-specific emoji. Best-effort — failures are logged, never thrown,
+   * and non-Discord loci are silently skipped.
+   */
+  private async reactToRefusal(agentName: string, category: string): Promise<void> {
+    try {
+      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      if (!incoming) return;
+      // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
+      // the reaction tool wants the raw Discord channel (or thread) id — the
+      // last segment.
+      const parts = incoming.channelId.split(':');
+      if (parts[0] !== 'discord') return;
+      const channelId = parts[parts.length - 1];
+      const emoji = AgentFramework.REFUSAL_REACTIONS[category] ?? '🛑';
+      // Resolve the MCPL server that owns the locus channel and call
+      // tools/call directly on its connection (bare tool name — no prefix
+      // games), bypassing the agent event queue so no synthetic tool-result
+      // is injected into a turn the agent never took.
+      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
+      if (!server) {
+        console.error(
+          `[inference-refusal] reaction skipped: no MCPL server for locus "${incoming.channelId}" (agent=${agentName})`,
+        );
+        return;
+      }
+      await server.sendToolsCall('add_reaction', {
+        channelId,
+        messageId: incoming.messageId,
+        emoji,
+      });
+    } catch (err) {
+      console.error(
+        '[inference-refusal] reaction failed:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Handle a `host/command` request from an MCPL surface server (e.g. a
+   * Discord slash command). Currently supports:
+   *
+   *   undo — revert the last N inference turns (branch-based, see
+   *   `undoLastTurn`). The response includes the last message the agent
+   *   would see in its context after the undo, obtained via the transparent
+   *   `previewActivation` render (no inference, no Chronicle writes).
+   */
+  private async handleHostCommand(
+    serverId: string,
+    params: HostCommandParams,
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    undone?: number;
+    requested?: number;
+    messagesRemoved?: number;
+    hidden?: number;
+    /** For `hide`: the Discord (channelId, messageId) of each removed message
+     *  that carried one — so the surface can mark them with a reaction. */
+    hiddenRefs?: Array<{ channelId: string; messageId: string }>;
+    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    if (params.command !== 'undo' && params.command !== 'hide') {
+      return { ok: false, error: `Unknown host command: ${String(params.command)}` };
+    }
+
+    const agentName = params.agentName ?? [...this.agents.keys()][0];
+    if (!agentName || !this.agents.has(agentName)) {
+      return { ok: false, error: `Unknown agent: ${String(agentName)}` };
+    }
+
+    // hide: redact a single message (or an inclusive range) from the active
+    // branch, addressed by Discord message id. Unlike undo this is a
+    // removal-in-place (chronicle redact), not a branch rewind.
+    if (params.command === 'hide') {
+      const agent = this.agents.get(agentName)!;
+      if (agent.state.status !== 'idle') {
+        return { ok: false, error: `Cannot hide while agent is ${agent.state.status}` };
+      }
+      if (!params.fromMessageId) {
+        return { ok: false, error: 'hide: fromMessageId is required' };
+      }
+      const cm = agent.getContextManager();
+      const all = cm.getAllMessages();
+      const byDiscordId = (did: string) =>
+        all.findIndex((m) => String((m.metadata as { messageId?: unknown } | undefined)?.messageId) === String(did));
+
+      // Collect Discord refs of every message in [lo, hi] that carries one,
+      // so the surface can mark them. channelId here is whatever the ingest
+      // path stored (raw id or "discord:guild:channel"); the surface
+      // normalizes it.
+      const refsIn = (lo: number, hi: number) => {
+        const refs: Array<{ channelId: string; messageId: string }> = [];
+        for (let i = lo; i <= hi; i++) {
+          const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
+          if (md?.messageId && md?.channelId) {
+            refs.push({ channelId: String(md.channelId), messageId: String(md.messageId) });
+          }
+        }
+        return refs;
+      };
+
+      const fromIdx = byDiscordId(params.fromMessageId);
+      if (fromIdx < 0) {
+        return {
+          ok: false,
+          error: `Message ${params.fromMessageId} is not an addressable message in context (it may only exist inside backscroll text, or predates this session).`,
+        };
+      }
+
+      try {
+        if (params.toMessageId) {
+          const toIdx = byDiscordId(params.toMessageId);
+          if (toIdx < 0) {
+            return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
+          }
+          const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          const refs = refsIn(lo, hi);
+          cm.removeMessages(all[lo].id, all[hi].id);
+          console.error(
+            `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
+              `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+          );
+          return {
+            ok: true,
+            hidden: hi - lo + 1,
+            hiddenRefs: refs,
+            lastVisible: await this.lastVisiblePreview(agentName),
+          };
+        }
+        const refs = refsIn(fromIdx, fromIdx);
+        cm.removeMessage(all[fromIdx].id);
+        console.error(
+          `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
+            `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+        );
+        return {
+          ok: true,
+          hidden: 1,
+          hiddenRefs: refs,
+          lastVisible: await this.lastVisiblePreview(agentName),
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    // Message-granular mode: branch the chronicle at the message that should
+    // become the new tail (ContextManager.branchAt — origin-sequence-based
+    // time-travel branching; see chronicle's rfc-state-item-origins addendum).
+    // No turn checkpoints involved, so this reaches past turn boundaries.
+    if (typeof params.messages === 'number' && params.messages > 0) {
+      const agent = this.agents.get(agentName)!;
+      if (agent.state.status !== 'idle') {
+        return { ok: false, error: `Cannot undo while agent is ${agent.state.status}` };
+      }
+      const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
+      const cm = agent.getContextManager();
+      const allMessages = cm.getAllMessages();
+      if (n >= allMessages.length) {
+        return {
+          ok: false,
+          error: `Cannot remove ${n} message(s) — history has ${allMessages.length}; at least one must remain.`,
+        };
+      }
+      const target = allMessages[allMessages.length - 1 - n];
+      const branchName = cm.branchAt(target.id, `undo-msgs/${agentName}/${Date.now()}`);
+      await cm.switchBranch(branchName);
+
+      // Materialize config files from the new branch (fire-and-forget; gate
+      // picks up via mtime) — mirrors undoLastTurn.
+      const wsUndo = this.moduleRegistry.getModule('workspace');
+      if (wsUndo && 'materializeMount' in wsUndo) {
+        (wsUndo as { materializeMount: (m: string) => Promise<void> })
+          .materializeMount('_config')
+          .catch(() => {});
+      }
+
+      console.error(
+        `[host-command] undo-messages agent=${agentName} removed=${n} branch=${branchName}` +
+          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+      );
+
+      return {
+        ok: true,
+        messagesRemoved: n,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    }
+
+    const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
+    let undone = 0;
+    try {
+      for (let i = 0; i < requested; i++) {
+        const r = this.undoLastTurn(agentName);
+        if (!r.undone) break;
+        undone++;
+      }
+    } catch (error) {
+      // e.g. "Cannot undo while agent is streaming" — report what happened,
+      // including any turns already undone before the failure.
+      const msg = error instanceof Error ? error.message : String(error);
+      if (undone === 0) return { ok: false, error: msg };
+      console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
+    }
+
+    console.error(
+      `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
+        ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+    );
+
+    if (undone === 0) {
+      return { ok: true, undone: 0, requested, lastVisible: null };
+    }
+
+    return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
+  }
+
+  /**
+   * The last message the agent would see in its context right now, via the
+   * transparent `previewActivation` render (no inference, no Chronicle
+   * writes). Returns null if the preview fails or the context is empty.
+   */
+  private async lastVisiblePreview(
+    agentName: string,
+  ): Promise<{ participant?: string; role?: string; preview?: string } | null> {
+    try {
+      const preview = await this.previewActivation(agentName);
+      const messages = (preview as { messages?: unknown[] }).messages ?? [];
+      const last = messages[messages.length - 1] as
+        | { role?: string; participant?: string; content?: unknown }
+        | undefined;
+      if (!last) return null;
+      const blocks = Array.isArray(last.content) ? last.content : [];
+      const text = blocks
+        .map((b) => (b && typeof b === 'object' && 'text' in b ? String((b as { text: unknown }).text) : ''))
+        .join(' ')
+        .trim();
+      // Surface-injected preambles (<system>…</system>, <backscroll>…
+      // </backscroll>) can dominate the head of a bundled incoming message
+      // and bury the actual conversational line. Strip them for the
+      // preview; fall back to the raw text if nothing else remains.
+      const stripped = text
+        .replace(/<system>[\s\S]*?<\/system>/g, '')
+        .replace(/<backscroll\b[\s\S]*?<\/backscroll>/g, '')
+        .trim();
+      const body = stripped.length > 0 ? stripped : text;
+      return {
+        participant: last.participant,
+        role: last.role,
+        preview: body.length > 400 ? `${body.slice(0, 400)}…` : body,
+      };
+    } catch (error) {
+      console.error(
+        '[host-command] post-undo context preview failed:',
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    }
+  }
+
   queryInferenceLogs(query?: InferenceLogQuery): InferenceLogQueryResult {
     const limit = query?.limit ?? 50;
     const offset = query?.offset ?? 0;
@@ -2144,6 +2472,24 @@ export class AgentFramework {
               stopReason: response.stopReason,
             });
 
+            // Surface refusals instead of going silently mute: stderr line
+            // (headless inference failures are otherwise under-logged) + an
+            // emoji reaction on the triggering Discord message, keyed by the
+            // refusal category from stop_details.
+            if (response.stopReason === 'refusal') {
+              // stop_details lives on the raw PROVIDER response
+              // (response.raw is RawAccess = { request, response, headers }).
+              const stopDetails = (response.raw?.response as {
+                stop_details?: { category?: string; explanation?: string };
+              } | undefined)?.stop_details;
+              const category = stopDetails?.category ?? 'unknown';
+              console.error(
+                `[inference-refusal] agent=${agent.name} category=${category}` +
+                  (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
+              );
+              void this.reactToRefusal(agent.name, category);
+            }
+
             // Dispatch speech (and thoughts if any)
             if (speechContent.length > 0 || thoughts.length > 0) {
               const speechContext: SpeechContext = {
@@ -2511,6 +2857,12 @@ export class AgentFramework {
     // Route gate_status tool
     if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route sleep / wake tools
+    if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
+      this.dispatchSleepToolCall(agentName, enrichedCall);
       return;
     }
 
@@ -3007,6 +3359,21 @@ export class AgentFramework {
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
+    // Handle host-level admin commands from a surface (e.g. Discord /undo)
+    connection.on('host-command', async (
+      params: HostCommandParams,
+      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+    ) => {
+      if (!responder) return;
+      try {
+        const result = await this.handleHostCommand(connection.id, params ?? {});
+        responder.respond(result);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        responder.respondError(-32603, err.message);
+      }
+    });
+
     // Handle dynamic tool list changes (notifications/tools/list_changed)
     connection.on('tools-list-changed', () => {
       this.handleToolsListChanged(connection.id);
@@ -3244,6 +3611,53 @@ export class AgentFramework {
           result: { success: false, error: err.message, isError: true },
         });
       });
+  }
+
+  /**
+   * Handle the synthesized `sleep` / `wake` tools. `sleep` arms the gate's
+   * suppression window, optionally announces in the sticky channel, and ends
+   * the turn (the agent goes idle immediately). `wake` clears sleep.
+   */
+  private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const gate = this.eventGate!;
+    const input = (call.input ?? {}) as { seconds?: number; announce?: boolean; message?: string };
+
+    const finish = (result: ToolResult) => {
+      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    };
+
+    if (call.name === 'wake') {
+      const was = gate.clearSleep();
+      finish({ success: true, data: { woke: was } });
+      return;
+    }
+
+    const seconds = Number(input.seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      finish({ success: false, error: 'sleep: `seconds` must be a positive number', isError: true });
+      return;
+    }
+
+    const { until } = gate.setSleep(seconds, input.message);
+    const announce = input.announce !== false; // default true
+    const human =
+      seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
+      : seconds >= 60 ? `${Math.round(seconds / 60)}m`
+      : `${Math.round(seconds)}s`;
+
+    // Announce in the sticky channel (best-effort; never blocks the result).
+    if (announce && this.channelRegistry) {
+      const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
+      this.channelRegistry.routeSpeech(agentName, text).catch((err) => {
+        console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+      });
+    }
+
+    console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
+    // endTurn: the agent stops here and goes idle for the duration.
+    finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {

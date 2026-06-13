@@ -831,6 +831,11 @@ export class ChannelRegistry {
   // Private: Channel Lookup
   // ==========================================================================
 
+  /** Server id owning a registered channel (by descriptor id), or null. */
+  getChannelServerId(channelId: string): string | null {
+    return this.findChannelEntry(channelId)?.serverId ?? null;
+  }
+
   /**
    * Find a channel entry by channelId (searches across all servers).
    * Returns the first match.
