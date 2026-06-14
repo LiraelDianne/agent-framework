@@ -632,6 +632,14 @@ export class ChannelRegistry {
   }
 
   /**
+   * Get the descriptor for a channel by its channelId (first match across
+   * servers). Used by the conversation router for DM classification.
+   */
+  getDescriptor(channelId: string): ChannelDescriptor | undefined {
+    return this.findChannelEntry(channelId)?.descriptor;
+  }
+
+  /**
    * Get all open channels.
    */
   getOpenChannels(): ChannelEntry[] {

@@ -63,6 +63,18 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// Per-channel conversation routing
+export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+export type {
+  ConversationRouterConfig,
+  ConversationBinding,
+  RoutingDecision,
+  IncomingMessageFacts,
+  BindRule,
+  TriggerRule,
+  ChannelKind,
+} from './mcpl/index.js';
+
 // Re-export commonly used types from dependencies
 export type { ContextManager, ContextStrategy, TokenBudget } from '@animalabs/context-manager';
 export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from '@animalabs/context-manager';

@@ -234,6 +234,42 @@ export type TraceEvent =
       type: 'mcpl:server-stderr';
       serverId: string;
       line: string;
+    })
+
+  // Per-channel conversation routing lifecycle
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-spawned';
+      channelId: string;
+      agentName: string;
+      generation: number;
+      template: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-spawn-failed';
+      channelId: string;
+      agentName: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-unrouted';
+      channelId: string;
+      messageId: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-binding-orphaned';
+      channelId: string;
+      agentName: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-closed';
+      channelId: string;
+      agentName: string;
+      reason: 'idle-ttl';
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:conversation-disposed';
+      agentName: string;
+      channelId?: string;
     });
 
 /**
