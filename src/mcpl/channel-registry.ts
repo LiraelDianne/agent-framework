@@ -174,6 +174,43 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       required: [],
     },
   },
+  {
+    name: 'think',
+    description:
+      'Reason privately. The content stays in your own context and is NOT sent to any ' +
+      'channel or surface. This does NOT end or silence your turn: if you also write ' +
+      'plain text this turn, that text is still posted as your reply. Use think() purely ' +
+      'to work things out before (or instead of) speaking. To deliberately NOT reply this ' +
+      'turn, call skip_reply instead.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        content: {
+          type: 'string',
+          description: 'Your private thought / reasoning (optional; not sent anywhere).',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'skip_reply',
+    description:
+      'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
+      'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
+      'nothing to add, or you are waiting. Any plain text you wrote this turn stays private ' +
+      'and is NOT posted. To reply instead, just write plain text (no tool call).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Optional private note on why you are not replying (not sent anywhere).',
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ============================================================================
@@ -183,6 +220,20 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 interface ChannelRegistryOptions {
   /** Callback to determine whether an incoming message should trigger inference. */
   shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  /**
+   * Called when a text-only turn's speech could NOT be delivered to its
+   * conversational locus — no locus, an unregistered channel, a missing
+   * server, or the server reporting `delivered: false`. The host wires this
+   * to drop a `[discord-send-failed]` marker into chronicle so the failure is
+   * visible to the agent (and operator) rather than silently lost. Must not
+   * itself trigger inference (avoid wake loops).
+   */
+  onRouteFailure?: (info: {
+    conversationId: string;
+    channelId: string | null;
+    reason: string;
+    textLen: number;
+  }) => void;
 }
 
 // ============================================================================
@@ -201,6 +252,12 @@ export class ChannelRegistry {
     op?: 'start' | 'stop',
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  private onRouteFailure?: (info: {
+    conversationId: string;
+    channelId: string | null;
+    reason: string;
+    textLen: number;
+  }) => void;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
@@ -246,6 +303,7 @@ export class ChannelRegistry {
     this.emitTraceFn = emitTraceFn;
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
+    this.onRouteFailure = options?.onRouteFailure;
   }
 
   /**
@@ -371,6 +429,43 @@ export class ChannelRegistry {
       this.defaultPublishChannel = message.channelId;
       this.defaultPublishMessageId = message.messageId;
       this.defaultPublishThreadId = message.threadId;
+
+      // Lazy-register the channel if we've never seen it. A channel can deliver
+      // an incoming message before its channels/register (boot enumeration) or
+      // channels/changed (post-boot create / View-permission grant) round-trip
+      // lands — or the registration event can be missed entirely (e.g. the bot
+      // gains visibility in a way that fires neither `channelCreate` nor a
+      // View-permission transition). Without a registry entry, routeSpeech()
+      // can't resolve this channel as an outbound locus and the agent's reply
+      // is silently dropped, even though this very message proves the channel
+      // is reachable. The inbound message carries enough to make it publishable,
+      // so register it here; a later authoritative channels/register or
+      // channels/changed will overwrite this descriptor with the richer one.
+      const incomingKey = `${serverId}:${message.channelId}`;
+      if (!this.channels.has(incomingKey)) {
+        const channelLabel =
+          typeof message.metadata?.channelName === 'string' && message.metadata.channelName
+            ? (message.metadata.channelName as string)
+            : message.channelId;
+        this.channels.set(incomingKey, {
+          serverId,
+          descriptor: {
+            id: message.channelId,
+            type: serverId,
+            label: channelLabel,
+            direction: 'bidirectional',
+            address: message.threadId ? { threadId: message.threadId } : undefined,
+            metadata: { lazyRegistered: true },
+          },
+          open: true,
+        });
+        this.emitTraceFn({
+          type: 'mcpl:channel-lazy-registered',
+          serverId,
+          channelId: message.channelId,
+          label: channelLabel,
+        });
+      }
 
       // Determine whether to trigger inference
       let triggerInference = true;
@@ -577,6 +672,12 @@ export class ChannelRegistry {
       case 'channel_publish':
         return this.handleToolPublish(input as { channelId: string; content: string });
 
+      case 'think':
+        return this.handleToolThink(input as { content?: string });
+
+      case 'skip_reply':
+        return this.handleToolSkipReply(input as { reason?: string });
+
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
     }
@@ -730,6 +831,11 @@ export class ChannelRegistry {
   // Private: Channel Lookup
   // ==========================================================================
 
+  /** Server id owning a registered channel (by descriptor id), or null. */
+  getChannelServerId(channelId: string): string | null {
+    return this.findChannelEntry(channelId)?.serverId ?? null;
+  }
+
   /**
    * Find a channel entry by channelId (searches across all servers).
    * Returns the first match.
@@ -872,6 +978,113 @@ export class ChannelRegistry {
         isError: true,
       };
     }
+  }
+
+  /**
+   * Handle the synthesized `think` tool — a private reasoning scratchpad. It
+   * sends nothing, and (unlike before) does NOT silence the turn: trailing
+   * plain text is still routed as the reply. The thought stays in the agent's
+   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
+   */
+  private handleToolThink(input: { content?: string }): ToolResult {
+    return {
+      success: true,
+      data: {
+        noted: true,
+        note:
+          'Thought recorded (private — not sent anywhere). This did NOT silence your turn: ' +
+          'write plain text to reply, or call skip_reply to end the turn without replying.',
+        content: typeof input?.content === 'string' ? input.content : undefined,
+      },
+    };
+  }
+
+  /**
+   * Handle the synthesized `skip_reply` tool — the deliberate "stay silent"
+   * signal. A no-op as far as any surface is concerned (sends nothing); its
+   * effect is that the framework's output routing treats this as a silencing
+   * tool, so any trailing prose this turn is NOT posted. Replaces the old
+   * overloaded use of `think` for staying silent.
+   */
+  private handleToolSkipReply(input: { reason?: string }): ToolResult {
+    return {
+      success: true,
+      data: {
+        skipped: true,
+        note: 'Ended the turn without replying — nothing was sent to any channel.',
+        reason: typeof input?.reason === 'string' ? input.reason : undefined,
+      },
+    };
+  }
+
+  /**
+   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
+   * Publish the agent's plain-text speech to the current conversational locus
+   * (the most recent incoming channel, tracked cross-surface here in the host).
+   * Called by the framework on a text-only turn — replaces the per-surface
+   * sticky auto-post that used to live in discord-mcpl. Returns null when there
+   * is no locus / the channel or its server can't be resolved (in which case
+   * the speech simply stays in chronicle + module surfaces).
+   */
+  async routeSpeech(
+    conversationId: string,
+    text: string,
+  ): Promise<{ delivered: boolean; channelId: string } | null> {
+    // Surface a routing failure: emit a trace AND notify the host (which drops
+    // a `[discord-send-failed]` marker into chronicle) so the agent learns her
+    // reply never reached the human, instead of it vanishing silently.
+    const fail = (channelId: string | null, reason: string): null => {
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
+      this.emitTraceFn({
+        type: 'mcpl:speech-route-failed',
+        channelId: channelId ?? '',
+        reason,
+        textLen: text.length,
+      });
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length });
+      return null;
+    };
+
+    const channelId = this.defaultPublishChannel;
+    if (!channelId) {
+      return fail(null, 'no locus (defaultPublishChannel null)');
+    }
+
+    const entry = this.findChannelEntry(channelId);
+    if (!entry) {
+      return fail(channelId, `no registered channel for locus "${channelId}"`);
+    }
+
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      return fail(channelId, `server "${entry.serverId}" not found`);
+    }
+
+    const publishParams: ChannelsPublishParams = {
+      conversationId,
+      channelId,
+      content: [{ type: 'text', text }],
+    };
+    const result = await server.sendChannelsPublish(publishParams);
+    const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
+
+    // The server accepted the publish RPC but reported the message was not
+    // actually delivered (e.g. missing Send Messages permission). Previously
+    // this returned `{ delivered: true }`, masking the failure. Surface it.
+    if (delivered === false) {
+      return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
+    }
+
+    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
+    this.emitTraceFn({
+      type: 'mcpl:speech-routed',
+      serverId: entry.serverId,
+      channelId,
+      delivered,
+      textLen: text.length,
+    });
+
+    return { delivered, channelId };
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {

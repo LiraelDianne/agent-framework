@@ -6,6 +6,7 @@ import type {
   ContextInjection,
 } from '@animalabs/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
+import type { TraceEventListener } from './trace.js';
 
 /**
  * Filter criteria for querying messages.
@@ -184,6 +185,21 @@ export interface ModuleContext {
    * Unregister this module as a speech handler.
    */
   unregisterSpeechHandler(): void;
+
+  /**
+   * Subscribe to the framework's trace event stream for observability.
+   *
+   * Modules use this to react to agent lifecycle without polling — e.g. an
+   * adapter that wants to show a "typing" indicator can bracket it between
+   * `inference:started` and the terminal events (`inference:turn_ended`,
+   * `inference:aborted`, `inference:failed`, `inference:exhausted`), all of
+   * which carry `agentName`. The terminal events fire once per turn, after any
+   * tool-call cycles, so a single start/stop bracket spans the whole turn.
+   *
+   * Returns an unsubscribe function. Call it in the module's `stop()` to avoid
+   * leaking listeners across teardown/recreate (e.g. session switch).
+   */
+  onTrace(listener: TraceEventListener): () => void;
 }
 
 /**

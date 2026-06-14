@@ -646,6 +646,10 @@ export class McplServerConnection extends EventEmitter {
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
     [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
     'notifications/tools/list_changed': 'tools-list-changed',
+    // Host-level admin commands initiated from a surface (e.g. a Discord
+    // slash command). Params: { command, ... }; host responds with a
+    // command-specific result object.
+    'host/command': 'host-command',
   };
 
   /**

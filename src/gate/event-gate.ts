@@ -330,6 +330,20 @@ export class EventGate {
   private defaultSkipped = 0;
   private defaultByEventType = new Map<string, { triggered: number; skipped: number }>();
 
+  // Sleep state (set via the `sleep` tool). Passive: evaluate() suppresses
+  // non-privileged wakes while now() < sleepUntil. No timer — after expiry the
+  // next event evaluates normally.
+  private sleepUntil = 0;
+  private sleepNote: string | undefined;
+  private sleepSuppressed = 0;
+
+  // Privileged users who may wake the agent through sleep. Hot-reloaded from
+  // privilegedUsersPath on change.
+  private privilegedUsersPath: string | undefined;
+  private privilegedUserIds = new Set<string>();
+  private privilegedMtime = 0;
+  private lastPrivilegedCheck = 0;
+
   // Dependency-injected callbacks
   private emitTrace: (event: TraceEventLike) => void;
   private addMessageFn: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
@@ -342,6 +356,7 @@ export class EventGate {
   constructor(opts: {
     configPath: string;
     initialConfig?: GateConfig;
+    privilegedUsersPath?: string;
     emitTrace: (event: TraceEventLike) => void;
     addMessage: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
     requestInference: (agentName: string, reason: string, source: string) => void;
@@ -350,11 +365,13 @@ export class EventGate {
     now?: () => number;
   }) {
     this.configPath = opts.configPath;
+    this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
     this.now = opts.now ?? (() => Date.now());
+    this.loadPrivileged();
 
     // Seed or reconcile the on-disk config.
     //
@@ -596,6 +613,35 @@ export class EventGate {
 
   evaluate(info: GateEventInfo): GateDecision {
     this.reloadIfChanged();
+
+    // Sleep suppression: while asleep, drop EXTERNAL wakes. Two things still
+    // rouse the agent — its own heartbeat (an internal clock, not an outside
+    // interruption: each tick lets the agent reconsider and optionally `wake`)
+    // and a privileged user's ping. The event always enters context regardless
+    // (the gate only governs inference triggering).
+    if (this.sleepUntil > this.now()) {
+      this.reloadPrivilegedIfChanged();
+      const isHeartbeat =
+        info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
+      const authorId = this.extractAuthorId(info.metadata);
+      const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
+      if (!isHeartbeat && !privileged) {
+        this.sleepSuppressed++;
+        this.totalEvaluations++;
+        this.emitTrace({
+          type: 'gate:decision',
+          eventType: info.eventType,
+          serverId: info.serverId || undefined,
+          channelId: info.channelId || undefined,
+          matchedPolicy: 'asleep',
+          trigger: false,
+          behavior: 'skip',
+          timestamp: this.now(),
+        });
+        return { trigger: false, policyName: 'asleep', behavior: 'skip' };
+      }
+      // Privileged author — fall through to normal policy evaluation.
+    }
 
     const policy = this.matchPolicy(info);
     const decision = this.computeDecision(policy, info);
@@ -927,9 +973,93 @@ export class EventGate {
   // Tool: gate:status
   // =========================================================================
 
+  // =========================================================================
+  // Sleep
+  // =========================================================================
+
+  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
+  setSleep(seconds: number, note?: string): { until: number } {
+    const ms = Math.max(0, Math.floor(seconds * 1000));
+    this.sleepUntil = this.now() + ms;
+    this.sleepNote = note;
+    this.sleepSuppressed = 0;
+    this.reloadPrivilegedIfChanged();
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'sleep:set',
+      matchedPolicy: 'asleep',
+      trigger: false,
+      behavior: 'skip',
+      timestamp: this.now(),
+    });
+    return { until: this.sleepUntil };
+  }
+
+  /** End sleep immediately. Returns true if the agent was asleep. */
+  clearSleep(): boolean {
+    const wasAsleep = this.sleepUntil > this.now();
+    this.sleepUntil = 0;
+    this.sleepNote = undefined;
+    return wasAsleep;
+  }
+
+  /** Current sleep state, or null if awake. */
+  getSleepState(): { until: number; remainingMs: number; note?: string; suppressed: number } | null {
+    const remainingMs = this.sleepUntil - this.now();
+    if (remainingMs <= 0) return null;
+    return { until: this.sleepUntil, remainingMs, note: this.sleepNote, suppressed: this.sleepSuppressed };
+  }
+
+  /** Author id from an event's metadata, across the discord ingest shapes. */
+  private extractAuthorId(metadata?: Record<string, unknown>): string | null {
+    if (!metadata) return null;
+    const author = metadata.author as { id?: unknown } | undefined;
+    if (author && author.id != null) return String(author.id);
+    if (metadata.authorId != null) return String(metadata.authorId);
+    return null;
+  }
+
+  /** Load the privileged-users file (bare array or { userIds: [...] }). */
+  private loadPrivileged(): void {
+    if (!this.privilegedUsersPath) return;
+    try {
+      if (!existsSync(this.privilegedUsersPath)) {
+        this.privilegedUserIds = new Set();
+        this.privilegedMtime = 0;
+        return;
+      }
+      this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
+      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
+      const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
+      this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
+    } catch (err) {
+      this.configErrors.push(
+        `Failed to load privileged-users file: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Throttled mtime-based reload of the privileged-users file. */
+  private reloadPrivilegedIfChanged(): void {
+    if (!this.privilegedUsersPath) return;
+    const now = this.now();
+    if (now - this.lastPrivilegedCheck < RELOAD_THROTTLE_MS) return;
+    this.lastPrivilegedCheck = now;
+    try {
+      if (!existsSync(this.privilegedUsersPath)) {
+        if (this.privilegedUserIds.size > 0) this.privilegedUserIds = new Set();
+        return;
+      }
+      const mtime = statSync(this.privilegedUsersPath).mtimeMs;
+      if (mtime !== this.privilegedMtime) this.loadPrivileged();
+    } catch {
+      /* leave the last-known set in place on a transient stat/read error */
+    }
+  }
+
   getToolDefinition(): ToolDefinition {
     return {
-      name: 'gate:status',
+      name: 'gate_status',
       description: 'Show the current EventGate configuration, per-policy match counts, debounce state, and any config errors.',
       inputSchema: {
         type: 'object',
@@ -976,7 +1106,20 @@ export class EventGate {
     const byEventType: Record<string, { triggered: number; skipped: number }> = {};
     for (const [k, v] of this.defaultByEventType) byEventType[k] = { ...v };
 
+    const sleepState = this.getSleepState();
+
     return {
+      ...(sleepState
+        ? {
+            sleep: {
+              until: sleepState.until,
+              remainingMs: sleepState.remainingMs,
+              note: sleepState.note,
+              suppressed: sleepState.suppressed,
+              privilegedCount: this.privilegedUserIds.size,
+            },
+          }
+        : {}),
       configPath: this.configPath,
       configSource: this.configSource,
       lastReloadTimestamp: this.lastReloadTimestamp,

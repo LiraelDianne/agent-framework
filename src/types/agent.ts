@@ -42,6 +42,9 @@ export interface AgentConfig {
    *  restarts with recompiled (compressed) context. Default: 150000. */
   maxStreamTokens?: number;
 
+  /** Per-agent context compile budget (input tokens). When unset, the
+   *  ContextManager's built-in default (100k) applies. */
+  contextBudgetTokens?: number;
   /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
@@ -51,6 +54,14 @@ export interface AgentConfig {
   thinking?: {
     enabled: boolean;
     budgetTokens?: number;
+    /** 'enabled' (explicit budget, default) or 'adaptive' (model-managed) */
+    type?: 'enabled' | 'adaptive';
+    /**
+     * How thinking content is returned: 'summarized' (readable summary) or
+     * 'omitted' (empty thinking field, signature only). Fable 5 / Opus 4.7+
+     * default to 'omitted' — set 'summarized' to receive thinking text.
+     */
+    display?: 'summarized' | 'omitted';
   };
 }
 

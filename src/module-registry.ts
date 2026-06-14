@@ -21,6 +21,7 @@ import type {
   SpeechContext,
   SpeechHandlerOptions,
   ProcessEvent,
+  TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
 
@@ -53,6 +54,7 @@ export class ModuleRegistry {
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent) => void;
+  private onTraceFn: (listener: TraceEventListener) => () => void;
 
   constructor(
     store: JsStore,
@@ -65,6 +67,7 @@ export class ModuleRegistry {
       getMessage: (id: MessageId) => StoredMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
       pushEvent: (event: ProcessEvent) => void;
+      onTrace: (listener: TraceEventListener) => () => void;
     }
   ) {
     this.store = store;
@@ -76,6 +79,7 @@ export class ModuleRegistry {
     this.getMessageFn = options.getMessage;
     this.queryMessagesFn = options.queryMessages;
     this.pushEventFn = options.pushEvent;
+    this.onTraceFn = options.onTrace;
   }
 
   /**
@@ -115,7 +119,8 @@ export class ModuleRegistry {
       this.removeMessageFn,
       this.getMessageFn,
       this.queryMessagesFn,
-      this.pushEventFn
+      this.pushEventFn,
+      this.onTraceFn
     );
 
     this.modules.set(module.name, module);
@@ -366,6 +371,7 @@ class ModuleContextImpl implements ModuleContext {
   private getMessageFn: (id: MessageId) => StoredMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent) => void;
+  private onTraceFn: (listener: TraceEventListener) => () => void;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -383,7 +389,8 @@ class ModuleContextImpl implements ModuleContext {
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => StoredMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
-    pushEvent: (event: ProcessEvent) => void
+    pushEvent: (event: ProcessEvent) => void,
+    onTrace: (listener: TraceEventListener) => () => void
   ) {
     this.moduleName = moduleName;
     this.store = store;
@@ -398,6 +405,7 @@ class ModuleContextImpl implements ModuleContext {
     this.getMessageFn = getMessage;
     this.queryMessagesFn = queryMessages;
     this.pushEventFn = pushEvent;
+    this.onTraceFn = onTrace;
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();
@@ -422,6 +430,10 @@ class ModuleContextImpl implements ModuleContext {
 
   getModule<T extends Module>(name: string): T | null {
     return this.registry.getModule<T>(name);
+  }
+
+  onTrace(listener: TraceEventListener): () => void {
+    return this.onTraceFn(listener);
   }
 
   addMessage(

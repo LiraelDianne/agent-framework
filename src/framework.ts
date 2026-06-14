@@ -181,6 +181,24 @@ function extractGateFields(event: ProcessEvent): {
 /**
  * The main agent framework.
  */
+/** Params for a `host/command` request from an MCPL surface server. */
+interface HostCommandParams {
+  command?: string;
+  agentName?: string;
+  turns?: number;
+  /** Message-granular undo: branch the chronicle so the last N messages
+   *  (regardless of participant) are no longer on the active branch.
+   *  Mutually exclusive with `turns`. */
+  messages?: number;
+  /** For the `hide` command: Discord message id of the (first) message to
+   *  remove. With `toMessageId`, removes the inclusive range between them. */
+  fromMessageId?: string;
+  /** For the `hide` command: Discord message id ending an inclusive range. */
+  toMessageId?: string;
+  requesterId?: string;
+  requesterName?: string;
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -200,6 +218,12 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
+  /** Per-agent count of consecutive exhausted inferences (reset on any success).
+   *  Drives hard-down escalation — see noteInferenceExhausted. */
+  private consecutiveInferenceFailures: Map<string, number> = new Map();
+  /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
+   *  escalated loudly to stderr. */
+  private readonly inferenceFailureEscalationThreshold = 3;
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -266,6 +290,7 @@ export class AgentFramework {
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter) => this.queryMessages(filter),
       pushEvent: (event) => this.pushEvent(event),
+      onTrace: (listener) => this.onTrace(listener),
     });
   }
 
@@ -362,6 +387,7 @@ export class AgentFramework {
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
+        privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m) => framework.addMessage(p, c, m as MessageMetadata),
         requestInference: (agentName, reason, source) => {
@@ -487,8 +513,15 @@ export class AgentFramework {
   /**
    * Add a trace event listener for observability.
    */
-  onTrace(listener: TraceEventListener): void {
+  onTrace(listener: TraceEventListener): () => void {
     this.traceListeners.push(listener);
+    // Return an unsubscribe so callers with a bounded lifetime (e.g. modules
+    // that get torn down and recreated on session switch) don't leak
+    // listeners. Existing callers that ignore the return value are unaffected.
+    return () => {
+      const idx = this.traceListeners.indexOf(listener);
+      if (idx >= 0) this.traceListeners.splice(idx, 1);
+    };
   }
 
   /**
@@ -569,11 +602,86 @@ export class AgentFramework {
   getAllTools(): import('./types/index.js').ToolDefinition[] {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
-    const gateTools = this.eventGate ? [this.eventGate.getToolDefinition()] : [];
+    const gateTools = this.eventGate
+      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS]
+      : [];
     if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
       return moduleTools;
     }
     return [...moduleTools, ...this.mcplTools, ...channelTools, ...gateTools];
+  }
+
+  /**
+   * Build the membrane-normalized request that WOULD be emitted if `agentName`
+   * were activated right now — WITHOUT running inference, opening a stream, or
+   * mutating agent state. Intended for debug/preview tooling.
+   *
+   * Transparency contract (default): the preview is side-effect-free and
+   * leaves no trace on the system. It does only read-only work —
+   * `ContextManager.compile` (which never triggers compression itself;
+   * compression runs in the background out-of-band), tool filtering, and
+   * system-prompt assembly — then delegates to `Agent.buildActivationRequest`.
+   * No tokens are spent, nothing is written to Chronicle, and no external
+   * MCPL server is contacted.
+   *
+   * The trade-off is fidelity: the dynamically-gathered ContextInjection[]
+   * (module `gatherContext` + MCPL `beforeInference` hooks) are NOT included
+   * by default, because gathering them is not transparent —
+   *   - module `gatherContext` can run inference (e.g. RetrievalModule makes
+   *     Haiku calls — real token cost and latency), and
+   *   - MCPL `beforeInference` hooks are arbitrary RPCs to external servers
+   *     with side effects, and a preview never sends the paired
+   *     `afterInference`, which can leave a stateful server half-open.
+   *
+   * Pass `{ injections: true }` to opt into full-fidelity gathering and accept
+   * those side effects (byte-faithful to a real activation's injected context).
+   */
+  async previewActivation(
+    agentName: string,
+    opts?: { injections?: boolean }
+  ): Promise<NormalizedRequest> {
+    const agent = this.agents.get(agentName);
+    if (!agent) {
+      throw new Error(`Agent not found: ${agentName}`);
+    }
+
+    const tools = this.getAllTools().filter((t) => agent.canUseTool(t.name));
+
+    // Default: no dynamic injection gathering → fully transparent (no
+    // inference, no Chronicle writes, no external RPC). Opt in explicitly.
+    if (!opts?.injections) {
+      return agent.buildActivationRequest(tools, undefined);
+    }
+
+    // Full-fidelity path: mirrors startAgentStream's injection gathering.
+    // NOT transparent — see the doc comment above.
+    let injections: ContextInjection[] | undefined;
+
+    // Module gatherContext (fail-open, matches startAgentStream)
+    try {
+      const moduleInjections = await this.moduleRegistry.gatherContext(agentName);
+      if (moduleInjections.length > 0) {
+        injections = moduleInjections;
+      }
+    } catch (error) {
+      console.error('Module gatherContext error (preview):', error);
+    }
+
+    // MCPL beforeInference hooks (fail-open). Note: the paired afterInference
+    // is intentionally never sent here — this is a preview, not a real turn.
+    if (this.hookOrchestrator) {
+      try {
+        const hookParams = this.buildBeforeInferenceParams(agent);
+        const hookInjections = await this.hookOrchestrator.beforeInference(hookParams);
+        if (hookInjections.length > 0) {
+          injections = injections ? [...injections, ...hookInjections] : hookInjections;
+        }
+      } catch (error) {
+        console.error('beforeInference hook error (preview):', error);
+      }
+    }
+
+    return agent.buildActivationRequest(tools, injections);
   }
 
   /**
@@ -841,6 +949,313 @@ export class AgentFramework {
    * Query inference logs.
    * Returns entries with summary info (doesn't resolve blobs).
    */
+  /** Synthesized sleep/wake tool definitions (present when a gate is wired). */
+  private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'sleep',
+      description:
+        'Go quiet: suppress external pings and wakes for a number of seconds. ' +
+        'Messages still accumulate in your context — you just won’t be woken to ' +
+        'respond to them until the window passes. Your heartbeat still beats: you’ll ' +
+        'briefly rouse on each tick and can keep resting or call `wake` to get up early. ' +
+        'Privileged users can also still reach you. By default announces in your current channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          seconds: { type: 'number', description: 'How long to stay asleep, in seconds.' },
+          announce: {
+            type: 'boolean',
+            description: 'Announce the sleep in the current sticky channel (default true).',
+          },
+          message: {
+            type: 'string',
+            description: 'Optional custom announcement text (overrides the default).',
+          },
+        },
+        required: ['seconds'],
+      },
+    },
+    {
+      name: 'wake',
+      description: 'End your current sleep early, resuming normal wakes immediately.',
+      inputSchema: { type: 'object' },
+    },
+  ];
+
+  /** Refusal category → Discord reaction emoji. Unknown categories get 🛑. */
+  private static readonly REFUSAL_REACTIONS: Record<string, string> = {
+    bio: '☣️',
+    chem: '🧪',
+    nuclear: '☢️',
+    cyber: '💻',
+    reasoning_extraction: '🧠',
+  };
+
+  /**
+   * Mark an inference refusal visibly: react on the message that holds the
+   * conversational locus (the most recent incoming channel message) with a
+   * category-specific emoji. Best-effort — failures are logged, never thrown,
+   * and non-Discord loci are silently skipped.
+   */
+  private async reactToRefusal(agentName: string, category: string): Promise<void> {
+    try {
+      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      if (!incoming) return;
+      // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
+      // the reaction tool wants the raw Discord channel (or thread) id — the
+      // last segment.
+      const parts = incoming.channelId.split(':');
+      if (parts[0] !== 'discord') return;
+      const channelId = parts[parts.length - 1];
+      const emoji = AgentFramework.REFUSAL_REACTIONS[category] ?? '🛑';
+      // Resolve the MCPL server that owns the locus channel and call
+      // tools/call directly on its connection (bare tool name — no prefix
+      // games), bypassing the agent event queue so no synthetic tool-result
+      // is injected into a turn the agent never took.
+      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
+      if (!server) {
+        console.error(
+          `[inference-refusal] reaction skipped: no MCPL server for locus "${incoming.channelId}" (agent=${agentName})`,
+        );
+        return;
+      }
+      await server.sendToolsCall('add_reaction', {
+        channelId,
+        messageId: incoming.messageId,
+        emoji,
+      });
+    } catch (err) {
+      console.error(
+        '[inference-refusal] reaction failed:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Handle a `host/command` request from an MCPL surface server (e.g. a
+   * Discord slash command). Currently supports:
+   *
+   *   undo — revert the last N inference turns (branch-based, see
+   *   `undoLastTurn`). The response includes the last message the agent
+   *   would see in its context after the undo, obtained via the transparent
+   *   `previewActivation` render (no inference, no Chronicle writes).
+   */
+  private async handleHostCommand(
+    serverId: string,
+    params: HostCommandParams,
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    undone?: number;
+    requested?: number;
+    messagesRemoved?: number;
+    hidden?: number;
+    /** For `hide`: the Discord (channelId, messageId) of each removed message
+     *  that carried one — so the surface can mark them with a reaction. */
+    hiddenRefs?: Array<{ channelId: string; messageId: string }>;
+    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    if (params.command !== 'undo' && params.command !== 'hide') {
+      return { ok: false, error: `Unknown host command: ${String(params.command)}` };
+    }
+
+    const agentName = params.agentName ?? [...this.agents.keys()][0];
+    if (!agentName || !this.agents.has(agentName)) {
+      return { ok: false, error: `Unknown agent: ${String(agentName)}` };
+    }
+
+    // hide: redact a single message (or an inclusive range) from the active
+    // branch, addressed by Discord message id. Unlike undo this is a
+    // removal-in-place (chronicle redact), not a branch rewind.
+    if (params.command === 'hide') {
+      const agent = this.agents.get(agentName)!;
+      if (agent.state.status !== 'idle') {
+        return { ok: false, error: `Cannot hide while agent is ${agent.state.status}` };
+      }
+      if (!params.fromMessageId) {
+        return { ok: false, error: 'hide: fromMessageId is required' };
+      }
+      const cm = agent.getContextManager();
+      const all = cm.getAllMessages();
+      const byDiscordId = (did: string) =>
+        all.findIndex((m) => String((m.metadata as { messageId?: unknown } | undefined)?.messageId) === String(did));
+
+      // Collect Discord refs of every message in [lo, hi] that carries one,
+      // so the surface can mark them. channelId here is whatever the ingest
+      // path stored (raw id or "discord:guild:channel"); the surface
+      // normalizes it.
+      const refsIn = (lo: number, hi: number) => {
+        const refs: Array<{ channelId: string; messageId: string }> = [];
+        for (let i = lo; i <= hi; i++) {
+          const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
+          if (md?.messageId && md?.channelId) {
+            refs.push({ channelId: String(md.channelId), messageId: String(md.messageId) });
+          }
+        }
+        return refs;
+      };
+
+      const fromIdx = byDiscordId(params.fromMessageId);
+      if (fromIdx < 0) {
+        return {
+          ok: false,
+          error: `Message ${params.fromMessageId} is not an addressable message in context (it may only exist inside backscroll text, or predates this session).`,
+        };
+      }
+
+      try {
+        if (params.toMessageId) {
+          const toIdx = byDiscordId(params.toMessageId);
+          if (toIdx < 0) {
+            return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
+          }
+          const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          const refs = refsIn(lo, hi);
+          cm.removeMessages(all[lo].id, all[hi].id);
+          console.error(
+            `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
+              `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+          );
+          return {
+            ok: true,
+            hidden: hi - lo + 1,
+            hiddenRefs: refs,
+            lastVisible: await this.lastVisiblePreview(agentName),
+          };
+        }
+        const refs = refsIn(fromIdx, fromIdx);
+        cm.removeMessage(all[fromIdx].id);
+        console.error(
+          `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
+            `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+        );
+        return {
+          ok: true,
+          hidden: 1,
+          hiddenRefs: refs,
+          lastVisible: await this.lastVisiblePreview(agentName),
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    // Message-granular mode: branch the chronicle at the message that should
+    // become the new tail (ContextManager.branchAt — origin-sequence-based
+    // time-travel branching; see chronicle's rfc-state-item-origins addendum).
+    // No turn checkpoints involved, so this reaches past turn boundaries.
+    if (typeof params.messages === 'number' && params.messages > 0) {
+      const agent = this.agents.get(agentName)!;
+      if (agent.state.status !== 'idle') {
+        return { ok: false, error: `Cannot undo while agent is ${agent.state.status}` };
+      }
+      const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
+      const cm = agent.getContextManager();
+      const allMessages = cm.getAllMessages();
+      if (n >= allMessages.length) {
+        return {
+          ok: false,
+          error: `Cannot remove ${n} message(s) — history has ${allMessages.length}; at least one must remain.`,
+        };
+      }
+      const target = allMessages[allMessages.length - 1 - n];
+      const branchName = cm.branchAt(target.id, `undo-msgs/${agentName}/${Date.now()}`);
+      await cm.switchBranch(branchName);
+
+      // Materialize config files from the new branch (fire-and-forget; gate
+      // picks up via mtime) — mirrors undoLastTurn.
+      const wsUndo = this.moduleRegistry.getModule('workspace');
+      if (wsUndo && 'materializeMount' in wsUndo) {
+        (wsUndo as { materializeMount: (m: string) => Promise<void> })
+          .materializeMount('_config')
+          .catch(() => {});
+      }
+
+      console.error(
+        `[host-command] undo-messages agent=${agentName} removed=${n} branch=${branchName}` +
+          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+      );
+
+      return {
+        ok: true,
+        messagesRemoved: n,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    }
+
+    const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
+    let undone = 0;
+    try {
+      for (let i = 0; i < requested; i++) {
+        const r = this.undoLastTurn(agentName);
+        if (!r.undone) break;
+        undone++;
+      }
+    } catch (error) {
+      // e.g. "Cannot undo while agent is streaming" — report what happened,
+      // including any turns already undone before the failure.
+      const msg = error instanceof Error ? error.message : String(error);
+      if (undone === 0) return { ok: false, error: msg };
+      console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
+    }
+
+    console.error(
+      `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
+        ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+    );
+
+    if (undone === 0) {
+      return { ok: true, undone: 0, requested, lastVisible: null };
+    }
+
+    return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
+  }
+
+  /**
+   * The last message the agent would see in its context right now, via the
+   * transparent `previewActivation` render (no inference, no Chronicle
+   * writes). Returns null if the preview fails or the context is empty.
+   */
+  private async lastVisiblePreview(
+    agentName: string,
+  ): Promise<{ participant?: string; role?: string; preview?: string } | null> {
+    try {
+      const preview = await this.previewActivation(agentName);
+      const messages = (preview as { messages?: unknown[] }).messages ?? [];
+      const last = messages[messages.length - 1] as
+        | { role?: string; participant?: string; content?: unknown }
+        | undefined;
+      if (!last) return null;
+      const blocks = Array.isArray(last.content) ? last.content : [];
+      const text = blocks
+        .map((b) => (b && typeof b === 'object' && 'text' in b ? String((b as { text: unknown }).text) : ''))
+        .join(' ')
+        .trim();
+      // Surface-injected preambles (<system>…</system>, <backscroll>…
+      // </backscroll>) can dominate the head of a bundled incoming message
+      // and bury the actual conversational line. Strip them for the
+      // preview; fall back to the raw text if nothing else remains.
+      const stripped = text
+        .replace(/<system>[\s\S]*?<\/system>/g, '')
+        .replace(/<backscroll\b[\s\S]*?<\/backscroll>/g, '')
+        .trim();
+      const body = stripped.length > 0 ? stripped : text;
+      return {
+        participant: last.participant,
+        role: last.role,
+        preview: body.length > 400 ? `${body.slice(0, 400)}…` : body,
+      };
+    } catch (error) {
+      console.error(
+        '[host-command] post-undo context preview failed:',
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    }
+  }
+
   queryInferenceLogs(query?: InferenceLogQuery): InferenceLogQueryResult {
     const limit = query?.limit ?? 50;
     const offset = query?.offset ?? 0;
@@ -1813,6 +2228,13 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
 
+    // Typing indicator: show "<agent> is typing…" in the channel she's
+    // responding to, for the whole duration of this turn. Started here (paired
+    // with the finally below, so it can never leak) and refreshed on a 7s
+    // interval by the ChannelRegistry until stopped on any exit path.
+    const typingChannel = this.channelRegistry?.getDefaultPublishChannel();
+    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+
     try {
       for await (const event of stream) {
         switch (event.type) {
@@ -1846,13 +2268,27 @@ export class AgentFramework {
               calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
 
-            // Build assistant content blocks from preamble text + tool_use blocks
-            const assistantBlocks: ContentBlock[] = [];
-            if (event.context.preamble) {
-              assistantBlocks.push({ type: 'text', text: event.context.preamble });
-            }
-            for (const c of event.calls) {
-              assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+            // Build assistant content blocks for this round. Prefer the
+            // membrane's verbatim round content (membrane ≥0.5.64): it
+            // preserves native thinking / redacted_thinking blocks with
+            // their signatures IN ORDER — the API requires signed thinking
+            // to precede its tool_use in the same assistant turn, so
+            // rebuilding from preamble + calls would break thinking+tools.
+            const roundContent = (event.context as { roundContent?: ContentBlock[] }).roundContent;
+            let assistantBlocks: ContentBlock[];
+            if (roundContent && roundContent.length > 0) {
+              assistantBlocks = roundContent.filter(
+                (b) => b.type !== 'tool_result'
+              );
+            } else {
+              // Fallback (older membrane / XML tool mode): preamble + calls
+              assistantBlocks = [];
+              if (event.context.preamble) {
+                assistantBlocks.push({ type: 'text', text: event.context.preamble });
+              }
+              for (const c of event.calls) {
+                assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+              }
             }
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
@@ -1913,18 +2349,20 @@ export class AgentFramework {
             }
 
             // Add assistant response to context.
-            // If we had tool calls, the tool_use blocks were already stored as
-            // pendingAssistantBlocks and flushed when tool results arrived.
-            // Only store trailing content (text after the last tool round) to
-            // avoid double-storing tool_use blocks.
-            const hadToolCalls = response.content.some(
-              (b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'
+            // If we had tool calls, each round's blocks (thinking + text +
+            // tool_use) were already stored as pendingAssistantBlocks and
+            // flushed when tool results arrived. Only store TRAILING content
+            // — blocks after the last tool block. A type-based filter would
+            // double-store earlier rounds' text/thinking AND detach signed
+            // thinking blocks from their tool_use turn (the API requires
+            // thinking to precede tool_use in the same assistant turn).
+            const lastToolIdx = response.content.reduce(
+              (last: number, b: ContentBlock, i: number) =>
+                b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
+              -1
             );
-            if (hadToolCalls) {
-              // Filter to only trailing text/thinking blocks (no tool_use — those are already stored)
-              const trailingContent = response.content.filter(
-                (block: ContentBlock) => block.type !== 'tool_use' && block.type !== 'tool_result'
-              );
+            if (lastToolIdx >= 0) {
+              const trailingContent = response.content.slice(lastToolIdx + 1);
               if (trailingContent.length > 0) {
                 agent.addAssistantResponse(trailingContent);
               }
@@ -2030,6 +2468,24 @@ export class AgentFramework {
               stopReason: response.stopReason,
             });
 
+            // Surface refusals instead of going silently mute: stderr line
+            // (headless inference failures are otherwise under-logged) + an
+            // emoji reaction on the triggering Discord message, keyed by the
+            // refusal category from stop_details.
+            if (response.stopReason === 'refusal') {
+              // stop_details lives on the raw PROVIDER response
+              // (response.raw is RawAccess = { request, response, headers }).
+              const stopDetails = (response.raw?.response as {
+                stop_details?: { category?: string; explanation?: string };
+              } | undefined)?.stop_details;
+              const category = stopDetails?.category ?? 'unknown';
+              console.error(
+                `[inference-refusal] agent=${agent.name} category=${category}` +
+                  (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
+              );
+              void this.reactToRefusal(agent.name, category);
+            }
+
             // Dispatch speech (and thoughts if any)
             if (speechContent.length > 0 || thoughts.length > 0) {
               const speechContext: SpeechContext = {
@@ -2047,6 +2503,81 @@ export class AgentFramework {
                 speechContext
               );
             }
+
+            // Host-owned output routing (see LOCUS-ROUTING-DESIGN). On a
+            // text-only turn (no tool calls => speechContent populated),
+            // publish the agent's speech to the conversational locus — the
+            // most recent incoming channel, tracked cross-surface in the
+            // ChannelRegistry. This replaces discord-mcpl's per-surface sticky
+            // auto-post. Tool-call turns produce `thoughts`, not `speech`, so
+            // they are never routed here — which is precisely how the `think`
+            // tool (and any explicit send tool) yields a silent turn.
+            if (speechContent.length > 0 && this.channelRegistry) {
+              const speechText = speechContent
+                .map((b) => (b as ContentBlock & { type: 'text' }).text)
+                .join('\n')
+                .trim();
+              if (speechText) {
+                try {
+                  await this.channelRegistry.routeSpeech(agent.name, speechText);
+                } catch (err) {
+                  console.error('speech routing failed:', err);
+                }
+              }
+            } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
+              // Tool-call turn that also produced prose. Per design, route the
+              // prose to the locus as a reply UNLESS the turn used an explicit
+              // send/publish tool (channel_publish, *--send_message,
+              // *--reply_message, *--send_dm) — already delivered, so routing
+              // again would double-post. `think` and other non-sending tools
+              // (shell, workspace, etc.) still let the agent speak in the same
+              // turn. The global speech/thoughts split is left untouched
+              // (module/TUI rendering unaffected) — this only governs what
+              // reaches the channel.
+              // Tools whose presence suppresses the trailing prose, for two
+              // distinct reasons:
+              //   - `skip_reply` — the agent EXPLICITLY chose not to reply this
+              //     turn (the deliberate "stay silent" signal).
+              //   - explicit delivery tools (channel_publish / *send_message /
+              //     *reply_message / *send_dm) — already sent the message, so
+              //     routing it again would double-post.
+              // `think` is deliberately NOT here: it is silent *reasoning*, but
+              // prose written after a think is the agent's actual reply and must
+              // be delivered. (A think-only turn has no trailing prose and stays
+              // silent via the `!t` check below.)
+              const SILENCING = new Set([
+                'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
+              ]);
+              const bare = (n: string) => (n.includes('--') ? n.split('--').pop()! : n);
+              const toolNames = response.content
+                .filter((b) => b.type === 'tool_use')
+                .map((b) => (b as unknown as { name?: string }).name)
+                .filter((n): n is string => typeof n === 'string');
+              const silenced = toolNames.some((n) => SILENCING.has(bare(n)));
+              const t = allText
+                .map((b) => (b as ContentBlock & { type: 'text' }).text)
+                .join('\n')
+                .trim();
+              if (silenced || !t) {
+                console.error(
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> NOT routed ` +
+                  `(${silenced ? 'silencing tool / explicit send' : 'no prose'})`,
+                );
+              } else {
+                console.error(
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing trailing prose (${t.length} chars) as reply`,
+                );
+                try {
+                  await this.channelRegistry.routeSpeech(agent.name, t);
+                } catch (err) {
+                  console.error('speech routing failed:', err);
+                }
+              }
+            }
+            // NOTE: agent.reset() + onInferenceEnded() already ran above, BEFORE
+            // dispatchSpeech (main's zombie-subagent fix, PR #32 — sync listeners
+            // must see status === 'idle'). Locus routing is speech dispatch and
+            // doesn't depend on the status field, so it correctly runs after.
 
             break;
           }
@@ -2143,6 +2674,9 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // Stop the typing indicator on every exit path (complete, error,
+      // exhausted, abort) so it never sticks after the turn ends.
+      this.channelRegistry?.stopTyping();
       this.activeStreams.delete(agent.name);
       this.pendingAssistantBlocks.delete(agent.name);
 
@@ -2356,9 +2890,24 @@ export class AgentFramework {
       return;
     }
 
-    // Route gate:status tool
-    if (enrichedCall.name === 'gate:status' && this.eventGate) {
+    // Route gate_status tool
+    if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route sleep / wake tools
+    if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
+      this.dispatchSleepToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
+    // stay-silent) tools — handled by the channel registry like the other
+    // synthesized channel tools, but they aren't `channel_`-prefixed so they
+    // need an explicit route here.
+    if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
+      this.dispatchChannelToolCall(agentName, enrichedCall);
       return;
     }
 
@@ -2515,6 +3064,27 @@ export class AgentFramework {
   }
 
   private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+    // Centralized inference-health observability. Every terminal failure path
+    // funnels through an `inference:exhausted` trace and every successful model
+    // response through `inference:completed`, so intercepting here is the one
+    // place that reliably sees all outcomes regardless of which code path
+    // produced them. In headless/daemon mode no trace client is attached, so
+    // without this the only durable record of a failed inference is a field in
+    // llm-calls.jsonl — invisible to operator, agent, and monitoring.
+    if (event.type === 'inference:exhausted') {
+      this.noteInferenceExhausted(
+        (event.agentName as string) ?? 'unknown',
+        (event.error as string) ?? 'unknown error',
+      );
+    } else if (event.type === 'inference:completed') {
+      // A successful response — even mid-turn between tool calls — proves the
+      // agent isn't hard-down; clear its consecutive-failure streak.
+      const name = event.agentName as string | undefined;
+      if (name && this.consecutiveInferenceFailures.get(name)) {
+        this.consecutiveInferenceFailures.set(name, 0);
+      }
+    }
+
     const traceEvent = {
       ...event,
       timestamp: Date.now(),
@@ -2526,6 +3096,59 @@ export class AgentFramework {
       } catch (error) {
         console.error('Trace listener error:', error);
       }
+    }
+  }
+
+  /**
+   * Handle a fully-exhausted inference (the agent could not produce a response
+   * this turn, after retries). Severity here is high — the agent can't think
+   * at all — yet historically the only durable record was a buried field in
+   * llm-calls.jsonl. This surfaces it three ways:
+   *
+   *   1. stderr  — always, with the underlying API reason. The place an
+   *      operator greps; previously empty in headless mode.
+   *   2. chronicle marker — a `[inference-failed]` message so the agent itself
+   *      learns its turn failed and why (otherwise it's an experiential blank,
+   *      indistinguishable from "not addressed"). addMessage does NOT request
+   *      inference, so this never causes a retry/wake loop.
+   *   3. escalation — after N consecutive failures the agent is hard-down;
+   *      log that loudly (a repeated identical failure is the textbook signal).
+   */
+  private noteInferenceExhausted(agentName: string, reason: string): void {
+    const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
+    this.consecutiveInferenceFailures.set(agentName, streak);
+
+    // (1) Durable stderr line — works in headless/daemon mode with no client.
+    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+
+    // (2) Agent-facing chronicle marker (no inference triggered → no loop).
+    const agent = this.agents.get(agentName);
+    if (agent) {
+      try {
+        agent.getContextManager().addMessage(
+          'user',
+          [{
+            type: 'text',
+            text:
+              `[inference-failed] Your previous turn did not complete: the model ` +
+              `call failed and produced no response, so nothing was sent. Reason: ` +
+              `${reason}. If this recurs with the same cause, change approach ` +
+              `rather than retrying identically (e.g. drop an oversized attachment ` +
+              `or an unsupported setting).`,
+          }],
+          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+        );
+      } catch (err) {
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+      }
+    }
+
+    // (3) Hard-down escalation on repeated identical failure.
+    if (streak >= this.inferenceFailureEscalationThreshold) {
+      console.error(
+        `[inference-hard-down] agent=${agentName} has FAILED ${streak} consecutive ` +
+        `inferences — it cannot complete a turn. Last reason: ${reason}`,
+      );
     }
   }
 
@@ -2599,6 +3222,26 @@ export class AgentFramework {
           }
         },
         shouldTriggerInference: triggerFilter,
+        // A text-only turn whose speech couldn't be delivered must not vanish
+        // silently: record a `[discord-send-failed]` marker in chronicle so the
+        // agent sees, on her next turn, that her reply never reached the human.
+        // addMessage() alone does not request inference, so this never wakes
+        // her (matching the `discord-send-failed-skip` gate intent: context
+        // yes, wake no).
+        onRouteFailure: ({ channelId, reason, textLen }) => {
+          try {
+            this.addMessage(
+              'user',
+              [{
+                type: 'text',
+                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${channelId ?? 'the channel'} (${reason}). It was saved to your archive but the human did not receive it.`,
+              }],
+              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+            );
+          } catch (err) {
+            console.error('onRouteFailure: failed to record send-failure marker:', err);
+          }
+        },
       },
     );
 
@@ -2750,6 +3393,21 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void },
     ) => {
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+    });
+
+    // Handle host-level admin commands from a surface (e.g. Discord /undo)
+    connection.on('host-command', async (
+      params: HostCommandParams,
+      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+    ) => {
+      if (!responder) return;
+      try {
+        const result = await this.handleHostCommand(connection.id, params ?? {});
+        responder.respond(result);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        responder.respondError(-32603, err.message);
+      }
     });
 
     // Handle dynamic tool list changes (notifications/tools/list_changed)
@@ -3000,6 +3658,53 @@ export class AgentFramework {
           result: { success: false, error: err.message, isError: true },
         });
       });
+  }
+
+  /**
+   * Handle the synthesized `sleep` / `wake` tools. `sleep` arms the gate's
+   * suppression window, optionally announces in the sticky channel, and ends
+   * the turn (the agent goes idle immediately). `wake` clears sleep.
+   */
+  private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const gate = this.eventGate!;
+    const input = (call.input ?? {}) as { seconds?: number; announce?: boolean; message?: string };
+
+    const finish = (result: ToolResult) => {
+      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    };
+
+    if (call.name === 'wake') {
+      const was = gate.clearSleep();
+      finish({ success: true, data: { woke: was } });
+      return;
+    }
+
+    const seconds = Number(input.seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      finish({ success: false, error: 'sleep: `seconds` must be a positive number', isError: true });
+      return;
+    }
+
+    const { until } = gate.setSleep(seconds, input.message);
+    const announce = input.announce !== false; // default true
+    const human =
+      seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
+      : seconds >= 60 ? `${Math.round(seconds / 60)}m`
+      : `${Math.round(seconds)}s`;
+
+    // Announce in the sticky channel (best-effort; never blocks the result).
+    if (announce && this.channelRegistry) {
+      const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
+      this.channelRegistry.routeSpeech(agentName, text).catch((err) => {
+        console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+      });
+    }
+
+    console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
+    // endTurn: the agent stops here and goes idle for the duration.
+    finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {

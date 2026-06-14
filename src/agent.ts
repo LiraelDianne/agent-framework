@@ -43,13 +43,17 @@ export class Agent {
    * request native thinking from the provider. Signatures on response thinking
    * blocks are preserved through Chronicle.
    */
-  readonly thinking: { enabled: boolean; budgetTokens?: number } | undefined;
+  readonly thinking: AgentConfig['thinking'];
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
   private _streamId = 0;
   lastStreamInputTokens = 0;
   maxStreamTokens: number;
+  /** Per-agent context compile budget (input tokens). When unset, the
+   * ContextManager's built-in default applies. reserveForResponse uses
+   * this agent's maxTokens. */
+  contextBudgetTokens?: number;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -67,6 +71,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
+    this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
     this.membrane = membrane;
   }
@@ -126,8 +131,16 @@ export class Agent {
    * Step 1 of the inference pipeline — callers can inspect/modify the result
    * before building a request.
    */
+  /** Resolve the compile budget: explicit arg wins, else the per-agent
+   * configured context budget (if any), else the ContextManager default. */
+  private resolveBudget(budget?: TokenBudget): TokenBudget | undefined {
+    if (budget) return budget;
+    if (this.contextBudgetTokens === undefined) return undefined;
+    return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    return this.contextManager.compile(budget);
+    return this.contextManager.compile(this.resolveBudget(budget));
   }
 
   /**
@@ -139,7 +152,7 @@ export class Agent {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    return this.contextManager.compile(budget, injections);
+    return this.contextManager.compile(this.resolveBudget(budget), injections);
   }
 
   // ==========================================================================
@@ -291,6 +304,49 @@ export class Agent {
   }
 
   /**
+   * Build the membrane-normalized request that WOULD be emitted for this
+   * agent's next activation, given the supplied tools and injections.
+   *
+   * This is the single source of truth for request assembly, shared by the
+   * real activation path (`startStreamWithInjections`) and debug/preview
+   * tooling (`Framework.previewActivation`). It is pure and non-mutating:
+   * it does not touch agent state and does not call the membrane, and
+   * `ContextManager.compile` is itself side-effect-free (compression runs in
+   * the background). Safe to call regardless of the agent's current status.
+   */
+  async buildActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget
+  ): Promise<NormalizedRequest> {
+    let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+
+    // Safety: ensure messages don't end with an assistant message.
+    // Some models reject trailing assistant messages ("prefill not supported"),
+    // and after context compression a stale assistant turn can end up last.
+    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      messages = [...messages, {
+        participant: 'user',
+        content: [{ type: 'text', text: '[Continue]' }],
+      }];
+    }
+
+    return {
+      messages,
+      system: this.buildSystemPrompt(systemInjections),
+      config: {
+        model: this.model,
+        maxTokens: this.maxTokens,
+        ...(this.temperature !== undefined && { temperature: this.temperature }),
+        ...(this.thinking !== undefined && { thinking: this.thinking }),
+      },
+      tools: availableTools.length > 0 ? availableTools : undefined,
+      promptCaching: true,
+      assistantParticipant: this.name,
+    };
+  }
+
+  /**
    * Start a yielding stream with context injections.
    * Same as startStream but passes injections through to compile.
    */
@@ -307,31 +363,7 @@ export class Agent {
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
 
-    let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
-
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
-      messages = [...messages, {
-        participant: 'user',
-        content: [{ type: 'text', text: '[Continue]' }],
-      }];
-    }
-
-    const request: NormalizedRequest = {
-      messages,
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: availableTools.length > 0 ? availableTools : undefined,
-      promptCaching: true,
-      assistantParticipant: this.name,
-    };
+    const request = await this.buildActivationRequest(availableTools, injections, budget);
 
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,

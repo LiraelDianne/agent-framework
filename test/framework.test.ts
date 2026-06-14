@@ -98,6 +98,9 @@ class MockYieldingStream implements YieldingStream {
           depth: this._toolDepth,
           previousResults: [],
           accumulated: '',
+          // membrane ≥0.5.64: verbatim blocks of the current round, in
+          // provider order (thinking with signatures before tool_use)
+          roundContent: response.content,
         },
       } as StreamEvent);
     } else {
@@ -463,6 +466,89 @@ describe('AgentFramework', () => {
 
     // With streaming, membrane is called once (streamYielding handles tool rounds internally)
     assert.strictEqual(membrane.calls.length, 1);
+
+    await framework.stop();
+    rmSync(tempDir, { recursive: true });
+  });
+
+  it('preserves signed thinking blocks in tool-call turns (round-trip ordering)', async () => {
+    const testModule = new TestModule();
+
+    // Round 1: signed thinking BEFORE the tool_use — the API requires this
+    // ordering to survive verbatim into the stored assistant turn.
+    membrane.pushResponse(createMockResponse([
+      { type: 'thinking', thinking: 'I should echo this', signature: 'sig_round1' } as unknown as ContentBlock,
+      { type: 'text', text: 'Let me echo that.' },
+      {
+        type: 'tool_use',
+        id: 'call_1',
+        name: 'test--echo',
+        input: { message: 'hi' },
+      },
+    ], 'tool_use'));
+
+    // Round 2 (final): signature-only thinking (display:'omitted') + answer
+    membrane.pushResponse(createMockResponse([
+      { type: 'thinking', thinking: '', signature: 'sig_round2' } as unknown as ContentBlock,
+      { type: 'text', text: 'Done: hi' },
+    ]));
+
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        {
+          name: 'assistant',
+          model: 'test-model',
+          systemPrompt: 'You are a helpful assistant.',
+        },
+      ],
+      modules: [testModule],
+    });
+
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: 'Echo this!',
+      metadata: {},
+    });
+
+    await framework.runUntilIdle();
+
+    const agent = framework.getAgent('assistant');
+    assert.ok(agent);
+    const compiled = await agent.compileContext();
+
+    // The assistant turn that carries the tool_use must contain the signed
+    // thinking block BEFORE the tool_use, signature intact.
+    const assistantWithTool = compiled.messages.find(
+      (m) => Array.isArray(m.content) && m.content.some((b: ContentBlock) => b.type === 'tool_use')
+    );
+    assert.ok(assistantWithTool, 'assistant turn with tool_use should be stored');
+    const blocks = assistantWithTool.content as ContentBlock[];
+    const thinkIdx = blocks.findIndex((b) => b.type === 'thinking');
+    const toolIdx = blocks.findIndex((b) => b.type === 'tool_use');
+    assert.ok(thinkIdx >= 0, 'thinking block should be stored in the tool_use turn');
+    assert.ok(thinkIdx < toolIdx, 'thinking must precede tool_use in the same turn');
+    assert.strictEqual(
+      (blocks[thinkIdx] as { signature?: string }).signature,
+      'sig_round1',
+      'signature must survive verbatim'
+    );
+
+    // The final assistant turn keeps its signature-only thinking block.
+    const finalSigBlock = compiled.messages
+      .flatMap((m) => (Array.isArray(m.content) ? (m.content as ContentBlock[]) : []))
+      .find((b) => b.type === 'thinking' && (b as { signature?: string }).signature === 'sig_round2');
+    assert.ok(finalSigBlock, 'signature-only thinking block must survive in the final turn');
+
+    // No double-storing: the round-1 preamble text must appear exactly once
+    // across all stored assistant content.
+    const preambleCount = compiled.messages
+      .flatMap((m) => (Array.isArray(m.content) ? (m.content as ContentBlock[]) : []))
+      .filter((b) => b.type === 'text' && (b as { text: string }).text.includes('Let me echo that.'))
+      .length;
+    assert.strictEqual(preambleCount, 1, 'preamble text must not be double-stored');
 
     await framework.stop();
     rmSync(tempDir, { recursive: true });
