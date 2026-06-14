@@ -1,5 +1,6 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { toolResultDataToHistoryString } from './tool-result-history.js';
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -509,13 +510,15 @@ export class Agent {
   }
 
   private buildToolResultMessages(results: CompletedToolCall[]): NormalizedMessage[] {
-    // Tool results go as a user message with tool_result blocks
+    // Tool results go as a user message with tool_result blocks. The history
+    // serializer turns MCP image blocks into `[image: type, size]` so the
+    // persisted transcript stays small and survives truncation.
     const content = results.map((r) => ({
       type: 'tool_result' as const,
       toolUseId: r.id,
       content: r.result.isError
         ? r.result.error ?? 'Unknown error'
-        : JSON.stringify(r.result.data),
+        : toolResultDataToHistoryString(r.result.data),
       isError: r.result.isError,
     }));
 

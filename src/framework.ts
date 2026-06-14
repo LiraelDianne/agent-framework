@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
@@ -51,6 +51,7 @@ import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { safeSlice } from './safe-slice.js';
+import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate } from './gate/event-gate.js';
@@ -1392,25 +1393,18 @@ export class AgentFramework {
           // Compute truncation limit from agent's strategy (maxMessageTokens * 4 chars)
           const maxChars = this.getMaxToolResultChars(agent);
 
-          // Store tool results as a user message (tool_result blocks)
-          const toolResultContent: ContentBlock[] = currentState.toolResults.map(tc => {
-            let content: string;
-            if (tc.result.isError) {
-              content = tc.result.error ?? 'Unknown error';
-            } else {
-              content = JSON.stringify(tc.result.data);
-              if (maxChars && content.length > maxChars) {
-                content = safeSlice(content, 0, maxChars)
-                  + '\n\n[truncated — original was ' + content.length + ' chars]';
-              }
-            }
-            return {
-              type: 'tool_result' as const,
-              toolUseId: tc.id,
-              content,
-              isError: tc.result.isError,
-            };
-          });
+          // Store tool results as a user message (tool_result blocks).
+          // Use the history serializer so MCP image blocks become a short
+          // `[image: type, size]` placeholder instead of megabytes of base64
+          // that would corrupt under truncation.
+          const toolResultContent: ContentBlock[] = currentState.toolResults.map(tc => ({
+            type: 'tool_result' as const,
+            toolUseId: tc.id,
+            content: tc.result.isError
+              ? tc.result.error ?? 'Unknown error'
+              : toolResultDataToHistoryString(tc.result.data, maxChars),
+            isError: tc.result.isError,
+          }));
           agent.getContextManager().addMessage('user', toolResultContent);
 
           // Flush any messages that were deferred while waiting for tool results.
@@ -1909,7 +1903,9 @@ export class AgentFramework {
                 const toolResultContent: ContentBlock[] = readyState.toolResults.map(tc => ({
                   type: 'tool_result' as const,
                   toolUseId: tc.id,
-                  content: tc.result.isError ? (tc.result.error ?? 'Unknown error') : JSON.stringify(tc.result.data),
+                  content: tc.result.isError
+                    ? (tc.result.error ?? 'Unknown error')
+                    : toolResultDataToHistoryString(tc.result.data),
                   isError: tc.result.isError,
                 }));
                 agent.getContextManager().addMessage('user', toolResultContent);
@@ -2216,17 +2212,57 @@ export class AgentFramework {
   }
 
   private toMembraneToolResult(callId: string, afResult: ToolResult, maxChars?: number): MembraneToolResult {
-    let content: string;
     if (afResult.isError) {
-      content = afResult.error ?? 'Unknown error';
-    } else {
-      content = JSON.stringify(afResult.data);
-      if (maxChars && content.length > maxChars) {
-        content = safeSlice(content, 0, maxChars)
-          + '\n\n[truncated — original was ' + content.length + ' chars]';
+      return { toolUseId: callId, content: afResult.error ?? 'Unknown error', isError: true };
+    }
+    // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
+    // blocks natively rather than JSON-stringifying them away. Anything else
+    // (objects, scalars) falls through to JSON. The error path was handled
+    // above, so isError is always false on these return paths.
+    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars);
+    if (blocks) {
+      return { toolUseId: callId, content: blocks, isError: false };
+    }
+    let content = JSON.stringify(afResult.data);
+    if (maxChars && content.length > maxChars) {
+      content = safeSlice(content, 0, maxChars)
+        + '\n\n[truncated — original was ' + content.length + ' chars]';
+    }
+    return { toolUseId: callId, content, isError: false };
+  }
+
+  /**
+   * If `data` is an MCP tool-result content array carrying at least one image,
+   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
+   * the array is text-only (let JSON path handle it; saves a code path).
+   * `maxChars`, when provided, caps each accompanying text block so an image
+   * inlined alongside an enormous text payload can't blow the context.
+   */
+  private tryNativeToolResultContent(data: unknown, maxChars?: number): ToolResultContentBlock[] | null {
+    if (!Array.isArray(data)) return null;
+    let hasImage = false;
+    const blocks: ToolResultContentBlock[] = [];
+    for (const raw of data) {
+      if (!raw || typeof raw !== 'object') return null;
+      const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
+      if (b.type === 'text' && typeof b.text === 'string') {
+        let text = b.text;
+        if (maxChars && text.length > maxChars) {
+          text = safeSlice(text, 0, maxChars)
+            + '\n\n[truncated — original was ' + text.length + ' chars]';
+        }
+        blocks.push({ type: 'text', text });
+      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
+        hasImage = true;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', data: b.data, mediaType: b.mimeType },
+        });
+      } else {
+        return null; // unknown shape — bail to JSON path
       }
     }
-    return { toolUseId: callId, content, isError: afResult.isError };
+    return hasImage ? blocks : null;
   }
 
   private getMaxToolResultChars(agent: Agent): number | undefined {
@@ -2887,11 +2923,22 @@ export class AgentFramework {
           }
         }
 
-        // Convert MCP tool result to framework ToolResult
+        // Convert MCP tool result to framework ToolResult.
+        // When the result contains non-text blocks (e.g. images from an MCP
+        // tool like zulip-mcp's fetch_attachment), pass the full content array
+        // through so toMembraneToolResult can preserve image blocks natively.
+        // Text-only results still collapse to a joined string for backward
+        // compatibility with callers that expect data to be string-ish.
         const textContent = result.content
           ?.filter((c) => c.type === 'text' && c.text)
           .map((c) => c.text!)
           .join('\n');
+        const hasNonText = result.content?.some((c) => c.type !== 'text');
+        const data = result.isError
+          ? undefined
+          : hasNonText
+            ? result.content
+            : (textContent || undefined);
 
         this.pushEvent({
           type: 'tool-result',
@@ -2900,7 +2947,7 @@ export class AgentFramework {
           moduleName: `mcpl:${serverId}`,
           result: {
             success: !result.isError,
-            data: result.isError ? undefined : textContent || undefined,
+            data,
             error: result.isError ? (textContent || 'Tool call failed') : undefined,
             isError: result.isError ?? false,
           },
