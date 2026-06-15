@@ -3463,7 +3463,7 @@ export class AgentFramework {
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
-    if (agent) {
+    if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       try {
         agent.getContextManager().addMessage(
           'user',
