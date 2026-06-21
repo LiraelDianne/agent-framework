@@ -3894,14 +3894,20 @@ export class AgentFramework {
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
 
-    // Build state params for stateful tools (Step 8)
+    // Build state params for stateful tools (Step 8).
+    // Host-managed state is single-valued per server, so inject the host-managed
+    // set's `state` for any call; otherwise fall back to a server-managed set's
+    // opaque `checkpoint`. Never blindly pick "first stateful" — when a server
+    // mixes host-managed (e.g. a feed) and server-managed (e.g. post/undo) sets,
+    // that misattributes the feed's state.
     let stateParams: { state?: unknown; checkpoint?: string } | undefined;
     if (this.checkpointManager) {
-      const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
-      if (fs) {
-        if (this.checkpointManager.isHostManaged(serverId, fs)) {
-          stateParams = { state: this.checkpointManager.getCurrentState(serverId, fs) };
-        } else {
+      const hostFs = this.checkpointManager.getHostManagedFeatureSet(serverId);
+      if (hostFs) {
+        stateParams = { state: this.checkpointManager.getCurrentState(serverId, hostFs) };
+      } else {
+        const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
+        if (fs) {
           const cp = this.checkpointManager.getCurrentCheckpoint(serverId, fs);
           if (cp) stateParams = { checkpoint: cp };
         }
@@ -3913,10 +3919,17 @@ export class AgentFramework {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
 
-        // Record checkpoint from stateful tool response (Step 8)
+        // Record checkpoint from stateful tool response (Step 8).
+        // Attribute to the set the server tagged (result.state.featureSet) first;
+        // else the host-managed set (host-managed checkpoints carry data/patch);
+        // else the single stateful set. Avoids recording a feed checkpoint onto a
+        // server-managed set just because it registered first.
         if (result.state && this.checkpointManager) {
-          const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
-          if (fs) {
+          const tagged = result.state.featureSet;
+          const fs = tagged
+            ?? this.checkpointManager.getHostManagedFeatureSet(serverId)
+            ?? this.checkpointManager.getStatefulFeatureSet(serverId);
+          if (fs && this.checkpointManager.isStateful(serverId, fs)) {
             this.checkpointManager.recordCheckpoint(serverId, fs, result.state);
           }
         }

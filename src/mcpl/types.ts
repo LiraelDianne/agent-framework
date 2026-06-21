@@ -391,6 +391,13 @@ export interface StateCheckpoint {
   parent: string | null;
 
   /**
+   * Owning feature set, when the server tags it. Authoritative signal for
+   * attributing this checkpoint — lets the host record it to the right set
+   * instead of guessing when a server has more than one stateful feature set.
+   */
+  featureSet?: string;
+
+  /**
    * Full state data (for host-managed state).
    * Mutually exclusive with `patch`.
    */
