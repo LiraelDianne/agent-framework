@@ -368,6 +368,22 @@ export class CheckpointManager {
     return null;
   }
 
+  /**
+   * Get the server's host-managed (hostState) feature set. Host-managed state is
+   * single-valued by protocol (one unkeyed `state` per tool call), so there is at
+   * most one such set — return it so its state is threaded correctly even when the
+   * server also declares server-managed (rollback) sets. Returns null if none.
+   */
+  getHostManagedFeatureSet(serverId: string): string | null {
+    const prefix = `${serverId}:`;
+    for (const [key, tree] of this.trees) {
+      if (key.startsWith(prefix) && tree.hostState) {
+        return key.slice(prefix.length);
+      }
+    }
+    return null;
+  }
+
   // ==========================================================================
   // Rollback
   // ==========================================================================
