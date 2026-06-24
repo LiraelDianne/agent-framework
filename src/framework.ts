@@ -309,6 +309,7 @@ export class AgentFramework {
       queryMessages: (filter) => this.queryMessages(filter),
       pushEvent: (event) => this.pushEvent(event),
       onTrace: (listener) => this.onTrace(listener),
+      callTool: (call) => this.executeToolCall(call),
     });
   }
 

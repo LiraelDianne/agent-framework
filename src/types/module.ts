@@ -187,6 +187,19 @@ export interface ModuleContext {
   unregisterSpeechHandler(): void;
 
   /**
+   * Execute a tool call autonomously, without agent mediation.
+   *
+   * Routes through the framework's normal tool dispatch — MCPL-prefixed names
+   * (e.g. `mcpl--discord--unsubscribe_channel`) hit the MCPL subsystem; module
+   * names hit the owning module. Unlike pushing a `tool-call` event, this does
+   * NOT record tool_use/tool_result into any agent's context — it's a pure
+   * side-effecting call whose result is returned to the caller. Used by modules
+   * that need to act on their own (e.g. subscription GC unsubscribing a noisy
+   * channel) rather than asking the agent to call the tool.
+   */
+  callTool(call: ToolCall): Promise<ToolResult>;
+
+  /**
    * Subscribe to the framework's trace event stream for observability.
    *
    * Modules use this to react to agent lifecycle without polling — e.g. an

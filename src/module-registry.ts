@@ -55,6 +55,7 @@ export class ModuleRegistry {
 
   private pushEventFn: (event: ProcessEvent) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
+  private callToolFn: (call: ToolCall) => Promise<ToolResult>;
 
   constructor(
     store: JsStore,
@@ -68,6 +69,7 @@ export class ModuleRegistry {
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
       pushEvent: (event: ProcessEvent) => void;
       onTrace: (listener: TraceEventListener) => () => void;
+      callTool: (call: ToolCall) => Promise<ToolResult>;
     }
   ) {
     this.store = store;
@@ -80,6 +82,7 @@ export class ModuleRegistry {
     this.queryMessagesFn = options.queryMessages;
     this.pushEventFn = options.pushEvent;
     this.onTraceFn = options.onTrace;
+    this.callToolFn = options.callTool;
   }
 
   /**
@@ -120,7 +123,8 @@ export class ModuleRegistry {
       this.getMessageFn,
       this.queryMessagesFn,
       this.pushEventFn,
-      this.onTraceFn
+      this.onTraceFn,
+      this.callToolFn
     );
 
     this.modules.set(module.name, module);
@@ -372,6 +376,7 @@ class ModuleContextImpl implements ModuleContext {
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
+  private callToolFn: (call: ToolCall) => Promise<ToolResult>;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -390,7 +395,8 @@ class ModuleContextImpl implements ModuleContext {
     getMessage: (id: MessageId) => StoredMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
     pushEvent: (event: ProcessEvent) => void,
-    onTrace: (listener: TraceEventListener) => () => void
+    onTrace: (listener: TraceEventListener) => () => void,
+    callTool: (call: ToolCall) => Promise<ToolResult>
   ) {
     this.moduleName = moduleName;
     this.store = store;
@@ -406,6 +412,7 @@ class ModuleContextImpl implements ModuleContext {
     this.queryMessagesFn = queryMessages;
     this.pushEventFn = pushEvent;
     this.onTraceFn = onTrace;
+    this.callToolFn = callTool;
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();
@@ -434,6 +441,10 @@ class ModuleContextImpl implements ModuleContext {
 
   onTrace(listener: TraceEventListener): () => void {
     return this.onTraceFn(listener);
+  }
+
+  callTool(call: ToolCall): Promise<ToolResult> {
+    return this.callToolFn(call);
   }
 
   addMessage(
