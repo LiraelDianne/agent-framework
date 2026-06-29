@@ -237,6 +237,9 @@ export class AgentFramework {
   private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
   private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
 
+  /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
+  private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
+
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
@@ -445,6 +448,19 @@ export class AgentFramework {
       });
     }
 
+    // Liveness watchdog: fail hard if the main thread wedges (opt-in).
+    if (config.watchdog?.enabled) {
+      const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
+      framework.livenessWatchdog = new LivenessWatchdog({
+        enabled: true,
+        thresholdMs: config.watchdog.thresholdMs,
+        action: config.watchdog.action,
+        reportPath: config.watchdog.reportPath
+          ?? (config.storePath ? join(config.storePath, 'watchdog-wedge.jsonl') : undefined),
+      });
+      framework.livenessWatchdog.start();
+    }
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
@@ -530,6 +546,7 @@ export class AgentFramework {
 
     // Dispose EventGate (clear debounce timers)
     this.eventGate?.dispose();
+    this.livenessWatchdog?.stop();
 
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
