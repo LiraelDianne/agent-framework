@@ -19,6 +19,7 @@
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { phaseChannel } from '@animalabs/context-manager';
 
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'liveness-watchdog-worker.js');
 
@@ -71,6 +72,9 @@ export class LivenessWatchdog {
       });
       this.worker.unref();
       this.worker.on('error', (e) => console.error('[liveness-watchdog] worker error:', e.message));
+      // Wire the phase channel so labelled synchronous spans (compression,
+      // context-build, merge-graph walks) name themselves in a wedge report.
+      phaseChannel.report = (label: string) => this.setPhase(label);
       console.error(
         `[liveness-watchdog] armed: threshold=${this.opts.thresholdMs ?? 30_000}ms ` +
           `action=${this.opts.action ?? 'abort'}`,
@@ -110,6 +114,7 @@ export class LivenessWatchdog {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    phaseChannel.report = () => {};
     void this.worker?.terminate();
     this.worker = undefined;
     this.started = false;
