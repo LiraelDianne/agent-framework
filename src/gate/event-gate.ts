@@ -89,6 +89,9 @@ interface CompiledPolicy {
   channelRegex?: RegExp;
   mountRegex?: RegExp;
   pathRegex?: RegExp;
+  tagsAnyRe?: RegExp[];
+  tagsAllRe?: RegExp[];
+  tagsNoneRe?: RegExp[];
 }
 
 interface PolicyStats {
@@ -266,6 +269,14 @@ function validatePolicy(raw: unknown): GatePolicy {
       const fields = m.metadataTrue.filter((s): s is string => typeof s === 'string' && s.length > 0);
       if (fields.length > 0) match.metadataTrue = fields;
     }
+    const tagList = (v: unknown): string[] | undefined => {
+      if (!Array.isArray(v)) return undefined;
+      const out = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      return out.length > 0 ? out : undefined;
+    };
+    const tagsAny = tagList(m.tagsAny); if (tagsAny) match.tagsAny = tagsAny;
+    const tagsAll = tagList(m.tagsAll); if (tagsAll) match.tagsAll = tagsAll;
+    const tagsNone = tagList(m.tagsNone); if (tagsNone) match.tagsNone = tagsNone;
     if (m.filter && typeof m.filter === 'object') {
       const f = m.filter as Record<string, unknown>;
       if ((f.type === 'text' || f.type === 'regex') && typeof f.pattern === 'string') {
@@ -466,6 +477,9 @@ export class EventGate {
       if (policy.match.pathGlob) {
         compiled.pathRegex = compileGlob(policy.match.pathGlob);
       }
+      if (policy.match.tagsAny) compiled.tagsAnyRe = policy.match.tagsAny.map(compileGlob);
+      if (policy.match.tagsAll) compiled.tagsAllRe = policy.match.tagsAll.map(compileGlob);
+      if (policy.match.tagsNone) compiled.tagsNoneRe = policy.match.tagsNone.map(compileGlob);
       return compiled;
     });
   }
@@ -602,6 +616,16 @@ export class EventGate {
       const md = info.metadata ?? {};
       const anyTrue = match.metadataTrue.some(field => isMetadataTruthy(md[field]));
       if (!anyTrue) return false;
+    }
+
+    // Tag matching (MCPL RFC-001). Patterns are globs; `tags` is the event's
+    // (implication-expanded) tag set. A pattern "matches" if it matches ANY tag.
+    if (compiled.tagsAnyRe || compiled.tagsAllRe || compiled.tagsNoneRe) {
+      const tags = info.tags ?? [];
+      const patternHits = (re: RegExp): boolean => tags.some(t => re.test(t));
+      if (compiled.tagsAnyRe && !compiled.tagsAnyRe.some(patternHits)) return false;
+      if (compiled.tagsAllRe && !compiled.tagsAllRe.every(patternHits)) return false;
+      if (compiled.tagsNoneRe && compiled.tagsNoneRe.some(patternHits)) return false;
     }
 
     return true;

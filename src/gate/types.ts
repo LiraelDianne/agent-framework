@@ -88,6 +88,17 @@ export interface GatePolicyMatch {
    * matches if any of those is set. Empty/omitted = no metadata constraint.
    */
   metadataTrue?: string[];
+  /**
+   * Tag matching (MCPL RFC-001 event tags). Globs allowed (e.g. `robotics:*`).
+   * Evaluated against the event's (implication-expanded) tag set:
+   *   tagsAny  — match if ANY listed pattern matches an event tag
+   *   tagsAll  — match only if EVERY listed pattern matches some event tag
+   *   tagsNone — match only if NO listed pattern matches any event tag
+   * Combined with the other fields by AND, like the rest of the match.
+   */
+  tagsAny?: string[];
+  tagsAll?: string[];
+  tagsNone?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +174,8 @@ export interface GateEventInfo {
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */
   paths?: string[];
+  /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
+  tags?: string[];
 }
 
 /** Per-policy runtime statistics (for gate:status). */
