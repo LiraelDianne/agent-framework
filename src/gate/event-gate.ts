@@ -878,6 +878,7 @@ export class EventGate {
         serverId: (metadata.serverId as string) ?? '',
         channelId: (metadata.channelId as string) ?? '',
         metadata,
+        tags: Array.isArray(metadata.tags) ? (metadata.tags as string[]) : undefined,
       });
       return decision.trigger;
     };

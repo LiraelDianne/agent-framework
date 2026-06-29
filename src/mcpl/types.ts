@@ -468,6 +468,9 @@ export interface PushEventParams {
   /** Provenance metadata (server-defined) */
   origin?: Record<string, unknown>;
 
+  /** Semantic classification the host may route on (MCPL RFC-001). */
+  tags?: string[];
+
   /** Event payload */
   payload: {
     /** Content for the model to interpret */
@@ -904,6 +907,9 @@ export interface ChannelIncomingMessage {
 
   /** Platform-specific metadata */
   metadata?: Record<string, unknown>;
+
+  /** Semantic classification the host may route on (MCPL RFC-001). */
+  tags?: string[];
 }
 
 /**

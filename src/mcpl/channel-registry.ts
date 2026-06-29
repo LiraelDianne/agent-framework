@@ -484,6 +484,7 @@ export class ChannelRegistry {
             messageId: message.messageId,
             threadId: message.threadId,
             author: message.author,
+            ...(message.tags ? { tags: message.tags } : {}),
           },
         );
       }
