@@ -659,7 +659,7 @@ export class AgentFramework {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
     const gateTools = this.eventGate
-      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS]
+      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS, AgentFramework.EVENT_TAGS_TOOL]
       : [];
     if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
       return moduleTools;
@@ -1037,6 +1037,47 @@ export class AgentFramework {
       inputSchema: { type: 'object' },
     },
   ];
+
+  /** Discoverability for event tags (MCPL RFC-001): the reserved chat:* core,
+   *  each connected server's declared tag ontology, and gate.js status. */
+  private static readonly EVENT_TAGS_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'event_tags',
+    description:
+      'List the event tags available for gating: the reserved cross-platform ' +
+      'chat:* core, each connected server\'s declared tag ontology (descriptions, ' +
+      'implications, suggested treatments), and the status of your programmable ' +
+      'gate (gate.js). Use these tag names in gate.json policies (tagsAny / ' +
+      'tagsAll / tagsNone) or in gate.js.',
+    inputSchema: { type: 'object' },
+  };
+
+  /** Reserved chat:* core vocabulary (MCPL RFC-001 §4) — short descriptions so
+   *  the agent can author rules without reading the spec. */
+  private static readonly CHAT_CORE_TAGS: Record<string, string> = {
+    'chat:addressed': 'Directed at you (umbrella: dm/mention/reply)',
+    'chat:mention': 'You were explicitly @-mentioned',
+    'chat:reply': 'A reply to your own message',
+    'chat:dm': 'A direct/private message to you',
+    'chat:ambient': 'Overheard in a followed channel; not addressed',
+    'chat:broadcast': 'Channel-wide ping (@everyone / channel post)',
+    'chat:to-self': 'Acts on your own content (reaction/reply to you)',
+    'chat:from-human': 'Authored by a human',
+    'chat:from-bot': 'Authored by a bot/automation',
+    'chat:from-self': 'Your own message, echoed back',
+    'chat:from-agent': 'Authored by another persona/agent',
+    'chat:edited': 'An edit of an existing message',
+    'chat:deleted': 'A deletion',
+    'chat:reaction': 'An emoji reaction was added',
+    'chat:reaction-remove': 'A reaction was removed',
+    'chat:has-image': 'Has an image attachment',
+    'chat:has-audio': 'Has an audio attachment',
+    'chat:has-file': 'Has a file attachment',
+    'chat:has-link': 'Contains a link',
+    'chat:command': 'A slash/bot command invocation',
+    'chat:private': 'Private conversation',
+    'chat:group': 'Group (multi-party) conversation',
+    'chat:thread': 'Occurred in a thread',
+  };
 
   /** Refusal category → Discord reaction emoji. Unknown categories get 🛑. */
   private static readonly REFUSAL_REACTIONS: Record<string, string> = {
@@ -3243,6 +3284,12 @@ export class AgentFramework {
       return;
     }
 
+    // Route event_tags (tag/ontology discovery)
+    if (enrichedCall.name === 'event_tags' && this.eventGate) {
+      this.dispatchEventTagsToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
     // stay-silent) tools — handled by the channel registry like the other
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
@@ -4096,6 +4143,42 @@ export class AgentFramework {
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
     // endTurn: the agent stops here and goes idle for the duration.
     finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
+  }
+
+  /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected
+   *  server's declared tag ontology + gate.js status. */
+  private buildEventTagsResult(): Record<string, unknown> {
+    const servers: Record<string, Record<string, unknown>> = {};
+    for (const conn of this.mcplServerRegistry?.getAllServers() ?? []) {
+      const declared = this.featureSetManager?.getDeclaredFeatureSets(conn.id) ?? {};
+      const sets: Record<string, unknown> = {};
+      for (const [name, decl] of Object.entries(declared)) {
+        if (decl.tagOntology) sets[name] = decl.tagOntology;
+      }
+      if (Object.keys(sets).length > 0) servers[conn.id] = sets;
+    }
+    return {
+      core: AgentFramework.CHAT_CORE_TAGS,
+      servers,
+      gateScript: this.eventGate?.getStatus().script ?? null,
+      hint:
+        'Use these in gate.json policies (match.tagsAny / tagsAll / tagsNone) or ' +
+        'in gate.js. Unknown/undeclared tags are tolerated (open ontologies).',
+    };
+  }
+
+  private dispatchEventTagsToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    let result: import('./types/events.js').ToolResult;
+    try {
+      result = { success: true, data: this.buildEventTagsResult() };
+      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      result = { success: false, error: err.message, isError: true };
+    }
+    this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {

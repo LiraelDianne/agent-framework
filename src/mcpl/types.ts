@@ -291,6 +291,16 @@ export interface FeatureSetDeclaration {
 
   /** Whether host manages state persistence for this feature set (Section 8.1) */
   hostState?: boolean;
+
+  /** Optional, open-world tag ontology for this feature set's events
+   *  (MCPL RFC-001 §5). A hint catalog — hosts tolerate undeclared tags. */
+  tagOntology?: {
+    coreTags?: string[];
+    tags?: Record<string, unknown>;
+    keyed?: Record<string, unknown>;
+    defaultTreatment?: unknown[];
+    open?: boolean;
+  };
 }
 
 /**

@@ -12,7 +12,8 @@
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { GateScript } from './gate-script.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -173,8 +174,8 @@ function validateConfig(raw: unknown): GateConfig {
   const obj = raw as Record<string, unknown>;
 
   const defaultBehavior = obj.default ?? 'always';
-  if (defaultBehavior !== 'always' && defaultBehavior !== 'skip') {
-    throw new Error(`gate.json "default" must be "always" or "skip", got: ${defaultBehavior}`);
+  if (defaultBehavior !== 'always' && defaultBehavior !== 'defer' && defaultBehavior !== 'skip') {
+    throw new Error(`gate.json "default" must be "always", "defer", or "skip", got: ${defaultBehavior}`);
   }
 
   const policies: GatePolicy[] = [];
@@ -200,7 +201,7 @@ function validatePolicy(raw: unknown): GatePolicy {
 
   // Validate behavior
   let behavior: GateBehavior;
-  if (obj.behavior === 'always' || obj.behavior === 'skip') {
+  if (obj.behavior === 'always' || obj.behavior === 'defer' || obj.behavior === 'skip') {
     behavior = obj.behavior;
   } else if (obj.behavior && typeof obj.behavior === 'object') {
     const b = obj.behavior as Record<string, unknown>;
@@ -250,7 +251,7 @@ function validatePolicy(raw: unknown): GatePolicy {
       }
       behavior = { passive_sample: out };
     } else {
-      throw new Error(`Policy "${obj.name}": unknown behavior — expected always | skip | { debounce } | { rate_limit } | { passive_sample }`);
+      throw new Error(`Policy "${obj.name}": unknown behavior — expected always | defer | skip | { debounce } | { rate_limit } | { passive_sample }`);
     }
   } else {
     behavior = 'always';
@@ -310,6 +311,8 @@ function validatePolicy(raw: unknown): GatePolicy {
 export class EventGate {
   private configPath: string;
   private config: GateConfig;
+  /** Optional agent-authored programmable gate (gate.js). */
+  private gateScript: GateScript;
   private compiledPolicies: CompiledPolicy[] = [];
   private configMtime: number = 0;
   private lastReloadCheck: number = 0;
@@ -374,6 +377,8 @@ export class EventGate {
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
+    /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
+    scriptTimeoutMs?: number;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -428,6 +433,14 @@ export class EventGate {
     // Load config
     this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
     this.compiledPolicies = this.compilePolicies(this.config);
+
+    // Programmable gate: an optional agent-authored `gate.js` next to gate.json.
+    // Absent ⇒ inactive (zero overhead beyond a throttled stat check).
+    this.gateScript = new GateScript(
+      join(dirname(this.configPath), 'gate.js'),
+      opts.scriptTimeoutMs ?? 50,
+      this.now,
+    );
   }
 
   // =========================================================================
@@ -667,7 +680,12 @@ export class EventGate {
       // Privileged author — fall through to normal policy evaluation.
     }
 
-    const policy = this.matchPolicy(info);
+    // Programmable gate (gate.js) takes precedence when present and returns a
+    // behavior; null/undefined (inactive, error, or a deliberate pass) falls
+    // through to the declarative gate.json policies below.
+    const scripted = this.gateScript.evaluate(info);
+    const policy: GatePolicy | null =
+      scripted != null ? { name: 'gate.js', match: {}, behavior: scripted } : this.matchPolicy(info);
     const decision = this.computeDecision(policy, info);
 
     this.totalEvaluations++;
@@ -720,8 +738,9 @@ export class EventGate {
       timestamp: this.now(),
     });
 
-    if (policy.behavior === 'skip') {
-      return { trigger: false, policyName: policy.name, behavior: 'skip' };
+    if (policy.behavior === 'defer' || policy.behavior === 'skip') {
+      // Report the configured name faithfully ('defer' or legacy 'skip').
+      return { trigger: false, policyName: policy.name, behavior: policy.behavior };
     }
 
     if (policy.behavior === 'always') {
@@ -1149,6 +1168,7 @@ export class EventGate {
       configSource: this.configSource,
       lastReloadTimestamp: this.lastReloadTimestamp,
       default: this.config.default ?? 'always',
+      script: this.gateScript.status(),
       policies,
       errors: [...this.configErrors],
       totalEvaluations: this.totalEvaluations,
@@ -1165,6 +1185,7 @@ export class EventGate {
   // =========================================================================
 
   dispose(): void {
+    this.gateScript.dispose();
     for (const state of this.debounceTimers.values()) {
       clearTimeout(state.timer);
     }
