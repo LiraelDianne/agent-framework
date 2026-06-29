@@ -71,6 +71,10 @@ export class LivenessWatchdog {
       });
       this.worker.unref();
       this.worker.on('error', (e) => console.error('[liveness-watchdog] worker error:', e.message));
+      console.error(
+        `[liveness-watchdog] armed: threshold=${this.opts.thresholdMs ?? 30_000}ms ` +
+          `action=${this.opts.action ?? 'abort'}`,
+      );
     } catch (e) {
       console.error('[liveness-watchdog] failed to start:', (e as Error).message);
     }
