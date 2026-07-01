@@ -10,13 +10,16 @@ type RouteFailure = { conversationId: string; channelId: string | null; reason: 
  * Build a registry with a mock server whose publish result is configurable,
  * plus capture arrays for route-failure notifications and emitted traces.
  */
-function makeRegistry(publishResult: { delivered?: boolean } | undefined) {
+function makeRegistry(
+  publishResult: { delivered?: boolean } | undefined,
+  homeChannelResolver?: (agentName: string) => string | undefined,
+) {
   const failures: RouteFailure[] = [];
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
-  const publishCalls: unknown[] = [];
+  const publishCalls: Array<{ channelId?: string; conversationId?: string }> = [];
 
   const mockServer = {
-    sendChannelsPublish: async (params: unknown) => {
+    sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
       publishCalls.push(params);
       return publishResult;
     },
@@ -32,6 +35,7 @@ function makeRegistry(publishResult: { delivered?: boolean } | undefined) {
     (e) => { traces.push(e); },
     {
       onRouteFailure: (info) => { failures.push(info); },
+      homeChannelResolver,
     },
   );
 
@@ -89,6 +93,62 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.equal(failures[0].channelId, 'ch-x');
   assert.match(failures[0].reason, /delivered:false/);
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed'));
+});
+
+test('routeSpeech routes a conversation fork to its HOME channel, not the global last-inbound (item 3)', async () => {
+  // Two channels are live. chanA registered first; then a message arrives on
+  // chanB, flipping the process-global defaultPublishChannel to chanB. A fork
+  // bound to chanA must still publish to chanA.
+  const homes: Record<string, string> = { 'conversation-chanA-g1': 'chanA' };
+  const { registry, publishCalls } = makeRegistry(
+    { delivered: true },
+    (agentName) => homes[agentName],
+  );
+
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+  // Global locus is now chanB.
+  assert.equal(registry.getDefaultPublishChannel(), 'chanB');
+
+  const res = await registry.routeSpeech('conversation-chanA-g1', 'reply for A');
+  assert.deepEqual(res, { delivered: true, channelId: 'chanA' },
+    'fork must route to its home channel, not the global last-inbound');
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
+});
+
+test('routeSpeech falls back to the global locus for the trunk agent (no home)', async () => {
+  // The trunk/primary agent has no home entry; it correctly uses the global
+  // most-recent-inbound channel.
+  const { registry, publishCalls } = makeRegistry(
+    { delivered: true },
+    () => undefined, // no agent has a home
+  );
+
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+
+  const res = await registry.routeSpeech('trunk', 'heartbeat reply');
+  assert.deepEqual(res, { delivered: true, channelId: 'chanB' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanB');
+});
+
+test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)', () => {
+  const homes: Record<string, string> = { 'conversation-chanA-g1': 'chanA' };
+  const { registry } = makeRegistry(
+    { delivered: true },
+    (agentName) => homes[agentName],
+  );
+
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+
+  // The fork is told chanA (where its speech actually lands)...
+  const forkCtx = registry.buildChannelContext('conversation-chanA-g1');
+  assert.equal(forkCtx?.defaultOutgoing?.channelId, 'chanA');
+
+  // ...while the trunk agent (no home) is told the global default.
+  const trunkCtx = registry.buildChannelContext('trunk');
+  assert.equal(trunkCtx?.defaultOutgoing?.channelId, 'chanB');
 });
 
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
