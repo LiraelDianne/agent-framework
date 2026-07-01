@@ -212,6 +212,16 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
+  /**
+   * Per-agent channel that triggered the agent's CURRENT inference turn, if any
+   * (item-3 redux). Read by the ChannelRegistry's `activeChannelResolver` to
+   * route a single-trunk agent's plain-text speech back to the channel it is
+   * answering, instead of the process-global most-recent-inbound locus that a
+   * concurrent message elsewhere can hijack. Set at turn start (or cleared for a
+   * heartbeat / no-trigger turn) in startAgentStream; overwritten by the next
+   * turn. Never read between turns (a given agent runs one turn at a time).
+   */
+  private activeTriggerChannels: Map<string, string> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private traceListeners: TraceEventListener[] = [];
@@ -2175,6 +2185,9 @@ export class AgentFramework {
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
           timestamp: Date.now(),
+          // Route this turn's auto-published speech back to THIS channel, not
+          // the global most-recent-inbound locus (item-3 redux, trunk agents).
+          channelId: event.channelId,
         });
       }
     }
@@ -2269,6 +2282,9 @@ export class AgentFramework {
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
         timestamp: Date.now(),
+        // A fork's home channel wins in routeSpeech regardless, but carry the
+        // triggering channel too so the trunk/active path stays consistent.
+        channelId: event.channelId,
       });
     }
   }
@@ -2450,6 +2466,20 @@ export class AgentFramework {
     const id = this.addMessage('user', event.content, metadata);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
+    // Some push events carry a channel of origin (Discord DMs arrive here, not
+    // via channels/incoming, because discord-mcpl forwards them with the channel
+    // closed). Register + open that channel so routeSpeech can resolve it, and
+    // thread it onto the wake request so the reply routes back to it instead of
+    // the global locus (item-3 redux, DM sub-case).
+    const triggerChannel = this.derivePushEventChannel(event.origin);
+    if (triggerChannel && this.channelRegistry) {
+      this.channelRegistry.ensureChannelRegistered(
+        event.serverId,
+        triggerChannel.channelId,
+        triggerChannel.label,
+      );
+    }
+
     if (event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
       const targetAgents = event.targetAgents
@@ -2460,9 +2490,48 @@ export class AgentFramework {
           reason: 'mcpl:push-event',
           source: event.serverId,
           timestamp: Date.now(),
+          channelId: triggerChannel?.channelId,
         });
       }
     }
+  }
+
+  /**
+   * Derive the MCPL composite channel id (the outbound routing locus) for a
+   * push event from its server-defined `origin`, if it carries one.
+   *
+   * Discord DMs are the motivating case: discord-mcpl forwards them via
+   * push/event (the DM channel is closed), so they never pass through
+   * channels/incoming and their channel is never registered — leaving the
+   * agent's reply with nowhere to route (item-3 redux, DM sub-case). Prefers an
+   * explicit `origin.mcplChannelId` (a surface declaring its own composite id —
+   * the surface-agnostic contract); otherwise reconstructs the Discord form
+   * `discord:{guildId|dm}:{channelId}` from origin fields, matching
+   * discord-mcpl's `mcplChannelId()` / `parseMcplChannelId()` convention so the
+   * fix works even against a discord-mcpl build that predates `mcplChannelId`.
+   * Returns undefined for push events with no channel provenance (heartbeats,
+   * timers), which correctly keep the global fallback.
+   */
+  private derivePushEventChannel(
+    origin: Record<string, unknown> | undefined,
+  ): { channelId: string; label?: string } | undefined {
+    if (!origin) return undefined;
+    const label = typeof origin.channelName === 'string' ? origin.channelName : undefined;
+
+    const explicit = origin.mcplChannelId;
+    if (typeof explicit === 'string' && explicit) {
+      return { channelId: explicit, label };
+    }
+
+    // Discord fallback: reconstruct the composite from origin parts. `guildId`
+    // is null for a DM (→ 'dm'); a real guild id for a non-open guild channel.
+    if (origin.source === 'discord' && typeof origin.channelId === 'string' && origin.channelId) {
+      const guild =
+        typeof origin.guildId === 'string' && origin.guildId ? origin.guildId : 'dm';
+      return { channelId: `discord:${guild}:${origin.channelId}`, label };
+    }
+
+    return undefined;
   }
 
   private async processInferenceRequests(): Promise<void> {
@@ -2525,7 +2594,19 @@ export class AgentFramework {
 
       // Start streaming inference (non-blocking — driveStream runs in background)
       const trigger = requests[0];
-      await this.startAgentStream(agent, trigger);
+      // Route this turn's auto-published speech to the channel that triggered
+      // it (item-3 redux). A batched wake may carry several triggering channels
+      // (messages arrived in >1 channel while the agent was busy/idle) — reply
+      // in the MOST-RECENT one: it matches the legacy last-inbound semantics and
+      // is the message the agent is most likely answering. The common case is
+      // 1 message → 1 channel (unambiguous). Non-channel wakes carry no
+      // channelId, leaving the field undefined → global fallback. `reduce`
+      // keeps the last defined channelId across the (FIFO-ordered) batch.
+      const triggerChannel = requests.reduce<string | undefined>(
+        (acc, r) => r.channelId ?? acc,
+        undefined,
+      );
+      await this.startAgentStream(agent, { ...trigger, channelId: triggerChannel });
     }
   }
 
@@ -2534,6 +2615,18 @@ export class AgentFramework {
     if (attempt === 0) {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
+    }
+
+    // Establish this turn's outbound routing locus (item-3 redux). Set it to the
+    // triggering channel for a channel/DM-triggered turn; clear it otherwise so
+    // a heartbeat / no-trigger turn doesn't inherit a previous turn's channel and
+    // instead falls back to the global default. A given agent runs one turn at a
+    // time, so a set here is only read during THIS turn's routeSpeech /
+    // buildChannelContext; retries re-run with the same trigger, re-setting it.
+    if (trigger?.channelId) {
+      this.activeTriggerChannels.set(agent.name, trigger.channelId);
+    } else {
+      this.activeTriggerChannels.delete(agent.name);
     }
 
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
@@ -3650,6 +3743,13 @@ export class AgentFramework {
         homeChannelResolver: (agentName) =>
           this.conversationAgentHomes.get(agentName)
           ?? this.conversationRouter?.channelForAgent(agentName),
+        // Route a single TRUNK agent's plain-text speech to the channel that
+        // triggered its CURRENT turn (item-3 redux). connectome-host runs every
+        // agent as a trunk (it never exposes conversation forks), so without this
+        // a reply falls back to the process-global most-recent-inbound locus and
+        // a concurrent message in another channel hijacks it. Empty for
+        // heartbeat / no-trigger turns → correct global fallback.
+        activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
@@ -4254,7 +4354,13 @@ export class AgentFramework {
     const inferenceId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return {
       inferenceId,
-      conversationId: agent.name, // Simplified; proper conversation tracking TODO
+      // Conversation identity = the agent (a trunk agent IS its own conversation;
+      // forks get their own agent). The turn's channel LOCUS — the "proper
+      // conversation tracking" this once flagged as a TODO — is now tracked
+      // per-agent in `activeTriggerChannels` and surfaced to the agent via
+      // buildChannelContext (channels.defaultOutgoing) below, so the agent is
+      // told the same channel its speech will route to (item-3 redux).
+      conversationId: agent.name,
       turnIndex: 0, // Simplified; needs per-conversation counter TODO
       userMessage: null, // Could extract from trigger context
       model: {
