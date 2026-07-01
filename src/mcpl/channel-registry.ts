@@ -1121,9 +1121,23 @@ export class ChannelRegistry {
    * is no locus / the channel or its server can't be resolved (in which case
    * the speech simply stays in chronicle + module surfaces).
    */
+  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
+   *  process-global default). Public so a multi-segment caller can snapshot it
+   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
+  resolveLocus(conversationId: string): string | null {
+    const home = this.homeChannelResolver?.(conversationId);
+    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+  }
+
   async routeSpeech(
     conversationId: string,
     text: string,
+    /** Pin the outbound locus, skipping resolution. Callers delivering MULTIPLE
+     *  segments of ONE turn snapshot resolveLocus() once and pass it here, so a
+     *  new turn starting mid-dispatch (segments run after the agent is idle,
+     *  PR #32) can't overwrite the per-agent triggering channel between segments
+     *  and split one reply across channels. */
+    overrideChannelId?: string | null,
   ): Promise<{ delivered: boolean; channelId: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
@@ -1153,9 +1167,7 @@ export class ChannelRegistry {
     // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
     // it tracks the most-recent inbound across ALL channels, so a reply lands
     // wherever a message last happened to arrive rather than where it belongs.
-    const home = this.homeChannelResolver?.(conversationId);
-    const channelId =
-      home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel;
+    const channelId = overrideChannelId ?? this.resolveLocus(conversationId);
     if (!channelId) {
       // Reached only when the agent has no home, no active triggering channel,
       // AND no global inbound was ever seen.

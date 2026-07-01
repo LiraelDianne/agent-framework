@@ -3212,13 +3212,21 @@ export class AgentFramework {
                   `(${silenced ? 'silencing tool / explicit send' : 'no prose'})`,
                 );
               } else {
+                // Snapshot the locus ONCE. This loop dispatches AFTER the agent
+                // is idle (see PR #32 note below), so a queued inbound from
+                // another channel can start a NEW turn and overwrite the per-agent
+                // triggering channel (`activeTriggerChannels`) BETWEEN segments —
+                // splitting one turn's reply across channels (the residual
+                // multi-segment race left by 83dedf8's per-agent locus). Pin every
+                // segment of THIS turn to the channel resolved right now.
+                const turnLocus = this.channelRegistry.resolveLocus(agent.name);
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} prose segment(s) in order`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} prose segment(s) in order -> ${turnLocus ?? '(default)'}`,
                 );
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    await this.channelRegistry.routeSpeech(agent.name, seg);
+                    await this.channelRegistry.routeSpeech(agent.name, seg, turnLocus);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
