@@ -53,6 +53,7 @@ import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { splitProseSegments } from './prose-segments.js';
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate } from './gate/event-gate.js';
@@ -211,6 +212,16 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
+  /**
+   * Per-agent channel that triggered the agent's CURRENT inference turn, if any
+   * (item-3 redux). Read by the ChannelRegistry's `activeChannelResolver` to
+   * route a single-trunk agent's plain-text speech back to the channel it is
+   * answering, instead of the process-global most-recent-inbound locus that a
+   * concurrent message elsewhere can hijack. Set at turn start (or cleared for a
+   * heartbeat / no-trigger turn) in startAgentStream; overwritten by the next
+   * turn. Never read between turns (a given agent runs one turn at a time).
+   */
+  private activeTriggerChannels: Map<string, string> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private traceListeners: TraceEventListener[] = [];
@@ -236,6 +247,9 @@ export class AgentFramework {
   // Undo/redo state
   private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
   private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
+
+  /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
+  private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
 
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
@@ -309,6 +323,7 @@ export class AgentFramework {
       queryMessages: (filter) => this.queryMessages(filter),
       pushEvent: (event) => this.pushEvent(event),
       onTrace: (listener) => this.onTrace(listener),
+      callTool: (call) => this.executeToolCall(call),
     });
   }
 
@@ -444,6 +459,19 @@ export class AgentFramework {
       });
     }
 
+    // Liveness watchdog: fail hard if the main thread wedges (opt-in).
+    if (config.watchdog?.enabled) {
+      const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
+      framework.livenessWatchdog = new LivenessWatchdog({
+        enabled: true,
+        thresholdMs: config.watchdog.thresholdMs,
+        action: config.watchdog.action,
+        reportPath: config.watchdog.reportPath
+          ?? (config.storePath ? join(config.storePath, 'watchdog-wedge.jsonl') : undefined),
+      });
+      framework.livenessWatchdog.start();
+    }
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
@@ -529,6 +557,7 @@ export class AgentFramework {
 
     // Dispose EventGate (clear debounce timers)
     this.eventGate?.dispose();
+    this.livenessWatchdog?.stop();
 
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
@@ -658,7 +687,12 @@ export class AgentFramework {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
     const gateTools = this.eventGate
-      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS]
+      ? [
+          this.eventGate.getToolDefinition(),
+          ...AgentFramework.SLEEP_TOOLS,
+          ...AgentFramework.WAKE_RULE_TOOLS,
+          AgentFramework.EVENT_TAGS_TOOL,
+        ]
       : [];
     if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
       return moduleTools;
@@ -761,6 +795,45 @@ export class AgentFramework {
    */
   getModule(name: string): Module | null {
     return this.moduleRegistry.getModule(name);
+  }
+
+  // =========================================================================
+  // Wake-rule surface (gate policy mutation) — backs wake_add_rule /
+  // wake_remove_rule and lets host modules compose higher-level wake modes
+  // (e.g. an "every-message-debounced" channel mode) without reaching into
+  // the private EventGate.
+  // =========================================================================
+
+  /**
+   * Add or replace (upsert) a gate policy at runtime. Validated and persisted
+   * to gate.json; hot-applied in memory. Throws if no gate is configured or the
+   * policy is invalid. `position: 'prepend'` puts a wake rule ahead of broad
+   * defer/debounce rules (first match wins).
+   */
+  addGatePolicy(
+    rawPolicy: unknown,
+    options?: { position?: 'append' | 'prepend' },
+  ): import('./gate/types.js').GatePolicy {
+    if (!this.eventGate) {
+      throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
+    }
+    return this.eventGate.addPolicy(rawPolicy, options);
+  }
+
+  /**
+   * Remove a gate policy by name at runtime. Returns false if it didn't exist.
+   * Throws if no gate is configured.
+   */
+  removeGatePolicy(name: string): boolean {
+    if (!this.eventGate) {
+      throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
+    }
+    return this.eventGate.removePolicy(name);
+  }
+
+  /** Current gate policy names (freshest on-disk view). Empty when no gate. */
+  getGatePolicyNames(): string[] {
+    return this.eventGate?.listPolicyNames() ?? [];
   }
 
   /**
@@ -1036,6 +1109,154 @@ export class AgentFramework {
       inputSchema: { type: 'object' },
     },
   ];
+
+  /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
+   *  Present when a gate is wired. They write validated policies into the
+   *  hot-reloaded gate.json (same validation as load), so a rule takes effect
+   *  immediately and survives restart. */
+  private static readonly WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'wake_add_rule',
+      description:
+        'Add or replace a wake rule (a gate.json policy) at runtime — no need to ' +
+        'hand-edit the file. The rule is validated and hot-applied immediately. ' +
+        'A rule with the same `name` replaces the existing one in place. Use ' +
+        '`position: "prepend"` to put a wake rule ahead of broad defer/debounce ' +
+        'rules (first match wins). Two common shapes:\n' +
+        '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
+        '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
+        '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
+        'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, behavior: { debounce: 60000 } }` ' +
+        '(the channel must be subscribed for ambient events to arrive — see channel mode).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Unique rule name. Reusing a name replaces that rule.' },
+          match: {
+            type: 'object',
+            description: 'Match criteria (all AND together). Omitted fields match anything.',
+            properties: {
+              scope: { type: 'array', items: { type: 'string' }, description: 'Event types, e.g. ["mcpl:channel-incoming","workspace:modified"].' },
+              source: { type: 'string', description: 'Integration/serverId, glob ok (e.g. "discord").' },
+              channel: { type: 'string', description: 'Channel id, glob ok (e.g. "discord:*:12345").' },
+              mount: { type: 'string', description: 'Workspace mount name, glob ok (workspace:* events).' },
+              pathGlob: { type: 'string', description: 'Glob over touched paths (workspace:* events).' },
+              tagsAny: { type: 'array', items: { type: 'string' }, description: 'Match if ANY tag matches (globs ok).' },
+              tagsAll: { type: 'array', items: { type: 'string' }, description: 'Match only if EVERY tag matches.' },
+              tagsNone: { type: 'array', items: { type: 'string' }, description: 'Match only if NONE match.' },
+              metadataTrue: { type: 'array', items: { type: 'string' }, description: 'Match if ANY listed metadata field is truthy.' },
+              filter: {
+                type: 'object',
+                description: 'Content filter.',
+                properties: {
+                  type: { type: 'string', enum: ['text', 'regex'] },
+                  pattern: { type: 'string' },
+                },
+                required: ['type', 'pattern'],
+              },
+            },
+          },
+          behavior: {
+            type: 'string',
+            enum: ['always', 'defer', 'skip'],
+            description:
+              'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
+              'context). For debounce / rate-limit / sampling, use debounceMs / rateLimit / ' +
+              'passiveSample below instead of this field. Exactly one behavior must be given.',
+          },
+          debounceMs: {
+            type: 'number',
+            description: 'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000).',
+          },
+          rateLimit: {
+            type: 'object',
+            description: 'Token-bucket wake: at most `tokens` wakes per window; refills one per refillIntervalMs.',
+            properties: {
+              tokens: { type: 'number', description: 'Bucket capacity (> 0).' },
+              refillIntervalMs: { type: 'number', description: 'Ms between token refills (> 0).' },
+              keyBy: { type: 'string', description: 'Metadata field to partition buckets by (e.g. "channelId").' },
+            },
+            required: ['tokens', 'refillIntervalMs'],
+          },
+          passiveSample: {
+            type: 'object',
+            description: 'Wake every Nth matching event.',
+            properties: {
+              every: { type: 'number', description: 'Fire every N matches (positive integer).' },
+              keyBy: { type: 'string', description: 'Metadata field for separate per-key counters.' },
+            },
+            required: ['every'],
+          },
+          position: {
+            type: 'string',
+            enum: ['append', 'prepend'],
+            description: 'Where to insert a NEW rule (ignored when replacing by name). Default "append".',
+          },
+          resets: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Names of other rules whose runtime state to clear when this rule fires.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+    {
+      name: 'wake_remove_rule',
+      description:
+        'Remove a wake rule (gate.json policy) by name at runtime. Any pending ' +
+        'debounce batch for that rule is delivered first. Returns whether a rule ' +
+        'was removed (false if no rule had that name).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The rule name to remove.' },
+        },
+        required: ['name'],
+      },
+    },
+  ];
+
+  /** Discoverability for event tags (MCPL RFC-001): the reserved chat:* core,
+   *  each connected server's declared tag ontology, and gate.js status. */
+  private static readonly EVENT_TAGS_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'event_tags',
+    description:
+      'List the event tags available for gating: the reserved cross-platform ' +
+      'chat:* core, each connected server\'s declared tag ontology (descriptions, ' +
+      'implications, suggested treatments), and the status of your programmable ' +
+      'gate (gate.js). Use these tag names in gate.json policies (tagsAny / ' +
+      'tagsAll / tagsNone) or in gate.js.',
+    inputSchema: { type: 'object' },
+  };
+
+  /** Reserved chat:* core vocabulary (MCPL RFC-001 §4) — short descriptions so
+   *  the agent can author rules without reading the spec. */
+  private static readonly CHAT_CORE_TAGS: Record<string, string> = {
+    'chat:addressed': 'Directed at you (umbrella: dm/mention/reply)',
+    'chat:mention': 'You were explicitly @-mentioned',
+    'chat:reply': 'A reply to your own message',
+    'chat:dm': 'A direct/private message to you',
+    'chat:ambient': 'Overheard in a followed channel; not addressed',
+    'chat:broadcast': 'Channel-wide ping (@everyone / channel post)',
+    'chat:to-self': 'Acts on your own content (reaction/reply to you)',
+    'chat:from-human': 'Authored by a human',
+    'chat:from-bot': 'Authored by a bot/automation',
+    'chat:from-self': 'Your own message, echoed back',
+    'chat:from-agent': 'Authored by another persona/agent',
+    'chat:edited': 'An edit of an existing message',
+    'chat:deleted': 'A deletion',
+    'chat:reaction': 'An emoji reaction was added',
+    'chat:reaction-remove': 'A reaction was removed',
+    'chat:has-image': 'Has an image attachment',
+    'chat:has-audio': 'Has an audio attachment',
+    'chat:has-file': 'Has a file attachment',
+    'chat:has-link': 'Contains a link',
+    'chat:command': 'A slash/bot command invocation',
+    'chat:private': 'Private conversation',
+    'chat:group': 'Group (multi-party) conversation',
+    'chat:thread': 'Occurred in a thread',
+  };
 
   /** Refusal category → Discord reaction emoji. Unknown categories get 🛑. */
   private static readonly REFUSAL_REACTIONS: Record<string, string> = {
@@ -2115,6 +2336,9 @@ export class AgentFramework {
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
           timestamp: Date.now(),
+          // Route this turn's auto-published speech back to THIS channel, not
+          // the global most-recent-inbound locus (item-3 redux, trunk agents).
+          channelId: event.channelId,
         });
       }
     }
@@ -2209,6 +2433,9 @@ export class AgentFramework {
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
         timestamp: Date.now(),
+        // A fork's home channel wins in routeSpeech regardless, but carry the
+        // triggering channel too so the trunk/active path stays consistent.
+        channelId: event.channelId,
       });
     }
   }
@@ -2390,6 +2617,20 @@ export class AgentFramework {
     const id = this.addMessage('user', event.content, metadata);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
+    // Some push events carry a channel of origin (Discord DMs arrive here, not
+    // via channels/incoming, because discord-mcpl forwards them with the channel
+    // closed). Register + open that channel so routeSpeech can resolve it, and
+    // thread it onto the wake request so the reply routes back to it instead of
+    // the global locus (item-3 redux, DM sub-case).
+    const triggerChannel = this.derivePushEventChannel(event.origin);
+    if (triggerChannel && this.channelRegistry) {
+      this.channelRegistry.ensureChannelRegistered(
+        event.serverId,
+        triggerChannel.channelId,
+        triggerChannel.label,
+      );
+    }
+
     if (event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
       const targetAgents = event.targetAgents
@@ -2400,9 +2641,48 @@ export class AgentFramework {
           reason: 'mcpl:push-event',
           source: event.serverId,
           timestamp: Date.now(),
+          channelId: triggerChannel?.channelId,
         });
       }
     }
+  }
+
+  /**
+   * Derive the MCPL composite channel id (the outbound routing locus) for a
+   * push event from its server-defined `origin`, if it carries one.
+   *
+   * Discord DMs are the motivating case: discord-mcpl forwards them via
+   * push/event (the DM channel is closed), so they never pass through
+   * channels/incoming and their channel is never registered — leaving the
+   * agent's reply with nowhere to route (item-3 redux, DM sub-case). Prefers an
+   * explicit `origin.mcplChannelId` (a surface declaring its own composite id —
+   * the surface-agnostic contract); otherwise reconstructs the Discord form
+   * `discord:{guildId|dm}:{channelId}` from origin fields, matching
+   * discord-mcpl's `mcplChannelId()` / `parseMcplChannelId()` convention so the
+   * fix works even against a discord-mcpl build that predates `mcplChannelId`.
+   * Returns undefined for push events with no channel provenance (heartbeats,
+   * timers), which correctly keep the global fallback.
+   */
+  private derivePushEventChannel(
+    origin: Record<string, unknown> | undefined,
+  ): { channelId: string; label?: string } | undefined {
+    if (!origin) return undefined;
+    const label = typeof origin.channelName === 'string' ? origin.channelName : undefined;
+
+    const explicit = origin.mcplChannelId;
+    if (typeof explicit === 'string' && explicit) {
+      return { channelId: explicit, label };
+    }
+
+    // Discord fallback: reconstruct the composite from origin parts. `guildId`
+    // is null for a DM (→ 'dm'); a real guild id for a non-open guild channel.
+    if (origin.source === 'discord' && typeof origin.channelId === 'string' && origin.channelId) {
+      const guild =
+        typeof origin.guildId === 'string' && origin.guildId ? origin.guildId : 'dm';
+      return { channelId: `discord:${guild}:${origin.channelId}`, label };
+    }
+
+    return undefined;
   }
 
   private async processInferenceRequests(): Promise<void> {
@@ -2465,7 +2745,19 @@ export class AgentFramework {
 
       // Start streaming inference (non-blocking — driveStream runs in background)
       const trigger = requests[0];
-      await this.startAgentStream(agent, trigger);
+      // Route this turn's auto-published speech to the channel that triggered
+      // it (item-3 redux). A batched wake may carry several triggering channels
+      // (messages arrived in >1 channel while the agent was busy/idle) — reply
+      // in the MOST-RECENT one: it matches the legacy last-inbound semantics and
+      // is the message the agent is most likely answering. The common case is
+      // 1 message → 1 channel (unambiguous). Non-channel wakes carry no
+      // channelId, leaving the field undefined → global fallback. `reduce`
+      // keeps the last defined channelId across the (FIFO-ordered) batch.
+      const triggerChannel = requests.reduce<string | undefined>(
+        (acc, r) => r.channelId ?? acc,
+        undefined,
+      );
+      await this.startAgentStream(agent, { ...trigger, channelId: triggerChannel });
     }
   }
 
@@ -2474,6 +2766,18 @@ export class AgentFramework {
     if (attempt === 0) {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
+    }
+
+    // Establish this turn's outbound routing locus (item-3 redux). Set it to the
+    // triggering channel for a channel/DM-triggered turn; clear it otherwise so
+    // a heartbeat / no-trigger turn doesn't inherit a previous turn's channel and
+    // instead falls back to the global default. A given agent runs one turn at a
+    // time, so a set here is only read during THIS turn's routeSpeech /
+    // buildChannelContext; retries re-run with the same trigger, re-setting it.
+    if (trigger?.channelId) {
+      this.activeTriggerChannels.set(agent.name, trigger.channelId);
+    } else {
+      this.activeTriggerChannels.delete(agent.name);
     }
 
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
@@ -2888,23 +3192,36 @@ export class AgentFramework {
                 .map((b) => (b as unknown as { name?: string }).name)
                 .filter((n): n is string => typeof n === 'string');
               const silenced = toolNames.some((n) => SILENCING.has(bare(n)));
-              const t = allText
-                .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
-              if (silenced || !t) {
+
+              // Split the turn's content into ordered prose segments, broken at
+              // each tool_use / tool_result boundary. `response.content` holds the
+              // WHOLE turn's blocks in provider order — earlier tool rounds
+              // included (see the trailing-slice note above, which slices exactly
+              // because the full turn is present) — so a left-to-right walk
+              // reconstructs the emission order. Interleaved prose
+              // ("msgA → [tool] → msgB → [tool] → msgC") is then delivered as
+              // separate messages IN ORDER instead of being collapsed into one
+              // trailing post (item 4). The silencing rule stays turn-wide: an
+              // explicit send / skip suppresses ALL auto-routed prose this turn,
+              // preserving the double-post guard.
+              const segments = splitProseSegments(response.content);
+
+              if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> NOT routed ` +
                   `(${silenced ? 'silencing tool / explicit send' : 'no prose'})`,
                 );
               } else {
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing trailing prose (${t.length} chars) as reply`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} prose segment(s) in order`,
                 );
-                try {
-                  await this.channelRegistry.routeSpeech(agent.name, t);
-                } catch (err) {
-                  console.error('speech routing failed:', err);
+                // Deliver sequentially (await each) so the segments land in order.
+                for (const seg of segments) {
+                  try {
+                    await this.channelRegistry.routeSpeech(agent.name, seg);
+                  } catch (err) {
+                    console.error('speech routing failed:', err);
+                  }
                 }
               }
             }
@@ -3242,6 +3559,18 @@ export class AgentFramework {
       return;
     }
 
+    // Route wake-rule tools (runtime gate.json policy add/remove)
+    if ((enrichedCall.name === 'wake_add_rule' || enrichedCall.name === 'wake_remove_rule') && this.eventGate) {
+      this.dispatchWakeRuleToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route event_tags (tag/ontology discovery)
+    if (enrichedCall.name === 'event_tags' && this.eventGate) {
+      this.dispatchEventTagsToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
     // stay-silent) tools — handled by the channel registry like the other
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
@@ -3562,6 +3891,22 @@ export class AgentFramework {
           }
         },
         shouldTriggerInference: triggerFilter,
+        // Route a conversation fork's plain-text speech to its HOME channel, not
+        // the process-global most-recent-inbound locus (item 3). The trunk agent
+        // has no home entry, so this returns undefined and routeSpeech falls back
+        // to defaultPublishChannel. `conversationAgentHomes` is the permanent
+        // spawn-time binding; `channelForAgent` is the router's live binding as a
+        // belt-and-suspenders fallback.
+        homeChannelResolver: (agentName) =>
+          this.conversationAgentHomes.get(agentName)
+          ?? this.conversationRouter?.channelForAgent(agentName),
+        // Route a single TRUNK agent's plain-text speech to the channel that
+        // triggered its CURRENT turn (item-3 redux). connectome-host runs every
+        // agent as a trunk (it never exposes conversation forks), so without this
+        // a reply falls back to the process-global most-recent-inbound locus and
+        // a concurrent message in another channel hijacks it. Empty for
+        // heartbeat / no-trigger turns → correct global fallback.
+        activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
@@ -4051,6 +4396,91 @@ export class AgentFramework {
   }
 
   /**
+   * Handle the synthesized `wake_add_rule` / `wake_remove_rule` tools: mutate
+   * the hot-reloaded gate.json at runtime. Validation lives in the EventGate
+   * (same path as gate.json load), so an invalid rule is surfaced as a tool
+   * error and nothing is written.
+   */
+  private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const finish = (result: ToolResult) => {
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    };
+
+    try {
+      if (call.name === 'wake_remove_rule') {
+        const input = (call.input ?? {}) as { name?: unknown };
+        if (typeof input.name !== 'string' || !input.name) {
+          finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
+          return;
+        }
+        const removed = this.removeGatePolicy(input.name);
+        finish({
+          success: true,
+          data: { removed, name: input.name, policies: this.getGatePolicyNames() },
+        });
+        return;
+      }
+
+      // wake_add_rule — assemble the canonical behavior from the typed fields
+      // (exactly one), then let the gate's own validator do the authoritative
+      // range/shape checks.
+      const input = (call.input ?? {}) as {
+        name?: unknown; match?: unknown; resets?: unknown; position?: unknown;
+        behavior?: unknown; debounceMs?: unknown; rateLimit?: unknown; passiveSample?: unknown;
+      };
+      const behaviorSources = [
+        input.behavior !== undefined ? 'behavior' : null,
+        input.debounceMs !== undefined ? 'debounceMs' : null,
+        input.rateLimit !== undefined ? 'rateLimit' : null,
+        input.passiveSample !== undefined ? 'passiveSample' : null,
+      ].filter((s): s is string => s !== null);
+      if (behaviorSources.length === 0) {
+        finish({
+          success: false,
+          error: 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, or `passiveSample`.',
+          isError: true,
+        });
+        return;
+      }
+      if (behaviorSources.length > 1) {
+        finish({
+          success: false,
+          error: `wake_add_rule: give only one behavior, got [${behaviorSources.join(', ')}].`,
+          isError: true,
+        });
+        return;
+      }
+      const behavior: unknown =
+        input.debounceMs !== undefined ? { debounce: input.debounceMs }
+        : input.rateLimit !== undefined ? { rate_limit: input.rateLimit }
+        : input.passiveSample !== undefined ? { passive_sample: input.passiveSample }
+        : input.behavior;
+
+      const position = input.position === 'prepend' ? 'prepend' : 'append';
+      const rawPolicy = {
+        name: input.name,
+        match: input.match ?? {},
+        behavior,
+        ...(input.resets !== undefined ? { resets: input.resets } : {}),
+      };
+      const policy = this.addGatePolicy(rawPolicy, { position });
+      finish({
+        success: true,
+        data: { added: policy.name, policies: this.getGatePolicyNames() },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      finish({ success: false, error: msg, isError: true });
+    }
+  }
+
+  /**
    * Handle the synthesized `sleep` / `wake` tools. `sleep` arms the gate's
    * suppression window, optionally announces in the sticky channel, and ends
    * the turn (the agent goes idle immediately). `wake` clears sleep.
@@ -4097,6 +4527,42 @@ export class AgentFramework {
     finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
   }
 
+  /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected
+   *  server's declared tag ontology + gate.js status. */
+  private buildEventTagsResult(): Record<string, unknown> {
+    const servers: Record<string, Record<string, unknown>> = {};
+    for (const conn of this.mcplServerRegistry?.getAllServers() ?? []) {
+      const declared = this.featureSetManager?.getDeclaredFeatureSets(conn.id) ?? {};
+      const sets: Record<string, unknown> = {};
+      for (const [name, decl] of Object.entries(declared)) {
+        if (decl.tagOntology) sets[name] = decl.tagOntology;
+      }
+      if (Object.keys(sets).length > 0) servers[conn.id] = sets;
+    }
+    return {
+      core: AgentFramework.CHAT_CORE_TAGS,
+      servers,
+      gateScript: this.eventGate?.getStatus().script ?? null,
+      hint:
+        'Use these in gate.json policies (match.tagsAny / tagsAll / tagsNone) or ' +
+        'in gate.js. Unknown/undeclared tags are tolerated (open ontologies).',
+    };
+  }
+
+  private dispatchEventTagsToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    let result: import('./types/events.js').ToolResult;
+    try {
+      result = { success: true, data: this.buildEventTagsResult() };
+      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      result = { success: false, error: err.message, isError: true };
+    }
+    this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+  }
+
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
@@ -4130,7 +4596,13 @@ export class AgentFramework {
     const inferenceId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return {
       inferenceId,
-      conversationId: agent.name, // Simplified; proper conversation tracking TODO
+      // Conversation identity = the agent (a trunk agent IS its own conversation;
+      // forks get their own agent). The turn's channel LOCUS — the "proper
+      // conversation tracking" this once flagged as a TODO — is now tracked
+      // per-agent in `activeTriggerChannels` and surfaced to the agent via
+      // buildChannelContext (channels.defaultOutgoing) below, so the agent is
+      // told the same channel its speech will route to (item-3 redux).
+      conversationId: agent.name,
       turnIndex: 0, // Simplified; needs per-conversation counter TODO
       userMessage: null, // Could extract from trigger context
       model: {
@@ -4139,7 +4611,7 @@ export class AgentFramework {
         contextWindow: 200000,
         capabilities: ['tools'],
       },
-      channels: this.channelRegistry?.buildChannelContext(),
+      channels: this.channelRegistry?.buildChannelContext(agent.name),
     };
   }
 }

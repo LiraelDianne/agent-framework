@@ -234,6 +234,31 @@ interface ChannelRegistryOptions {
     reason: string;
     textLen: number;
   }) => void;
+  /**
+   * Resolve a conversation fork's HOME channel from its agent name. Conversation
+   * forks are spawned bound to a single channel (the framework tracks this in
+   * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
+   * plain-text speech must route THERE. The process-global `defaultPublishChannel`
+   * tracks only the most-recent inbound across ALL channels, so with one fork per
+   * channel running concurrently it misroutes a fork's reply to whichever channel
+   * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
+   * no home and correctly falls back to the global locus (heartbeats, etc.).
+   */
+  homeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Resolve the channel that triggered an agent's CURRENT inference turn, by
+   * agent name. This is the fix for single-TRUNK agents (the only mode
+   * connectome-host runs — it never exposes conversation forks). A trunk agent
+   * has no fork home, so without this its plain-text speech falls back to the
+   * process-global `defaultPublishChannel`, which tracks the most-recent inbound
+   * across ALL channels and misroutes a reply to whichever channel last spoke
+   * under concurrency (item-3 redux). The framework tracks the triggering
+   * channel of the live turn per-agent and exposes it here; resolves to
+   * undefined for a heartbeat / no-trigger turn, which correctly keeps the
+   * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
+   * wins), BEFORE `defaultPublishChannel`.
+   */
+  activeChannelResolver?: (agentName: string) => string | undefined;
 }
 
 // ============================================================================
@@ -258,6 +283,8 @@ export class ChannelRegistry {
     reason: string;
     textLen: number;
   }) => void;
+  private homeChannelResolver?: (agentName: string) => string | undefined;
+  private activeChannelResolver?: (agentName: string) => string | undefined;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
@@ -304,6 +331,8 @@ export class ChannelRegistry {
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
     this.onRouteFailure = options?.onRouteFailure;
+    this.homeChannelResolver = options?.homeChannelResolver;
+    this.activeChannelResolver = options?.activeChannelResolver;
   }
 
   /**
@@ -484,6 +513,7 @@ export class ChannelRegistry {
             messageId: message.messageId,
             threadId: message.threadId,
             author: message.author,
+            ...(message.tags ? { tags: message.tags } : {}),
           },
         );
       }
@@ -522,6 +552,50 @@ export class ChannelRegistry {
       serverId,
       messageCount: params.messages.length,
       channelIds: [...new Set(params.messages.map((m) => m.channelId))],
+    });
+  }
+
+  /**
+   * Ensure a channel is registered AND open so it can serve as an outbound
+   * routing locus, lazy-registering it if unseen and opening it if closed.
+   *
+   * Mirrors the lazy-registration inside handleIncoming(), but for channels
+   * that only ever arrive as push/events rather than channels/incoming — the
+   * motivating case is Discord DMs, which discord-mcpl forwards via push/event
+   * with the channel closed (`channelIsOpen:false`). Such a channel is never
+   * registered, so routeSpeech() can't resolve it and the agent's reply is
+   * silently dropped even though the inbound message proves the channel is
+   * reachable (item-3 redux, DM sub-case). Idempotent: a later authoritative
+   * channels/register or channels/changed overwrites this descriptor with the
+   * richer one; re-opening an already-open channel is a no-op.
+   */
+  ensureChannelRegistered(serverId: string, channelId: string, label?: string): void {
+    const existing = this.findChannelEntry(channelId);
+    if (existing) {
+      if (!existing.open) {
+        existing.open = true;
+        this.emitTraceFn({ type: 'mcpl:channel-opened', serverId: existing.serverId, channelId });
+      }
+      return;
+    }
+
+    const key = `${serverId}:${channelId}`;
+    this.channels.set(key, {
+      serverId,
+      descriptor: {
+        id: channelId,
+        type: serverId,
+        label: label ?? channelId,
+        direction: 'bidirectional',
+        metadata: { lazyRegistered: true },
+      },
+      open: true,
+    });
+    this.emitTraceFn({
+      type: 'mcpl:channel-lazy-registered',
+      serverId,
+      channelId,
+      label: label ?? channelId,
     });
   }
 
@@ -700,15 +774,28 @@ export class ChannelRegistry {
    *
    * Returns undefined if no channels are active.
    */
-  buildChannelContext(): ChannelContext | undefined {
+  buildChannelContext(agentName?: string): ChannelContext | undefined {
     const openChannels = this.getOpenChannels();
-    if (openChannels.length === 0 && !this.defaultPublishChannel) {
+
+    // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
+    // told the channel its speech will actually land in: a conversation fork's
+    // home channel, else this turn's triggering channel (single trunk agent —
+    // item-3 redux), else the global default (heartbeats). Without this, a fork
+    // was advertised the global locus but published somewhere else; and a trunk
+    // agent was told the wrong channel under concurrency.
+    const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
+    const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
+    const outgoing = home ?? active ?? this.defaultPublishChannel;
+
+    if (openChannels.length === 0 && !outgoing) {
       return undefined;
     }
 
     const context: ChannelContext = {};
 
-    // Incoming: from defaultPublishChannel if set
+    // Incoming: the most-recent inbound message (what the agent is replying to).
+    // Left process-global — per-channel inbound tracking (the right messageId for
+    // a fork's own channel) is a separate concern from the outbound routing fix.
     if (this.defaultPublishChannel && this.defaultPublishMessageId) {
       context.incoming = {
         channelId: this.defaultPublishChannel,
@@ -717,10 +804,10 @@ export class ChannelRegistry {
       };
     }
 
-    // Default outgoing: same as incoming (reply to last channel)
-    if (this.defaultPublishChannel) {
+    // Default outgoing: the resolved outbound locus (home channel for forks).
+    if (outgoing) {
       context.defaultOutgoing = {
-        channelId: this.defaultPublishChannel,
+        channelId: outgoing,
       };
     }
 
@@ -1053,9 +1140,26 @@ export class ChannelRegistry {
       return null;
     };
 
-    const channelId = this.defaultPublishChannel;
+    // Resolve the outbound locus, in precedence order:
+    //   1. fork HOME channel — a conversation fork always replies in the channel
+    //      it was spawned to serve (item 3, forks).
+    //   2. this turn's TRIGGERING channel — a single trunk agent (connectome-
+    //      host's only mode) replies in the channel whose message woke THIS
+    //      inference, so a concurrent inbound elsewhere can't hijack the reply
+    //      (item-3 redux, trunk agents). Also carries DM channels, which arrive
+    //      as push/events and never touch `defaultPublishChannel`.
+    //   3. the process-global `defaultPublishChannel` — last resort for turns
+    //      with no triggering channel (heartbeats, timers).
+    // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
+    // it tracks the most-recent inbound across ALL channels, so a reply lands
+    // wherever a message last happened to arrive rather than where it belongs.
+    const home = this.homeChannelResolver?.(conversationId);
+    const channelId =
+      home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel;
     if (!channelId) {
-      return fail(null, 'no locus (defaultPublishChannel null)');
+      // Reached only when the agent has no home, no active triggering channel,
+      // AND no global inbound was ever seen.
+      return fail(null, 'no locus (no home/active channel, defaultPublishChannel null)');
     }
 
     const entry = this.findChannelEntry(channelId);

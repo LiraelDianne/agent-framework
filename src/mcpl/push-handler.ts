@@ -197,6 +197,7 @@ export class PushHandler {
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
         ...(params.origin ?? {}),
+        ...(params.tags ? { tags: params.tags } : {}),
       };
       triggerInference = this.shouldTriggerInference(textContent, metadata);
     }

@@ -52,7 +52,8 @@ export interface PassiveSampleConfig {
 /** How a matching policy affects inference triggering. */
 export type GateBehavior =
   | 'always'    // Trigger inference immediately
-  | 'skip'      // Don't trigger inference (event still enters context)
+  | 'defer'     // Don't trigger inference (event still enters context). Preferred name.
+  | 'skip'      // Legacy alias for 'defer' (still accepted).
   | { debounce: number }                  // Batch events per-policy, deliver after delay (ms)
   | { rate_limit: RateLimitConfig }       // Token bucket per `keyBy`; deny when empty
   | { passive_sample: PassiveSampleConfig };  // Fire every Nth match
@@ -88,6 +89,17 @@ export interface GatePolicyMatch {
    * matches if any of those is set. Empty/omitted = no metadata constraint.
    */
   metadataTrue?: string[];
+  /**
+   * Tag matching (MCPL RFC-001 event tags). Globs allowed (e.g. `robotics:*`).
+   * Evaluated against the event's (implication-expanded) tag set:
+   *   tagsAny  — match if ANY listed pattern matches an event tag
+   *   tagsAll  — match only if EVERY listed pattern matches some event tag
+   *   tagsNone — match only if NO listed pattern matches any event tag
+   * Combined with the other fields by AND, like the rest of the match.
+   */
+  tagsAny?: string[];
+  tagsAll?: string[];
+  tagsNone?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +128,7 @@ export interface GatePolicy {
 export interface GateConfig {
   policies: GatePolicy[];
   /** Behavior when no policy matches. Default: 'always'. */
-  default?: 'always' | 'skip';
+  default?: 'always' | 'defer' | 'skip';
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +175,8 @@ export interface GateEventInfo {
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */
   paths?: string[];
+  /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
+  tags?: string[];
 }
 
 /** Per-policy runtime statistics (for gate:status). */
@@ -192,7 +206,9 @@ export interface GateStatus {
   configPath: string;
   configSource: 'file' | 'initial' | 'default';
   lastReloadTimestamp: number | null;
-  default: 'always' | 'skip';
+  default: 'always' | 'defer' | 'skip';
+  /** Status of the optional programmable gate (gate.js). */
+  script: import('./gate-script.js').GateScriptStatus;
   policies: GatePolicyStats[];
   errors: string[];
   /** Total events the gate has evaluated since startup. */

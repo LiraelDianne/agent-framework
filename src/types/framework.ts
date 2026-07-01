@@ -69,6 +69,21 @@ export interface FrameworkConfig {
   gate?: GateOptions;
 
   /**
+   * Liveness watchdog: fail hard (and let the supervisor restart) if the main
+   * thread wedges — a synchronous infinite loop or microtask flood that would
+   * otherwise leave the agent silently deaf. Off unless `enabled` is set.
+   */
+  watchdog?: {
+    enabled?: boolean;
+    /** Kill if no heartbeat for this long (ms). Default 30000. */
+    thresholdMs?: number;
+    /** 'abort' → SIGABRT (core dump for debugging); 'exit' → SIGKILL. Default 'abort'. */
+    action?: 'abort' | 'exit';
+    /** Optional path for a JSON wedge report written before the kill. */
+    reportPath?: string;
+  };
+
+  /**
    * Per-channel conversation routing. When set, incoming MCPL channel
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is

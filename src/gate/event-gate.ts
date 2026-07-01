@@ -12,7 +12,8 @@
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { GateScript } from './gate-script.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -89,6 +90,9 @@ interface CompiledPolicy {
   channelRegex?: RegExp;
   mountRegex?: RegExp;
   pathRegex?: RegExp;
+  tagsAnyRe?: RegExp[];
+  tagsAllRe?: RegExp[];
+  tagsNoneRe?: RegExp[];
 }
 
 interface PolicyStats {
@@ -170,8 +174,8 @@ function validateConfig(raw: unknown): GateConfig {
   const obj = raw as Record<string, unknown>;
 
   const defaultBehavior = obj.default ?? 'always';
-  if (defaultBehavior !== 'always' && defaultBehavior !== 'skip') {
-    throw new Error(`gate.json "default" must be "always" or "skip", got: ${defaultBehavior}`);
+  if (defaultBehavior !== 'always' && defaultBehavior !== 'defer' && defaultBehavior !== 'skip') {
+    throw new Error(`gate.json "default" must be "always", "defer", or "skip", got: ${defaultBehavior}`);
   }
 
   const policies: GatePolicy[] = [];
@@ -197,7 +201,7 @@ function validatePolicy(raw: unknown): GatePolicy {
 
   // Validate behavior
   let behavior: GateBehavior;
-  if (obj.behavior === 'always' || obj.behavior === 'skip') {
+  if (obj.behavior === 'always' || obj.behavior === 'defer' || obj.behavior === 'skip') {
     behavior = obj.behavior;
   } else if (obj.behavior && typeof obj.behavior === 'object') {
     const b = obj.behavior as Record<string, unknown>;
@@ -247,7 +251,7 @@ function validatePolicy(raw: unknown): GatePolicy {
       }
       behavior = { passive_sample: out };
     } else {
-      throw new Error(`Policy "${obj.name}": unknown behavior — expected always | skip | { debounce } | { rate_limit } | { passive_sample }`);
+      throw new Error(`Policy "${obj.name}": unknown behavior — expected always | defer | skip | { debounce } | { rate_limit } | { passive_sample }`);
     }
   } else {
     behavior = 'always';
@@ -266,6 +270,14 @@ function validatePolicy(raw: unknown): GatePolicy {
       const fields = m.metadataTrue.filter((s): s is string => typeof s === 'string' && s.length > 0);
       if (fields.length > 0) match.metadataTrue = fields;
     }
+    const tagList = (v: unknown): string[] | undefined => {
+      if (!Array.isArray(v)) return undefined;
+      const out = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      return out.length > 0 ? out : undefined;
+    };
+    const tagsAny = tagList(m.tagsAny); if (tagsAny) match.tagsAny = tagsAny;
+    const tagsAll = tagList(m.tagsAll); if (tagsAll) match.tagsAll = tagsAll;
+    const tagsNone = tagList(m.tagsNone); if (tagsNone) match.tagsNone = tagsNone;
     if (m.filter && typeof m.filter === 'object') {
       const f = m.filter as Record<string, unknown>;
       if ((f.type === 'text' || f.type === 'regex') && typeof f.pattern === 'string') {
@@ -299,6 +311,8 @@ function validatePolicy(raw: unknown): GatePolicy {
 export class EventGate {
   private configPath: string;
   private config: GateConfig;
+  /** Optional agent-authored programmable gate (gate.js). */
+  private gateScript: GateScript;
   private compiledPolicies: CompiledPolicy[] = [];
   private configMtime: number = 0;
   private lastReloadCheck: number = 0;
@@ -363,6 +377,8 @@ export class EventGate {
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
+    /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
+    scriptTimeoutMs?: number;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -417,6 +433,14 @@ export class EventGate {
     // Load config
     this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
     this.compiledPolicies = this.compilePolicies(this.config);
+
+    // Programmable gate: an optional agent-authored `gate.js` next to gate.json.
+    // Absent ⇒ inactive (zero overhead beyond a throttled stat check).
+    this.gateScript = new GateScript(
+      join(dirname(this.configPath), 'gate.js'),
+      opts.scriptTimeoutMs ?? 50,
+      this.now,
+    );
   }
 
   // =========================================================================
@@ -466,6 +490,9 @@ export class EventGate {
       if (policy.match.pathGlob) {
         compiled.pathRegex = compileGlob(policy.match.pathGlob);
       }
+      if (policy.match.tagsAny) compiled.tagsAnyRe = policy.match.tagsAny.map(compileGlob);
+      if (policy.match.tagsAll) compiled.tagsAllRe = policy.match.tagsAll.map(compileGlob);
+      if (policy.match.tagsNone) compiled.tagsNoneRe = policy.match.tagsNone.map(compileGlob);
       return compiled;
     });
   }
@@ -531,6 +558,105 @@ export class EventGate {
       });
     } catch {
       // Ignore stat errors
+    }
+  }
+
+  // =========================================================================
+  // Runtime policy mutation (backs wake_add_rule / wake_remove_rule)
+  // =========================================================================
+
+  /**
+   * Add or replace (upsert) a single policy in gate.json and apply it live.
+   *
+   * The raw policy is validated with the SAME `validatePolicy` used when loading
+   * gate.json — an invalid shape throws (nothing is written) and the caller
+   * surfaces it as a tool error. On success the policy is persisted to gate.json
+   * (so it survives restart and is visible to `workspace--edit _config/gate.json`)
+   * and the in-memory config is swapped in immediately, so the rule takes effect
+   * without waiting for the throttled mtime reload.
+   *
+   * The freshest on-disk config is re-read first, so a concurrent operator edit
+   * isn't clobbered. A policy with the same `name` is replaced IN PLACE (order
+   * preserved); otherwise it is appended, or prepended when `position:'prepend'`
+   * — first match wins, so a wake rule that must beat a broad defer/debounce
+   * belongs at the front.
+   */
+  addPolicy(rawPolicy: unknown, options?: { position?: 'append' | 'prepend' }): GatePolicy {
+    const policy = validatePolicy(rawPolicy);
+    const current = this.loadConfig() ?? this.config;
+    const policies = [...current.policies];
+    const idx = policies.findIndex((p) => p.name === policy.name);
+    if (idx >= 0) {
+      policies[idx] = policy;
+    } else if (options?.position === 'prepend') {
+      policies.unshift(policy);
+    } else {
+      policies.push(policy);
+    }
+    this.writeConfig({ ...current, policies });
+    this.emitTrace({
+      type: 'gate:policy-added',
+      configPath: this.configPath,
+      policyName: policy.name,
+      replaced: idx >= 0,
+      timestamp: Date.now(),
+    });
+    return policy;
+  }
+
+  /**
+   * Remove a policy by name from gate.json and clear its live state. Any pending
+   * debounce batch is delivered first (matching reloadIfChanged's removal path,
+   * so buffered events aren't silently dropped). Returns false if no policy of
+   * that name exists (nothing written). Freshest on-disk config is re-read first
+   * (see addPolicy).
+   */
+  removePolicy(name: string): boolean {
+    const current = this.loadConfig() ?? this.config;
+    if (!current.policies.some((p) => p.name === name)) {
+      return false;
+    }
+    // Deliver any pending debounce batch, then drop timers/buckets/counters.
+    this.clearPolicyState(name, { deliverPendingDebounce: true });
+    this.stats.delete(name);
+    const policies = current.policies.filter((p) => p.name !== name);
+    this.writeConfig({ ...current, policies });
+    this.emitTrace({
+      type: 'gate:policy-removed',
+      configPath: this.configPath,
+      policyName: name,
+      timestamp: Date.now(),
+    });
+    return true;
+  }
+
+  /**
+   * List the current policy names (freshest on-disk view). Cheap helper for
+   * tools/UX that want to show what's active without the full status payload.
+   */
+  listPolicyNames(): string[] {
+    const current = this.loadConfig() ?? this.config;
+    return current.policies.map((p) => p.name);
+  }
+
+  /**
+   * Persist a config to gate.json and apply it in memory together: write the
+   * file, swap in the compiled policies, and sync `configMtime` to the new file
+   * so `reloadIfChanged` doesn't redundantly re-parse identical content. Throws
+   * if the write fails (disk/permission) — callers surface it as a tool error.
+   */
+  private writeConfig(config: GateConfig): void {
+    mkdirSync(dirname(this.configPath), { recursive: true });
+    writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
+    this.config = config;
+    this.compiledPolicies = this.compilePolicies(config);
+    this.configSource = 'file';
+    this.configErrors = [];
+    this.lastReloadTimestamp = Date.now();
+    try {
+      this.configMtime = statSync(this.configPath).mtimeMs;
+    } catch {
+      // A failed stat only risks one redundant reload; keep the old mtime.
     }
   }
 
@@ -604,6 +730,16 @@ export class EventGate {
       if (!anyTrue) return false;
     }
 
+    // Tag matching (MCPL RFC-001). Patterns are globs; `tags` is the event's
+    // (implication-expanded) tag set. A pattern "matches" if it matches ANY tag.
+    if (compiled.tagsAnyRe || compiled.tagsAllRe || compiled.tagsNoneRe) {
+      const tags = info.tags ?? [];
+      const patternHits = (re: RegExp): boolean => tags.some(t => re.test(t));
+      if (compiled.tagsAnyRe && !compiled.tagsAnyRe.some(patternHits)) return false;
+      if (compiled.tagsAllRe && !compiled.tagsAllRe.every(patternHits)) return false;
+      if (compiled.tagsNoneRe && compiled.tagsNoneRe.some(patternHits)) return false;
+    }
+
     return true;
   }
 
@@ -643,7 +779,12 @@ export class EventGate {
       // Privileged author — fall through to normal policy evaluation.
     }
 
-    const policy = this.matchPolicy(info);
+    // Programmable gate (gate.js) takes precedence when present and returns a
+    // behavior; null/undefined (inactive, error, or a deliberate pass) falls
+    // through to the declarative gate.json policies below.
+    const scripted = this.gateScript.evaluate(info);
+    const policy: GatePolicy | null =
+      scripted != null ? { name: 'gate.js', match: {}, behavior: scripted } : this.matchPolicy(info);
     const decision = this.computeDecision(policy, info);
 
     this.totalEvaluations++;
@@ -696,8 +837,9 @@ export class EventGate {
       timestamp: this.now(),
     });
 
-    if (policy.behavior === 'skip') {
-      return { trigger: false, policyName: policy.name, behavior: 'skip' };
+    if (policy.behavior === 'defer' || policy.behavior === 'skip') {
+      // Report the configured name faithfully ('defer' or legacy 'skip').
+      return { trigger: false, policyName: policy.name, behavior: policy.behavior };
     }
 
     if (policy.behavior === 'always') {
@@ -854,6 +996,7 @@ export class EventGate {
         serverId: (metadata.serverId as string) ?? '',
         channelId: (metadata.channelId as string) ?? '',
         metadata,
+        tags: Array.isArray(metadata.tags) ? (metadata.tags as string[]) : undefined,
       });
       return decision.trigger;
     };
@@ -1124,6 +1267,7 @@ export class EventGate {
       configSource: this.configSource,
       lastReloadTimestamp: this.lastReloadTimestamp,
       default: this.config.default ?? 'always',
+      script: this.gateScript.status(),
       policies,
       errors: [...this.configErrors],
       totalEvaluations: this.totalEvaluations,
@@ -1140,6 +1284,7 @@ export class EventGate {
   // =========================================================================
 
   dispose(): void {
+    this.gateScript.dispose();
     for (const state of this.debounceTimers.values()) {
       clearTimeout(state.timer);
     }
