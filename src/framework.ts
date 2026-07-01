@@ -53,6 +53,7 @@ import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { splitProseSegments } from './prose-segments.js';
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate } from './gate/event-gate.js';
@@ -2947,23 +2948,36 @@ export class AgentFramework {
                 .map((b) => (b as unknown as { name?: string }).name)
                 .filter((n): n is string => typeof n === 'string');
               const silenced = toolNames.some((n) => SILENCING.has(bare(n)));
-              const t = allText
-                .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
-              if (silenced || !t) {
+
+              // Split the turn's content into ordered prose segments, broken at
+              // each tool_use / tool_result boundary. `response.content` holds the
+              // WHOLE turn's blocks in provider order — earlier tool rounds
+              // included (see the trailing-slice note above, which slices exactly
+              // because the full turn is present) — so a left-to-right walk
+              // reconstructs the emission order. Interleaved prose
+              // ("msgA → [tool] → msgB → [tool] → msgC") is then delivered as
+              // separate messages IN ORDER instead of being collapsed into one
+              // trailing post (item 4). The silencing rule stays turn-wide: an
+              // explicit send / skip suppresses ALL auto-routed prose this turn,
+              // preserving the double-post guard.
+              const segments = splitProseSegments(response.content);
+
+              if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> NOT routed ` +
                   `(${silenced ? 'silencing tool / explicit send' : 'no prose'})`,
                 );
               } else {
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing trailing prose (${t.length} chars) as reply`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} prose segment(s) in order`,
                 );
-                try {
-                  await this.channelRegistry.routeSpeech(agent.name, t);
-                } catch (err) {
-                  console.error('speech routing failed:', err);
+                // Deliver sequentially (await each) so the segments land in order.
+                for (const seg of segments) {
+                  try {
+                    await this.channelRegistry.routeSpeech(agent.name, seg);
+                  } catch (err) {
+                    console.error('speech routing failed:', err);
+                  }
                 }
               }
             }
@@ -3627,6 +3641,15 @@ export class AgentFramework {
           }
         },
         shouldTriggerInference: triggerFilter,
+        // Route a conversation fork's plain-text speech to its HOME channel, not
+        // the process-global most-recent-inbound locus (item 3). The trunk agent
+        // has no home entry, so this returns undefined and routeSpeech falls back
+        // to defaultPublishChannel. `conversationAgentHomes` is the permanent
+        // spawn-time binding; `channelForAgent` is the router's live binding as a
+        // belt-and-suspenders fallback.
+        homeChannelResolver: (agentName) =>
+          this.conversationAgentHomes.get(agentName)
+          ?? this.conversationRouter?.channelForAgent(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
@@ -4240,7 +4263,7 @@ export class AgentFramework {
         contextWindow: 200000,
         capabilities: ['tools'],
       },
-      channels: this.channelRegistry?.buildChannelContext(),
+      channels: this.channelRegistry?.buildChannelContext(agent.name),
     };
   }
 }
