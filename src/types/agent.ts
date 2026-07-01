@@ -138,4 +138,14 @@ export interface InferenceRequest {
   reason: string;
   source: string;
   timestamp: number;
+  /**
+   * The MCPL channel whose message triggered this inference, if any (composite
+   * id, e.g. `discord:guild:channel` / `discord:dm:id`). The framework routes
+   * the turn's auto-published plain-text speech here so a single TRUNK agent
+   * replies in the channel it is answering — not the process-global most-recent-
+   * inbound locus, which a concurrent message elsewhere can hijack (item-3
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
+   * which correctly fall back to the global default channel.
+   */
+  channelId?: string;
 }
