@@ -165,14 +165,38 @@ export interface McplServerConfig {
   /** Unique server identifier */
   id: string;
 
-  /** Command to spawn the server process (stdio transport) */
-  command: string;
+  /**
+   * Command to spawn the server process (stdio transport). Mutually exclusive
+   * with `url`. Required for the stdio transport; omit it (and set `url`) for
+   * the WebSocket transport.
+   */
+  command?: string;
 
   /** Arguments for the command */
   args?: string[];
 
   /** Environment variables for the child process */
   env?: Record<string, string>;
+
+  /**
+   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
+   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
+   * dials this endpoint instead of spawning a process — newline-delimited
+   * JSON-RPC MCPL runs over the socket identically to stdio.
+   */
+  url?: string;
+
+  /**
+   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
+   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   */
+  transport?: 'stdio' | 'websocket';
+
+  /**
+   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
+   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   */
+  token?: string;
 
   /** Feature sets to enable on connect */
   enabledFeatureSets?: string[];
