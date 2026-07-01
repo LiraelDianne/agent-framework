@@ -676,7 +676,12 @@ export class AgentFramework {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
     const gateTools = this.eventGate
-      ? [this.eventGate.getToolDefinition(), ...AgentFramework.SLEEP_TOOLS, AgentFramework.EVENT_TAGS_TOOL]
+      ? [
+          this.eventGate.getToolDefinition(),
+          ...AgentFramework.SLEEP_TOOLS,
+          ...AgentFramework.WAKE_RULE_TOOLS,
+          AgentFramework.EVENT_TAGS_TOOL,
+        ]
       : [];
     if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
       return moduleTools;
@@ -779,6 +784,45 @@ export class AgentFramework {
    */
   getModule(name: string): Module | null {
     return this.moduleRegistry.getModule(name);
+  }
+
+  // =========================================================================
+  // Wake-rule surface (gate policy mutation) — backs wake_add_rule /
+  // wake_remove_rule and lets host modules compose higher-level wake modes
+  // (e.g. an "every-message-debounced" channel mode) without reaching into
+  // the private EventGate.
+  // =========================================================================
+
+  /**
+   * Add or replace (upsert) a gate policy at runtime. Validated and persisted
+   * to gate.json; hot-applied in memory. Throws if no gate is configured or the
+   * policy is invalid. `position: 'prepend'` puts a wake rule ahead of broad
+   * defer/debounce rules (first match wins).
+   */
+  addGatePolicy(
+    rawPolicy: unknown,
+    options?: { position?: 'append' | 'prepend' },
+  ): import('./gate/types.js').GatePolicy {
+    if (!this.eventGate) {
+      throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
+    }
+    return this.eventGate.addPolicy(rawPolicy, options);
+  }
+
+  /**
+   * Remove a gate policy by name at runtime. Returns false if it didn't exist.
+   * Throws if no gate is configured.
+   */
+  removeGatePolicy(name: string): boolean {
+    if (!this.eventGate) {
+      throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
+    }
+    return this.eventGate.removePolicy(name);
+  }
+
+  /** Current gate policy names (freshest on-disk view). Empty when no gate. */
+  getGatePolicyNames(): string[] {
+    return this.eventGate?.listPolicyNames() ?? [];
   }
 
   /**
@@ -1052,6 +1096,113 @@ export class AgentFramework {
       name: 'wake',
       description: 'End your current sleep early, resuming normal wakes immediately.',
       inputSchema: { type: 'object' },
+    },
+  ];
+
+  /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
+   *  Present when a gate is wired. They write validated policies into the
+   *  hot-reloaded gate.json (same validation as load), so a rule takes effect
+   *  immediately and survives restart. */
+  private static readonly WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'wake_add_rule',
+      description:
+        'Add or replace a wake rule (a gate.json policy) at runtime — no need to ' +
+        'hand-edit the file. The rule is validated and hot-applied immediately. ' +
+        'A rule with the same `name` replaces the existing one in place. Use ' +
+        '`position: "prepend"` to put a wake rule ahead of broad defer/debounce ' +
+        'rules (first match wins). Two common shapes:\n' +
+        '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
+        '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
+        '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
+        'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, behavior: { debounce: 60000 } }` ' +
+        '(the channel must be subscribed for ambient events to arrive — see channel mode).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Unique rule name. Reusing a name replaces that rule.' },
+          match: {
+            type: 'object',
+            description: 'Match criteria (all AND together). Omitted fields match anything.',
+            properties: {
+              scope: { type: 'array', items: { type: 'string' }, description: 'Event types, e.g. ["mcpl:channel-incoming","workspace:modified"].' },
+              source: { type: 'string', description: 'Integration/serverId, glob ok (e.g. "discord").' },
+              channel: { type: 'string', description: 'Channel id, glob ok (e.g. "discord:*:12345").' },
+              mount: { type: 'string', description: 'Workspace mount name, glob ok (workspace:* events).' },
+              pathGlob: { type: 'string', description: 'Glob over touched paths (workspace:* events).' },
+              tagsAny: { type: 'array', items: { type: 'string' }, description: 'Match if ANY tag matches (globs ok).' },
+              tagsAll: { type: 'array', items: { type: 'string' }, description: 'Match only if EVERY tag matches.' },
+              tagsNone: { type: 'array', items: { type: 'string' }, description: 'Match only if NONE match.' },
+              metadataTrue: { type: 'array', items: { type: 'string' }, description: 'Match if ANY listed metadata field is truthy.' },
+              filter: {
+                type: 'object',
+                description: 'Content filter.',
+                properties: {
+                  type: { type: 'string', enum: ['text', 'regex'] },
+                  pattern: { type: 'string' },
+                },
+                required: ['type', 'pattern'],
+              },
+            },
+          },
+          behavior: {
+            type: 'string',
+            enum: ['always', 'defer', 'skip'],
+            description:
+              'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
+              'context). For debounce / rate-limit / sampling, use debounceMs / rateLimit / ' +
+              'passiveSample below instead of this field. Exactly one behavior must be given.',
+          },
+          debounceMs: {
+            type: 'number',
+            description: 'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000).',
+          },
+          rateLimit: {
+            type: 'object',
+            description: 'Token-bucket wake: at most `tokens` wakes per window; refills one per refillIntervalMs.',
+            properties: {
+              tokens: { type: 'number', description: 'Bucket capacity (> 0).' },
+              refillIntervalMs: { type: 'number', description: 'Ms between token refills (> 0).' },
+              keyBy: { type: 'string', description: 'Metadata field to partition buckets by (e.g. "channelId").' },
+            },
+            required: ['tokens', 'refillIntervalMs'],
+          },
+          passiveSample: {
+            type: 'object',
+            description: 'Wake every Nth matching event.',
+            properties: {
+              every: { type: 'number', description: 'Fire every N matches (positive integer).' },
+              keyBy: { type: 'string', description: 'Metadata field for separate per-key counters.' },
+            },
+            required: ['every'],
+          },
+          position: {
+            type: 'string',
+            enum: ['append', 'prepend'],
+            description: 'Where to insert a NEW rule (ignored when replacing by name). Default "append".',
+          },
+          resets: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Names of other rules whose runtime state to clear when this rule fires.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+    {
+      name: 'wake_remove_rule',
+      description:
+        'Remove a wake rule (gate.json policy) by name at runtime. Any pending ' +
+        'debounce batch for that rule is delivered first. Returns whether a rule ' +
+        'was removed (false if no rule had that name).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The rule name to remove.' },
+        },
+        required: ['name'],
+      },
     },
   ];
 
@@ -3301,6 +3452,12 @@ export class AgentFramework {
       return;
     }
 
+    // Route wake-rule tools (runtime gate.json policy add/remove)
+    if ((enrichedCall.name === 'wake_add_rule' || enrichedCall.name === 'wake_remove_rule') && this.eventGate) {
+      this.dispatchWakeRuleToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route event_tags (tag/ontology discovery)
     if (enrichedCall.name === 'event_tags' && this.eventGate) {
       this.dispatchEventTagsToolCall(agentName, enrichedCall);
@@ -4113,6 +4270,91 @@ export class AgentFramework {
           result: { success: false, error: err.message, isError: true },
         });
       });
+  }
+
+  /**
+   * Handle the synthesized `wake_add_rule` / `wake_remove_rule` tools: mutate
+   * the hot-reloaded gate.json at runtime. Validation lives in the EventGate
+   * (same path as gate.json load), so an invalid rule is surfaced as a tool
+   * error and nothing is written.
+   */
+  private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const finish = (result: ToolResult) => {
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    };
+
+    try {
+      if (call.name === 'wake_remove_rule') {
+        const input = (call.input ?? {}) as { name?: unknown };
+        if (typeof input.name !== 'string' || !input.name) {
+          finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
+          return;
+        }
+        const removed = this.removeGatePolicy(input.name);
+        finish({
+          success: true,
+          data: { removed, name: input.name, policies: this.getGatePolicyNames() },
+        });
+        return;
+      }
+
+      // wake_add_rule — assemble the canonical behavior from the typed fields
+      // (exactly one), then let the gate's own validator do the authoritative
+      // range/shape checks.
+      const input = (call.input ?? {}) as {
+        name?: unknown; match?: unknown; resets?: unknown; position?: unknown;
+        behavior?: unknown; debounceMs?: unknown; rateLimit?: unknown; passiveSample?: unknown;
+      };
+      const behaviorSources = [
+        input.behavior !== undefined ? 'behavior' : null,
+        input.debounceMs !== undefined ? 'debounceMs' : null,
+        input.rateLimit !== undefined ? 'rateLimit' : null,
+        input.passiveSample !== undefined ? 'passiveSample' : null,
+      ].filter((s): s is string => s !== null);
+      if (behaviorSources.length === 0) {
+        finish({
+          success: false,
+          error: 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, or `passiveSample`.',
+          isError: true,
+        });
+        return;
+      }
+      if (behaviorSources.length > 1) {
+        finish({
+          success: false,
+          error: `wake_add_rule: give only one behavior, got [${behaviorSources.join(', ')}].`,
+          isError: true,
+        });
+        return;
+      }
+      const behavior: unknown =
+        input.debounceMs !== undefined ? { debounce: input.debounceMs }
+        : input.rateLimit !== undefined ? { rate_limit: input.rateLimit }
+        : input.passiveSample !== undefined ? { passive_sample: input.passiveSample }
+        : input.behavior;
+
+      const position = input.position === 'prepend' ? 'prepend' : 'append';
+      const rawPolicy = {
+        name: input.name,
+        match: input.match ?? {},
+        behavior,
+        ...(input.resets !== undefined ? { resets: input.resets } : {}),
+      };
+      const policy = this.addGatePolicy(rawPolicy, { position });
+      finish({
+        success: true,
+        data: { added: policy.name, policies: this.getGatePolicyNames() },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      finish({ success: false, error: msg, isError: true });
+    }
   }
 
   /**

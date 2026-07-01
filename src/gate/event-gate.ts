@@ -562,6 +562,105 @@ export class EventGate {
   }
 
   // =========================================================================
+  // Runtime policy mutation (backs wake_add_rule / wake_remove_rule)
+  // =========================================================================
+
+  /**
+   * Add or replace (upsert) a single policy in gate.json and apply it live.
+   *
+   * The raw policy is validated with the SAME `validatePolicy` used when loading
+   * gate.json — an invalid shape throws (nothing is written) and the caller
+   * surfaces it as a tool error. On success the policy is persisted to gate.json
+   * (so it survives restart and is visible to `workspace--edit _config/gate.json`)
+   * and the in-memory config is swapped in immediately, so the rule takes effect
+   * without waiting for the throttled mtime reload.
+   *
+   * The freshest on-disk config is re-read first, so a concurrent operator edit
+   * isn't clobbered. A policy with the same `name` is replaced IN PLACE (order
+   * preserved); otherwise it is appended, or prepended when `position:'prepend'`
+   * — first match wins, so a wake rule that must beat a broad defer/debounce
+   * belongs at the front.
+   */
+  addPolicy(rawPolicy: unknown, options?: { position?: 'append' | 'prepend' }): GatePolicy {
+    const policy = validatePolicy(rawPolicy);
+    const current = this.loadConfig() ?? this.config;
+    const policies = [...current.policies];
+    const idx = policies.findIndex((p) => p.name === policy.name);
+    if (idx >= 0) {
+      policies[idx] = policy;
+    } else if (options?.position === 'prepend') {
+      policies.unshift(policy);
+    } else {
+      policies.push(policy);
+    }
+    this.writeConfig({ ...current, policies });
+    this.emitTrace({
+      type: 'gate:policy-added',
+      configPath: this.configPath,
+      policyName: policy.name,
+      replaced: idx >= 0,
+      timestamp: Date.now(),
+    });
+    return policy;
+  }
+
+  /**
+   * Remove a policy by name from gate.json and clear its live state. Any pending
+   * debounce batch is delivered first (matching reloadIfChanged's removal path,
+   * so buffered events aren't silently dropped). Returns false if no policy of
+   * that name exists (nothing written). Freshest on-disk config is re-read first
+   * (see addPolicy).
+   */
+  removePolicy(name: string): boolean {
+    const current = this.loadConfig() ?? this.config;
+    if (!current.policies.some((p) => p.name === name)) {
+      return false;
+    }
+    // Deliver any pending debounce batch, then drop timers/buckets/counters.
+    this.clearPolicyState(name, { deliverPendingDebounce: true });
+    this.stats.delete(name);
+    const policies = current.policies.filter((p) => p.name !== name);
+    this.writeConfig({ ...current, policies });
+    this.emitTrace({
+      type: 'gate:policy-removed',
+      configPath: this.configPath,
+      policyName: name,
+      timestamp: Date.now(),
+    });
+    return true;
+  }
+
+  /**
+   * List the current policy names (freshest on-disk view). Cheap helper for
+   * tools/UX that want to show what's active without the full status payload.
+   */
+  listPolicyNames(): string[] {
+    const current = this.loadConfig() ?? this.config;
+    return current.policies.map((p) => p.name);
+  }
+
+  /**
+   * Persist a config to gate.json and apply it in memory together: write the
+   * file, swap in the compiled policies, and sync `configMtime` to the new file
+   * so `reloadIfChanged` doesn't redundantly re-parse identical content. Throws
+   * if the write fails (disk/permission) — callers surface it as a tool error.
+   */
+  private writeConfig(config: GateConfig): void {
+    mkdirSync(dirname(this.configPath), { recursive: true });
+    writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
+    this.config = config;
+    this.compiledPolicies = this.compilePolicies(config);
+    this.configSource = 'file';
+    this.configErrors = [];
+    this.lastReloadTimestamp = Date.now();
+    try {
+      this.configMtime = statSync(this.configPath).mtimeMs;
+    } catch {
+      // A failed stat only risks one redundant reload; keep the old mtime.
+    }
+  }
+
+  // =========================================================================
   // Policy matching — first match wins
   // =========================================================================
 
