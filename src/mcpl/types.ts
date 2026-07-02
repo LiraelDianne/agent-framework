@@ -234,10 +234,18 @@ export interface McplServerConfig {
   reconnect?: boolean;
 
   /**
-   * Interval between reconnection attempts in milliseconds.
+   * Base interval between reconnection attempts in milliseconds.
+   * The actual delay doubles with each consecutive failure (with ±25% jitter)
+   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake.
    * Default: 5000 (5 seconds).
    */
   reconnectIntervalMs?: number;
+
+  /**
+   * Ceiling for the exponential reconnect backoff in milliseconds.
+   * Default: 300000 (5 minutes).
+   */
+  reconnectMaxIntervalMs?: number;
 
   /**
    * Optional callback to filter which incoming channel messages should trigger

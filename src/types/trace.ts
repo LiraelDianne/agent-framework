@@ -270,6 +270,40 @@ export type TraceEvent =
       type: 'mcpl:conversation-disposed';
       agentName: string;
       channelId?: string;
+    })
+
+  // MCPL server connection lifecycle (spawn / handshake / reconnect health).
+  // Previously these outcomes were visible only on the host process's own
+  // stderr, so a server that lost the boot handshake race just went missing.
+  | (TraceEventBase & {
+      type: 'mcpl:server-connect-failed';
+      serverId: string;
+      error: string;
+      /** Ordinal of the failed attempt: 0 is the initial connect, N is the Nth background retry. */
+      attempt: number;
+      /** True when a background reconnect loop will keep retrying. */
+      willRetry: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:server-reconnected';
+      serverId: string;
+      /** How many attempts the reconnect loop needed (1 = first retry succeeded). */
+      attempts: number;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:server-closed';
+      serverId: string;
+      /** Child process exit code, or null when killed by signal / closed explicitly. */
+      code: number | null;
+      /** Signal that terminated the child, if any. */
+      signal: string | null;
+      /** True when a background reconnect loop will revive the connection. */
+      willReconnect: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:server-error';
+      serverId: string;
+      error: string;
     });
 
 /**
