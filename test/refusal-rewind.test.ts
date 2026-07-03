@@ -69,7 +69,10 @@ test('rewind: human message → kind=human + discordRef for announce', () => {
   assert.deepEqual(rec.discordRef, { channelId: 'discord:g:c', messageId: '999' });
 });
 
-test('rewind: never rewinds a prior system marker (no backward chewing)', () => {
+test('rewind: skips a prior system marker and sheds the real turn beneath it', () => {
+  // On a REPEAT refusal the tail is the marker we just injected. We must skip
+  // it (not stop at it) and rewind the next real turn, so the loop keeps
+  // shedding older poison until the refusal clears or the cap is hit.
   const msgs = [
     { id: 'm1', participant: 'simulect', content: [{ type: 'text', text: 'real msg' }], metadata: { messageId: '1' } },
     { id: 'm2', participant: 'user', content: [{ type: 'text', text: '[refusal-rewind] ...' }], metadata: { system: true, kind: 'refusal-rewind' } },
@@ -77,8 +80,9 @@ test('rewind: never rewinds a prior system marker (no backward chewing)', () => 
   const { fw, agent, removed } = makeAgentHarness(msgs);
 
   const rec = fw.rewindTriggeringTurn(agent, 'cyber');
-  assert.equal(rec, null, 'a system marker at the tail is not eligible');
-  assert.equal(removed.length, 0);
+  assert.ok(rec, 'should skip the marker and find a real turn');
+  assert.equal(removed[0], 'm1', 'rewinds the real turn beneath the marker, not the marker');
+  assert.equal(rec.kind, 'human');
 });
 
 test('rewind: nothing eligible when only agent turns remain', () => {

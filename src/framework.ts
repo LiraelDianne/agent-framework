@@ -1354,19 +1354,23 @@ export class AgentFramework {
   private rewindTriggeringTurn(agent: Agent, category: string): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
-    // Newest message not authored by the agent = the turn that fed the refusal.
+    // Newest message that is neither the agent's own output NOR one of our own
+    // injected system markers = the turn that fed the refusal. We SKIP prior
+    // refusal-rewind markers (rather than stopping at them) so that on a repeat
+    // refusal the loop keeps shedding older real turns until it clears or hits
+    // the cap — a marker at the tail must not be mistaken for "nothing left".
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
-      if (all[i].participant !== agent.name) { idx = i; break; }
+      if (all[i].participant === agent.name) continue;
+      const meta = (all[i].metadata ?? {}) as { system?: unknown };
+      if (meta.system) continue;
+      idx = i; break;
     }
     if (idx < 0) return null;
     const msg = all[idx];
     const md = (msg.metadata ?? {}) as {
       messageId?: unknown; channelId?: unknown; system?: unknown;
     };
-    // Never rewind one of our own injected system markers (incl. a prior
-    // refusal-rewind note) — that would just chew backwards through context.
-    if (md.system) return null;
 
     const content = Array.isArray(msg.content) ? msg.content : [];
     const typeOf = (b: unknown) => (b as { type?: string }).type;
