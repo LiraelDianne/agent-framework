@@ -198,6 +198,11 @@ interface HostCommandParams {
   fromMessageId?: string;
   /** For the `hide` command: Discord message id ending an inclusive range. */
   toMessageId?: string;
+  /** For the `unstick` command: max rewind/retry attempts (default = the
+   *  agent's refusalHandling.maxRewinds, else 3). */
+  maxRewinds?: number;
+  /** For the `unstick` command: raw channel id to post the outcome report to. */
+  channelId?: string;
   requesterId?: string;
   requesterName?: string;
 }
@@ -252,6 +257,15 @@ export class AgentFramework {
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
+  /** Active `/unstick` sessions: an admin-forced rewind-until-clean loop that
+   *  runs even when the agent's autoRewind toggle is off. Tracks the remaining
+   *  budget, what was shed (for the report), and where to post the outcome. */
+  private forcedRewind: Map<string, {
+    remaining: number;
+    removed: RewindRecord[];
+    serverId: string;
+    channelId: string;
+  }> = new Map();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -1437,6 +1451,40 @@ export class AgentFramework {
   }
 
   /**
+   * Conclude an active `/unstick` session: post the outcome (what was shed and
+   * whether the model stopped refusing) to the channel the command came from,
+   * then clear the session. Idempotent — a no-op if there's no session.
+   */
+  private finishUnstick(agentName: string, success: boolean, category?: string): void {
+    const s = this.forcedRewind.get(agentName);
+    if (!s) return;
+    this.forcedRewind.delete(agentName);
+    const n = s.removed.length;
+    const list = n
+      ? '\n' + s.removed.map((r) => `• ${r.descriptor}`).join('\n')
+      : '';
+    const content = success
+      ? `🔧 Unstuck **${agentName}** — shed ${n} turn(s); the model responded.${list}`
+      : `⚠️ Couldn't unstick **${agentName}** — still refusing after ${n} rewind(s)` +
+        `${category ? ` (category=${category})` : ''}.${list}`;
+    console.error(
+      `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)`,
+    );
+    if (s.channelId) void this.postToChannel(s.serverId, s.channelId, content);
+  }
+
+  /** Best-effort send_message to a raw channel via a named MCPL server. */
+  private async postToChannel(serverId: string, channelId: string, content: string): Promise<void> {
+    try {
+      const server = this.mcplServerRegistry?.getServer(serverId);
+      if (!server) return;
+      await server.sendToolsCall('send_message', { channelId, content });
+    } catch (err) {
+      console.error('[unstick] report post failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
    * Handle a `host/command` request from an MCPL surface server (e.g. a
    * Discord slash command). Currently supports:
    *
@@ -1459,14 +1507,50 @@ export class AgentFramework {
      *  that carried one — so the surface can mark them with a reaction. */
     hiddenRefs?: Array<{ channelId: string; messageId: string }>;
     lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+    /** For `unstick`: acknowledges the forced-rewind loop has started; the
+     *  outcome report is posted to the channel asynchronously. */
+    started?: boolean;
+    cap?: number;
   }> {
-    if (params.command !== 'undo' && params.command !== 'hide') {
+    if (params.command !== 'undo' && params.command !== 'hide' && params.command !== 'unstick') {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
     if (!agentName || !this.agents.has(agentName)) {
       return { ok: false, error: `Unknown agent: ${String(agentName)}` };
+    }
+
+    // unstick: force the refusal-rewind loop on demand (even if the agent's
+    // autoRewind toggle is off). Redacts the turn that fed the refusal and
+    // re-runs, up to `cap` times, until the model stops refusing. Kicks the
+    // loop and returns immediately; the outcome (what was shed + whether it
+    // cleared) is posted to the channel when the chain resolves.
+    if (params.command === 'unstick') {
+      const agent = this.agents.get(agentName)!;
+      if (agent.state.status !== 'idle') {
+        return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
+      }
+      const cap = Math.max(1, Math.min(10,
+        Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      this.forcedRewind.set(agentName, {
+        remaining: cap,
+        removed: [],
+        serverId,
+        channelId: params.channelId ?? '',
+      });
+      this.refusalRewinds.set(agentName, 0);
+      this.pendingRequests.push({
+        agentName,
+        reason: 'unstick',
+        source: 'framework',
+        timestamp: Date.now(),
+      });
+      console.error(
+        `[unstick] agent=${agentName} started cap=${cap} ` +
+          `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+      );
+      return { ok: true, started: true, cap };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -3249,54 +3333,79 @@ export class AgentFramework {
                   (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
               );
 
-              // Auto-rewind: excise the turn that fed the refusal, drop a
+              // Rewind: excise the turn that fed the refusal, drop a
               // metadata-only marker, and retry — keeping the agent on its own
-              // model instead of substituting a fallback. Bounded by maxRewinds.
+              // model instead of substituting a fallback. Driven either by an
+              // admin `/unstick` (forced session) or the agent's autoRewind
+              // config; both are bounded.
               let handledByRewind = false;
               const rh = agent.refusalHandling;
-              if (rh?.autoRewind) {
+              const forced = this.forcedRewind.get(agent.name);
+              const doRewind = (
+                budgetLeft: boolean,
+                onStep: () => void,
+                onGiveUp: () => void,
+              ): void => {
+                if (!budgetLeft) { onGiveUp(); return; }
+                const rec = this.rewindTriggeringTurn(agent, category);
+                if (!rec) { onGiveUp(); return; }
+                onStep();
+                if (rec.kind === 'human' && (rh?.announceHumanTurns ?? true)) {
+                  void this.announceRewind(agent.name, rec, category);
+                }
+                if (forced) forced.removed.push(rec);
+                this.pendingRequests.push({
+                  agentName: agent.name,
+                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
+                  source: 'framework',
+                  timestamp: Date.now(),
+                });
+                handledByRewind = true;
+              };
+
+              if (forced) {
+                doRewind(
+                  forced.remaining > 0,
+                  () => {
+                    forced.remaining -= 1;
+                    console.error(
+                      `[unstick] agent=${agent.name} rewound (remaining ${forced.remaining}): ` +
+                        `${forced.removed.length + 1} shed so far`,
+                    );
+                  },
+                  () => this.finishUnstick(agent.name, false, category),
+                );
+              } else if (rh?.autoRewind) {
                 const cap = Math.max(1, rh.maxRewinds ?? 3);
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
-                if (used < cap) {
-                  const rec = this.rewindTriggeringTurn(agent, category);
-                  if (rec) {
+                doRewind(
+                  used < cap,
+                  () => {
                     this.refusalRewinds.set(agent.name, used + 1);
                     console.error(
-                      `[refusal-rewind] agent=${agent.name} rewound ${rec.kind} turn ` +
-                        `(${used + 1}/${cap}): ${rec.descriptor}`,
+                      `[refusal-rewind] agent=${agent.name} rewound turn (${used + 1}/${cap})`,
                     );
-                    // Don't silently drop a human's message — say so on-surface.
-                    if (rec.kind === 'human' && (rh.announceHumanTurns ?? true)) {
-                      void this.announceRewind(agent.name, rec, category);
-                    }
-                    // Re-drive the turn via the normal scheduler; the retry now
-                    // compiles context without the poison turn.
-                    this.pendingRequests.push({
-                      agentName: agent.name,
-                      reason: 'refusal-rewind-retry',
-                      source: 'framework',
-                      timestamp: Date.now(),
-                    });
-                    handledByRewind = true;
-                  } else {
+                  },
+                  () => {
                     console.error(
-                      `[refusal-rewind] agent=${agent.name} nothing eligible to ` +
-                        `rewind — giving up turn`,
+                      `[refusal-rewind] agent=${agent.name} exhausted rewinds or nothing ` +
+                        `eligible — giving up turn`,
                     );
-                  }
-                } else {
-                  console.error(
-                    `[refusal-rewind] agent=${agent.name} exhausted ${cap} rewinds ` +
-                      `— giving up turn`,
-                  );
-                  this.refusalRewinds.set(agent.name, 0);
-                }
+                    this.refusalRewinds.set(agent.name, 0);
+                  },
+                );
               }
 
               if (!handledByRewind) void this.reactToRefusal(agent.name, category);
-            } else if (this.refusalRewinds.get(agent.name)) {
-              // A turn that completed without a refusal clears the rewind budget.
-              this.refusalRewinds.set(agent.name, 0);
+            } else {
+              // A turn that completed WITHOUT a refusal: an active /unstick
+              // session succeeded (the model responded); report and clear.
+              if (this.forcedRewind.has(agent.name)) {
+                this.finishUnstick(agent.name, true);
+              }
+              if (this.refusalRewinds.get(agent.name)) {
+                this.refusalRewinds.set(agent.name, 0);
+              }
             }
 
             // Dispatch speech (and thoughts if any)
