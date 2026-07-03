@@ -209,11 +209,12 @@ interface HostCommandParams {
 
 /** Descriptor of a single refusal-driven rewind (see rewindTriggeringTurn). */
 interface RewindRecord {
-  /** tool = machine tool result; human = an ingested message; other = else. */
+  /** tool = machine tool exchange; human = an ingested message; other = else. */
   kind: 'tool' | 'human' | 'other';
   /** Content-free, safe-to-replay description of what was withheld. */
   descriptor: string;
-  removedId: MessageId;
+  /** All message ids removed in this shed (a tool exchange removes 2+). */
+  removedIds: MessageId[];
   /** Discord (channelId, messageId) of the removed message, if it had one. */
   discordRef?: { channelId: string; messageId: string };
 }
@@ -1358,16 +1359,21 @@ export class AgentFramework {
   private shedNewestTurn(agent: Agent): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
-    // Newest message that is neither the agent's own output NOR one of our own
-    // injected system markers = the turn that fed the refusal. We SKIP the
-    // single episode marker (system) so successive refusals keep shedding older
-    // REAL turns strictly newest-first, in sequence — newest-first eventually
-    // reaches whatever older content is poisoning the context if allowed to run
-    // deep enough. We do NOT add a marker here; the caller maintains exactly one
-    // consolidated marker for the whole episode (updateRewindMarker).
+    const typeOf = (b: unknown) => (b as { type?: string }).type;
+    const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
+      Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
+
+    // Newest message that is not our own episode marker. We shed strictly
+    // newest-first, in sequence — INCLUDING the agent's own turns (poison lives
+    // in tool_use/narration turns too), because newest-first reaches whatever is
+    // poisoning the context if allowed to run deep enough. The one invariant:
+    // shed COMPLETE exchanges. Removing a `tool_result` also removes its paired
+    // `tool_use` assistant turn, so we never leave an orphaned tool_use / signed
+    // `thinking` block — which the API rejects with a 400 ("thinking blocks in
+    // the latest assistant message cannot be modified"). We do NOT add a marker
+    // here; the caller keeps one consolidated marker (updateRewindMarker).
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
-      if (all[i].participant === agent.name) continue;
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system) continue;
       idx = i; break;
@@ -1379,20 +1385,25 @@ export class AgentFramework {
     };
 
     const content = Array.isArray(msg.content) ? msg.content : [];
-    const typeOf = (b: unknown) => (b as { type?: string }).type;
     const toolBlocks = content.filter((b) => typeOf(b) === 'tool_result');
     const images = content.filter((b) => typeOf(b) === 'image').length;
     const textLen = content
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
+    // Determine the complete exchange to remove.
+    const removedIds: MessageId[] = [msg.id];
     let kind: RewindRecord['kind'];
     let descriptor: string;
     if (toolBlocks.length > 0) {
       kind = 'tool';
+      // Pair the tool_result with the tool_use assistant turn right before it.
+      if (idx - 1 >= 0 && hasBlock(all[idx - 1], 'tool_use')) {
+        removedIds.push(all[idx - 1].id);
+      }
       const sz = toolBlocks.reduce(
         (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
-      descriptor = `a tool result (~${Math.max(1, Math.round(sz / 1024))}KB` +
+      descriptor = `a tool exchange (~${Math.max(1, Math.round(sz / 1024))}KB` +
         `${images ? `, ${images} image(s)` : ''})`;
     } else if (md.messageId) {
       kind = 'human';
@@ -1400,15 +1411,15 @@ export class AgentFramework {
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     } else {
       kind = 'other';
-      descriptor = `the previous ${msg.participant} turn ` +
+      descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
     const discordRef = md.messageId && md.channelId
       ? { channelId: String(md.channelId), messageId: String(md.messageId) }
       : undefined;
 
-    cm.removeMessage(msg.id);
-    return { kind, descriptor, removedId: msg.id, discordRef };
+    for (const id of removedIds) cm.removeMessage(id);
+    return { kind, descriptor, removedIds, discordRef };
   }
 
   /**

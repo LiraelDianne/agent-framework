@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
 
 /**
- * The refusal auto-rewind sheds the newest real turn (in sequence, newest
- * first) and maintains exactly ONE consolidated marker per episode. These
- * exercise the two private primitives on a prototype instance with a minimal
- * in-memory ContextManager stub, mirroring inference-failure-observability.test.
+ * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
+ * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
+ * removed together with its paired tool_use turn, so no orphaned tool_use /
+ * signed thinking block is left behind. It maintains exactly ONE consolidated
+ * marker per episode. These exercise the private primitives on a prototype
+ * instance with a minimal in-memory ContextManager stub.
  */
 function makeAgentHarness(messages: any[]) {
   const removed: string[] = [];
@@ -37,31 +39,41 @@ function makeAgentHarness(messages: any[]) {
   return { fw, agent, removed, added, edited, messages };
 }
 
-test('shed: removes the newest real turn (tool result) and adds NO marker itself', () => {
+test('shed: tool_result removes its paired tool_use turn too (complete exchange)', () => {
   const msgs = [
-    { id: 'm1', participant: 'simulect', content: [{ type: 'text', text: 'help me shop' }], metadata: { messageId: '111', channelId: 'discord:g:c' } },
-    { id: 'm2', participant: 'labclaude', content: [{ type: 'text', text: 'on it' }] },
-    { id: 'm3', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'X'.repeat(320 * 1024) }] },
+    { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'do it' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'labclaude', content: [{ type: 'thinking', thinking: '…' }, { type: 'tool_use', name: 'shell', id: 't1' }] },
+    { id: 'r1', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'X'.repeat(320 * 1024) }] },
   ];
   const { fw, agent, removed, added } = makeAgentHarness(msgs);
-
   const rec = fw.shedNewestTurn(agent);
-  assert.ok(rec);
   assert.equal(rec.kind, 'tool');
-  assert.equal(removed[0], 'm3', 'sheds the tool result, not the agent turn');
-  assert.equal(added.length, 0, 'shedNewestTurn must not add a marker (caller owns the one marker)');
+  assert.deepEqual([...removed].sort(), ['a1', 'r1'], 'removes the tool_result AND its tool_use turn — no orphan');
+  assert.deepEqual([...rec.removedIds].sort(), ['a1', 'r1']);
+  assert.equal(added.length, 0, 'shedNewestTurn must not add a marker');
 });
 
-test('shed: human message → kind=human + discordRef', () => {
+test('shed: human message → kind=human + discordRef, single removal', () => {
   const msgs = [
-    { id: 'm1', participant: 'labclaude', content: [{ type: 'text', text: 'hi' }] },
+    { id: 'a0', participant: 'labclaude', content: [{ type: 'text', text: 'hi' }] },
     { id: 'm2', participant: 'simulect', content: [{ type: 'text', text: 'sketchy' }], metadata: { messageId: '999', channelId: 'discord:g:c' } },
   ];
   const { fw, agent, removed } = makeAgentHarness(msgs);
   const rec = fw.shedNewestTurn(agent);
   assert.equal(rec.kind, 'human');
-  assert.equal(removed[0], 'm2');
+  assert.deepEqual(removed, ['m2']);
   assert.deepEqual(rec.discordRef, { channelId: 'discord:g:c', messageId: '999' });
+});
+
+test('shed: agent turns ARE shed too (newest-first includes the agent own turns)', () => {
+  const msgs = [
+    { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'q' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'my narration' }] },
+  ];
+  const { fw, agent, removed } = makeAgentHarness(msgs);
+  const rec = fw.shedNewestTurn(agent);
+  assert.ok(rec, 'sheds the agent turn (no longer skipped)');
+  assert.deepEqual(removed, ['a1']);
 });
 
 test('shed: skips the episode marker and sheds the real turn beneath it', () => {
@@ -71,15 +83,12 @@ test('shed: skips the episode marker and sheds the real turn beneath it', () => 
   ];
   const { fw, agent, removed } = makeAgentHarness(msgs);
   const rec = fw.shedNewestTurn(agent);
-  assert.ok(rec, 'skips the marker, finds the real turn');
-  assert.equal(removed[0], 'm1');
+  assert.ok(rec);
+  assert.deepEqual(removed, ['m1']);
 });
 
-test('shed: null when only agent turns / markers remain', () => {
-  const msgs = [
-    { id: 'm1', participant: 'labclaude', content: [{ type: 'text', text: 'a' }] },
-    { id: 'mk', participant: 'user', content: [{ type: 'text', text: 'x' }], metadata: { system: true } },
-  ];
+test('shed: null when only the episode marker remains', () => {
+  const msgs = [{ id: 'mk', participant: 'user', content: [{ type: 'text', text: 'x' }], metadata: { system: true } }];
   const { fw, agent } = makeAgentHarness(msgs);
   assert.equal(fw.shedNewestTurn(agent), null);
 });
@@ -90,8 +99,10 @@ test('marker: six rewinds produce ONE marker, updated in place (not six)', () =>
 
   const c1 = fw.updateRewindMarker(agent, 'cyber');
   const c2 = fw.updateRewindMarker(agent, 'cyber');
-  const c6 = (fw.updateRewindMarker(agent, 'cyber'), fw.updateRewindMarker(agent, 'cyber'),
-              fw.updateRewindMarker(agent, 'cyber'), fw.updateRewindMarker(agent, 'cyber'));
+  fw.updateRewindMarker(agent, 'cyber');
+  fw.updateRewindMarker(agent, 'cyber');
+  fw.updateRewindMarker(agent, 'cyber');
+  const c6 = fw.updateRewindMarker(agent, 'cyber');
 
   assert.equal(c1, 1);
   assert.equal(c2, 2);
