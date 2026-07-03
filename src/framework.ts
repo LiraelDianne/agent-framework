@@ -257,6 +257,10 @@ export class AgentFramework {
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
+  /** Per-agent current rewind episode: the single consolidated marker's id and
+   *  how many turns have been shed so far. One marker per episode, updated in
+   *  place (see updateRewindMarker); cleared when the episode ends. */
+  private rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }> = new Map();
   /** Active `/unstick` sessions: an admin-forced rewind-until-clean loop that
    *  runs even when the agent's autoRewind toggle is off. Tracks the remaining
    *  budget, what was shed (for the report), and where to post the outcome. */
@@ -1351,14 +1355,16 @@ export class AgentFramework {
    * Shared by the auto path (on `stop_reason: refusal`) and the `/rewind`
    * host command.
    */
-  private rewindTriggeringTurn(agent: Agent, category: string): RewindRecord | null {
+  private shedNewestTurn(agent: Agent): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
     // Newest message that is neither the agent's own output NOR one of our own
-    // injected system markers = the turn that fed the refusal. We SKIP prior
-    // refusal-rewind markers (rather than stopping at them) so that on a repeat
-    // refusal the loop keeps shedding older real turns until it clears or hits
-    // the cap — a marker at the tail must not be mistaken for "nothing left".
+    // injected system markers = the turn that fed the refusal. We SKIP the
+    // single episode marker (system) so successive refusals keep shedding older
+    // REAL turns strictly newest-first, in sequence — newest-first eventually
+    // reaches whatever older content is poisoning the context if allowed to run
+    // deep enough. We do NOT add a marker here; the caller maintains exactly one
+    // consolidated marker for the whole episode (updateRewindMarker).
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       if (all[i].participant === agent.name) continue;
@@ -1402,22 +1408,39 @@ export class AgentFramework {
       : undefined;
 
     cm.removeMessage(msg.id);
-    cm.addMessage(
-      'user',
-      [{
-        type: 'text',
-        text:
-          `[refusal-rewind] ${descriptor} was withheld from your context because ` +
-          `it triggered a content-policy refusal (category=${category}). Its ` +
-          `content is intentionally not reproduced here (so this note cannot ` +
-          `re-trigger the filter); the original remains in the raw record. ` +
-          `Continue without it — if you were mid-task, try a different approach ` +
-          `rather than re-fetching the same thing.`,
-      }],
-      { system: true, kind: 'refusal-rewind', category, removedParticipant: msg.participant },
-    );
-
     return { kind, descriptor, removedId: msg.id, discordRef };
+  }
+
+  /**
+   * Maintain exactly ONE consolidated marker for the current rewind episode,
+   * updated in place as more turns are shed. Six rewinds ⇒ one message that
+   * says "the 6 most recent turns were set aside", not six separate notes — so
+   * the context converges (shed N, add 1) instead of growing, and the marker
+   * sits at the tail giving the model something actionable to answer once the
+   * refusal clears. Returns the running count.
+   */
+  private updateRewindMarker(agent: Agent, category: string): number {
+    const cm = agent.getContextManager();
+    const ep = this.rewindEpisode.get(agent.name);
+    const count = (ep?.count ?? 0) + 1;
+    const text =
+      `[refusal-rewind] The ${count} most recent turn(s) were set aside because ` +
+      `the model refused on them (content filter: ${category}). Their content is ` +
+      `not reproduced here (so this note can't re-trigger the filter); the ` +
+      `originals remain in the raw record. You are clear to continue — if you ` +
+      `were mid-task, take a different approach; otherwise carry on with whatever ` +
+      `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
+    const blocks: ContentBlock[] = [{ type: 'text', text }];
+    if (ep) {
+      cm.editMessage(ep.markerId, blocks);
+      this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
+    } else {
+      const id = cm.addMessage('user', blocks, {
+        system: true, kind: 'refusal-rewind', category, count,
+      });
+      this.rewindEpisode.set(agent.name, { markerId: id, count, category });
+    }
+    return count;
   }
 
   /**
@@ -3345,18 +3368,18 @@ export class AgentFramework {
               let handledByRewind = false;
               const rh = agent.refusalHandling;
               const forced = this.forcedRewind.get(agent.name);
+              // Shed exactly one more (newest, in-sequence) turn and keep the
+              // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
                 budgetLeft: boolean,
-                onStep: () => void,
+                onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.rewindTriggeringTurn(agent, category);
+                const rec = this.shedNewestTurn(agent);
                 if (!rec) { onGiveUp(); return; }
-                onStep();
-                if (rec.kind === 'human' && (rh?.announceHumanTurns ?? true)) {
-                  void this.announceRewind(agent.name, rec, category);
-                }
+                const count = this.updateRewindMarker(agent, category);
+                onStep(count);
                 if (forced) forced.removed.push(rec);
                 this.pendingRequests.push({
                   agentName: agent.name,
@@ -3370,11 +3393,11 @@ export class AgentFramework {
               if (forced) {
                 doRewind(
                   forced.remaining > 0,
-                  () => {
+                  (count) => {
                     forced.remaining -= 1;
                     console.error(
-                      `[unstick] agent=${agent.name} rewound (remaining ${forced.remaining}): ` +
-                        `${forced.removed.length + 1} shed so far`,
+                      `[unstick] agent=${agent.name} shed ${count} turn(s) ` +
+                        `(remaining ${forced.remaining})`,
                     );
                   },
                   () => this.finishUnstick(agent.name, false, category),
@@ -3384,32 +3407,36 @@ export class AgentFramework {
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
                   used < cap,
-                  () => {
+                  (count) => {
                     this.refusalRewinds.set(agent.name, used + 1);
                     console.error(
-                      `[refusal-rewind] agent=${agent.name} rewound turn (${used + 1}/${cap})`,
+                      `[refusal-rewind] agent=${agent.name} shed ${count} turn(s) so far ` +
+                        `(cap ${cap})`,
                     );
                   },
                   () => {
                     console.error(
-                      `[refusal-rewind] agent=${agent.name} exhausted rewinds or nothing ` +
-                        `eligible — giving up turn`,
+                      `[refusal-rewind] agent=${agent.name} gave up: ` +
+                        `${used >= cap ? `cap ${cap} reached` : 'nothing left to shed'}`,
                     );
                     this.refusalRewinds.set(agent.name, 0);
+                    this.rewindEpisode.delete(agent.name);
                   },
                 );
               }
 
               if (!handledByRewind) void this.reactToRefusal(agent.name, category);
             } else {
-              // A turn that completed WITHOUT a refusal: an active /unstick
-              // session succeeded (the model responded); report and clear.
+              // A turn that completed WITHOUT a refusal ends the rewind episode:
+              // the model responded. Leave the consolidated marker in place as
+              // the durable record; just clear the per-episode counters.
               if (this.forcedRewind.has(agent.name)) {
                 this.finishUnstick(agent.name, true);
               }
               if (this.refusalRewinds.get(agent.name)) {
                 this.refusalRewinds.set(agent.name, 0);
               }
+              this.rewindEpisode.delete(agent.name);
             }
 
             // Dispatch speech (and thoughts if any)
