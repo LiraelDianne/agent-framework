@@ -202,6 +202,17 @@ interface HostCommandParams {
   requesterName?: string;
 }
 
+/** Descriptor of a single refusal-driven rewind (see rewindTriggeringTurn). */
+interface RewindRecord {
+  /** tool = machine tool result; human = an ingested message; other = else. */
+  kind: 'tool' | 'human' | 'other';
+  /** Content-free, safe-to-replay description of what was withheld. */
+  descriptor: string;
+  removedId: MessageId;
+  /** Discord (channelId, messageId) of the removed message, if it had one. */
+  discordRef?: { channelId: string; messageId: string };
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -237,6 +248,10 @@ export class AgentFramework {
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
   private readonly inferenceFailureEscalationThreshold = 3;
+  /** Per-agent count of consecutive refusal-driven rewinds in the current turn
+   *  chain (reset when a turn completes without a refusal). Bounds the auto
+   *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
+  private refusalRewinds: Map<string, number> = new Map();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -1304,6 +1319,118 @@ export class AgentFramework {
     } catch (err) {
       console.error(
         '[inference-refusal] reaction failed:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Rewind the single turn that fed a refused generation: redact the newest
+   * message the agent did NOT author (a tool result, or an incoming message)
+   * and inject a metadata-only marker in its place. The marker carries a
+   * *description* of what was withheld (kind + size), never the content — so it
+   * cannot itself re-trip the classifier — while the raw record survives in the
+   * chronicle log for forensics. Returns a record describing the removal, or
+   * null if there is nothing eligible to rewind (e.g. only the agent's own
+   * turns, or a prior system marker, remain).
+   *
+   * Shared by the auto path (on `stop_reason: refusal`) and the `/rewind`
+   * host command.
+   */
+  private rewindTriggeringTurn(agent: Agent, category: string): RewindRecord | null {
+    const cm = agent.getContextManager();
+    const all = cm.getAllMessages();
+    // Newest message not authored by the agent = the turn that fed the refusal.
+    let idx = -1;
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (all[i].participant !== agent.name) { idx = i; break; }
+    }
+    if (idx < 0) return null;
+    const msg = all[idx];
+    const md = (msg.metadata ?? {}) as {
+      messageId?: unknown; channelId?: unknown; system?: unknown;
+    };
+    // Never rewind one of our own injected system markers (incl. a prior
+    // refusal-rewind note) — that would just chew backwards through context.
+    if (md.system) return null;
+
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    const typeOf = (b: unknown) => (b as { type?: string }).type;
+    const toolBlocks = content.filter((b) => typeOf(b) === 'tool_result');
+    const images = content.filter((b) => typeOf(b) === 'image').length;
+    const textLen = content
+      .filter((b) => typeOf(b) === 'text')
+      .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
+
+    let kind: RewindRecord['kind'];
+    let descriptor: string;
+    if (toolBlocks.length > 0) {
+      kind = 'tool';
+      const sz = toolBlocks.reduce(
+        (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
+      descriptor = `a tool result (~${Math.max(1, Math.round(sz / 1024))}KB` +
+        `${images ? `, ${images} image(s)` : ''})`;
+    } else if (md.messageId) {
+      kind = 'human';
+      descriptor = `an incoming message from ${msg.participant} ` +
+        `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
+    } else {
+      kind = 'other';
+      descriptor = `the previous ${msg.participant} turn ` +
+        `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
+    }
+    const discordRef = md.messageId && md.channelId
+      ? { channelId: String(md.channelId), messageId: String(md.messageId) }
+      : undefined;
+
+    cm.removeMessage(msg.id);
+    cm.addMessage(
+      'user',
+      [{
+        type: 'text',
+        text:
+          `[refusal-rewind] ${descriptor} was withheld from your context because ` +
+          `it triggered a content-policy refusal (category=${category}). Its ` +
+          `content is intentionally not reproduced here (so this note cannot ` +
+          `re-trigger the filter); the original remains in the raw record. ` +
+          `Continue without it — if you were mid-task, try a different approach ` +
+          `rather than re-fetching the same thing.`,
+      }],
+      { system: true, kind: 'refusal-rewind', category, removedParticipant: msg.participant },
+    );
+
+    return { kind, descriptor, removedId: msg.id, discordRef };
+  }
+
+  /**
+   * Announce a refusal-rewind on the conversational surface (Discord), used
+   * when the withheld turn was a *human* message so it isn't dropped silently.
+   * Best-effort; mirrors reactToRefusal's locus resolution.
+   */
+  private async announceRewind(
+    agentName: string,
+    rec: RewindRecord,
+    category: string,
+  ): Promise<void> {
+    try {
+      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      if (!incoming) return;
+      const parts = incoming.channelId.split(':');
+      if (parts[0] !== 'discord') return;
+      const channelId = parts[parts.length - 1];
+      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
+      if (!server) return;
+      await server.sendToolsCall('send_message', {
+        channelId,
+        content:
+          `⚠️ I had to set aside ${rec.descriptor} — it tripped a content ` +
+          `filter (${category}), so it's withheld from my context and I'm ` +
+          `continuing without it. If it was important, please rephrase or re-send.`,
+      });
+    } catch (err) {
+      console.error(
+        '[refusal-rewind] announce failed:',
         err instanceof Error ? err.message : err,
       );
     }
@@ -3121,7 +3248,55 @@ export class AgentFramework {
                 `[inference-refusal] agent=${agent.name} category=${category}` +
                   (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
               );
-              void this.reactToRefusal(agent.name, category);
+
+              // Auto-rewind: excise the turn that fed the refusal, drop a
+              // metadata-only marker, and retry — keeping the agent on its own
+              // model instead of substituting a fallback. Bounded by maxRewinds.
+              let handledByRewind = false;
+              const rh = agent.refusalHandling;
+              if (rh?.autoRewind) {
+                const cap = Math.max(1, rh.maxRewinds ?? 3);
+                const used = this.refusalRewinds.get(agent.name) ?? 0;
+                if (used < cap) {
+                  const rec = this.rewindTriggeringTurn(agent, category);
+                  if (rec) {
+                    this.refusalRewinds.set(agent.name, used + 1);
+                    console.error(
+                      `[refusal-rewind] agent=${agent.name} rewound ${rec.kind} turn ` +
+                        `(${used + 1}/${cap}): ${rec.descriptor}`,
+                    );
+                    // Don't silently drop a human's message — say so on-surface.
+                    if (rec.kind === 'human' && (rh.announceHumanTurns ?? true)) {
+                      void this.announceRewind(agent.name, rec, category);
+                    }
+                    // Re-drive the turn via the normal scheduler; the retry now
+                    // compiles context without the poison turn.
+                    this.pendingRequests.push({
+                      agentName: agent.name,
+                      reason: 'refusal-rewind-retry',
+                      source: 'framework',
+                      timestamp: Date.now(),
+                    });
+                    handledByRewind = true;
+                  } else {
+                    console.error(
+                      `[refusal-rewind] agent=${agent.name} nothing eligible to ` +
+                        `rewind — giving up turn`,
+                    );
+                  }
+                } else {
+                  console.error(
+                    `[refusal-rewind] agent=${agent.name} exhausted ${cap} rewinds ` +
+                      `— giving up turn`,
+                  );
+                  this.refusalRewinds.set(agent.name, 0);
+                }
+              }
+
+              if (!handledByRewind) void this.reactToRefusal(agent.name, category);
+            } else if (this.refusalRewinds.get(agent.name)) {
+              // A turn that completed without a refusal clears the rewind budget.
+              this.refusalRewinds.set(agent.name, 0);
             }
 
             // Dispatch speech (and thoughts if any)

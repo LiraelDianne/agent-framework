@@ -44,6 +44,8 @@ export class Agent {
    * blocks are preserved through Chronicle.
    */
   readonly thinking: AgentConfig['thinking'];
+  /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
+  readonly refusalHandling: AgentConfig['refusalHandling'];
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -70,6 +72,7 @@ export class Agent {
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature;
     this.thinking = config.thinking;
+    this.refusalHandling = config.refusalHandling;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
