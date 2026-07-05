@@ -344,12 +344,16 @@ export class EventGate {
   private defaultSkipped = 0;
   private defaultByEventType = new Map<string, { triggered: number; skipped: number }>();
 
-  // Sleep state (set via the `sleep` tool). Passive: evaluate() suppresses
-  // non-privileged wakes while now() < sleepUntil. No timer — after expiry the
-  // next event evaluates normally.
+  // Sleep state (set via the `sleep` tool). evaluate() suppresses non-privileged
+  // wakes while now() < sleepUntil. A self-wake timer (sleepTimer) fires an
+  // inference when the window expires, so `sleep(N)` means "wake me in N
+  // seconds" rather than merely lifting suppression and waiting for an external
+  // event.
   private sleepUntil = 0;
   private sleepNote: string | undefined;
   private sleepSuppressed = 0;
+  private sleepTimer: ReturnType<typeof setTimeout> | null = null;
+  private sleepAgent: string | undefined;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -1121,11 +1125,17 @@ export class EventGate {
   // =========================================================================
 
   /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string): { until: number } {
+  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
     this.sleepNote = note;
+    this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
+    // Arm the self-wake: when the window elapses, clear sleep and request an
+    // inference so the agent resumes on its own (not dependent on a heartbeat
+    // tick or an incoming message). Cancelled by clearSleep()/`wake`.
+    if (this.sleepTimer) clearTimeout(this.sleepTimer);
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1143,7 +1153,37 @@ export class EventGate {
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
     this.sleepNote = undefined;
+    this.sleepAgent = undefined;
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     return wasAsleep;
+  }
+
+  /**
+   * Self-wake handler: fired by the sleepTimer when a sleep window elapses.
+   * Clears the sleep state and requests an inference so the agent wakes on its
+   * own — this is what makes `sleep(N)` a real "wake me in N seconds" rather
+   * than just a suppression window. No-op if sleep was already cleared (via
+   * `wake`) or re-armed to a later time by a fresh `sleep` call.
+   */
+  private wakeFromSleep(reason: string): void {
+    this.sleepTimer = null;
+    if (this.sleepUntil === 0 || this.sleepUntil > this.now()) return;
+    const note = this.sleepNote;
+    const agent = this.sleepAgent;
+    this.sleepUntil = 0;
+    this.sleepNote = undefined;
+    this.sleepAgent = undefined;
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'sleep:expired',
+      matchedPolicy: 'asleep',
+      trigger: true,
+      behavior: 'always',
+      timestamp: this.now(),
+    });
+    const detail = note ? `${reason}: ${note}` : reason;
+    const targets = agent ? [agent] : this.getAgentNamesFn();
+    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
   }
 
   /** Current sleep state, or null if awake. */
