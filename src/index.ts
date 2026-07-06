@@ -63,6 +63,16 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// MCPL server config (exposed for hosts that manage servers at runtime via
+// connectMcplServer / disconnectMcplServer / restartMcplServer)
+export type { McplServerConfig } from './mcpl/index.js';
+
+// MCPL client connection (exposed so external tooling — server playtests,
+// health probes, protocol harnesses — can dial an MCPL server exactly the
+// way the framework host does, over stdio or WebSocket)
+export { McplServerConnection } from './mcpl/index.js';
+export type { McplHostCapabilities } from './mcpl/index.js';
+
 // Per-channel conversation routing
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
 export type {

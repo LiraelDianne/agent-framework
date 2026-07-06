@@ -87,6 +87,13 @@ export class McplServerConnection extends EventEmitter {
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
   private transport: McplTransport | null;
+
+  /** Whether the connection currently has a live transport. False for closed
+   *  connections and disconnected reconnect-stubs awaiting a retry. */
+  get isConnected(): boolean {
+    return !this.closed && this.transport !== null;
+  }
+
   private nextRequestId = 1;
   private pendingRequests = new Map<string | number, PendingRequest>();
   private closed = false;

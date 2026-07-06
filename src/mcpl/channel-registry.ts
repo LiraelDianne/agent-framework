@@ -824,6 +824,25 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
+   * Remove all channel state belonging to a single server. Called by the
+   * framework when an MCPL server is disconnected at runtime, so a dead
+   * server's channels don't linger and route speech into the void.
+   */
+  removeServer(serverId: string): void {
+    for (const [key, entry] of this.channels) {
+      if (entry.serverId !== serverId) continue;
+      this.channels.delete(key);
+      this.stopTyping(entry.descriptor.id);
+      if (this.defaultPublishChannel === entry.descriptor.id) {
+        this.defaultPublishChannel = null;
+        this.defaultPublishMessageId = null;
+        this.defaultPublishThreadId = undefined;
+      }
+    }
+    this.subscriptionPolicies.delete(serverId);
+  }
+
+  /**
    * Stop all typing intervals and clear all channel registrations.
    */
   stopAll(): void {

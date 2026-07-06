@@ -317,6 +317,13 @@ export class AgentFramework {
   private mcplPrefixMap: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
+  /** Host capabilities advertised during the MCP handshake — stored so servers
+   *  can be connected at runtime (connectMcplServer) after initialization. */
+  private mcplHostCapabilities: McplHostCapabilities | null = null;
+  /** Inference routing policy from FrameworkConfig — stored so the MCPL
+   *  subsystem can be lazily initialized by connectMcplServer when the
+   *  framework started with zero configured servers. */
+  private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
@@ -505,6 +512,10 @@ export class AgentFramework {
       });
       framework.livenessWatchdog.start();
     }
+
+    // Stored for lazy MCPL initialization (connectMcplServer on a framework
+    // that started with zero configured servers).
+    framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
 
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -4264,8 +4275,9 @@ export class AgentFramework {
       },
     );
 
-    // Host capabilities advertised during the MCP handshake
-    const hostCapabilities: McplHostCapabilities = {
+    // Host capabilities advertised during the MCP handshake — stored so
+    // servers can also be connected later at runtime (connectMcplServer).
+    this.mcplHostCapabilities = {
       version: '0.4',
       pushEvents: true,
       contextHooks: {
@@ -4277,57 +4289,7 @@ export class AgentFramework {
 
     for (const config of serverConfigs) {
       try {
-        // Record per-server channel subscription policy before the server
-        // registers channels — handleRegister fires during the handshake.
-        if (config.channelSubscription !== undefined && this.channelRegistry) {
-          this.channelRegistry.setSubscriptionPolicy(config.id, config.channelSubscription);
-        }
-
-        const connection = await this.mcplServerRegistry.addServer(config, hostCapabilities);
-
-        // Wire event listeners then flush any events that arrived during the
-        // handshake window (between setupMessageRouting and now).
-        this.wireMcplEvents(connection);
-        connection.ready();
-
-        // Initialize feature sets if server advertises MCPL capabilities
-        if (connection.capabilities) {
-          const updateParams = this.featureSetManager.initializeServer(
-            config.id,
-            connection.capabilities,
-            {
-              enabledFeatureSets: config.enabledFeatureSets,
-              disabledFeatureSets: config.disabledFeatureSets,
-            },
-          );
-
-          // Inform server which feature sets are enabled/disabled
-          if (updateParams.enabled?.length || updateParams.disabled?.length) {
-            connection.sendFeatureSetsUpdate(updateParams);
-          }
-
-          // Configure scope whitelist/blacklist patterns
-          if (config.scopes) {
-            this.scopeManager.configureAll(config.scopes);
-          }
-
-          // Register stateful feature sets with checkpoint manager (Step 8)
-          if (this.checkpointManager) {
-            const declared = this.featureSetManager.getDeclaredFeatureSets(config.id);
-            if (declared) {
-              for (const [fsName, fsDecl] of Object.entries(declared)) {
-                if (fsDecl.rollback || fsDecl.hostState) {
-                  this.checkpointManager.registerFeatureSet(config.id, fsName, {
-                    hostState: fsDecl.hostState ?? false,
-                    rollback: fsDecl.rollback ?? false,
-                  });
-                }
-              }
-            }
-          }
-        }
-
-        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+        await this.connectMcplServerInternal(config);
       } catch (error) {
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
@@ -4348,6 +4310,191 @@ export class AgentFramework {
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
+  }
+
+  /**
+   * Connect a single MCPL server: register routing entries, open the
+   * connection, wire events, and initialize feature sets / scopes /
+   * checkpoints. Shared by startup (initializeMcpl) and the runtime
+   * lifecycle API (connectMcplServer). Throws on connection failure.
+   */
+  private async connectMcplServerInternal(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
+    if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
+      throw new Error('MCPL subsystem is not initialized');
+    }
+
+    // Register prefix + config for tool dispatch routing (idempotent with
+    // the pre-registration pass in initializeMcpl).
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    this.mcplPrefixMap.set(prefix, config.id);
+    this.mcplServerConfigs.set(config.id, config);
+
+    // Record per-server channel subscription policy before the server
+    // registers channels — handleRegister fires during the handshake.
+    if (config.channelSubscription !== undefined && this.channelRegistry) {
+      this.channelRegistry.setSubscriptionPolicy(config.id, config.channelSubscription);
+    }
+
+    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+
+    // Wire event listeners then flush any events that arrived during the
+    // handshake window (between setupMessageRouting and now).
+    this.wireMcplEvents(connection);
+    connection.ready();
+
+    // Initialize feature sets if server advertises MCPL capabilities
+    if (connection.capabilities) {
+      const updateParams = this.featureSetManager!.initializeServer(
+        config.id,
+        connection.capabilities,
+        {
+          enabledFeatureSets: config.enabledFeatureSets,
+          disabledFeatureSets: config.disabledFeatureSets,
+        },
+      );
+
+      // Inform server which feature sets are enabled/disabled
+      if (updateParams.enabled?.length || updateParams.disabled?.length) {
+        connection.sendFeatureSetsUpdate(updateParams);
+      }
+
+      // Configure scope whitelist/blacklist patterns
+      if (config.scopes) {
+        this.scopeManager!.configureAll(config.scopes);
+      }
+
+      // Register stateful feature sets with checkpoint manager (Step 8)
+      if (this.checkpointManager) {
+        const declared = this.featureSetManager!.getDeclaredFeatureSets(config.id);
+        if (declared) {
+          for (const [fsName, fsDecl] of Object.entries(declared)) {
+            if (fsDecl.rollback || fsDecl.hostState) {
+              this.checkpointManager.registerFeatureSet(config.id, fsName, {
+                hostState: fsDecl.hostState ?? false,
+                rollback: fsDecl.rollback ?? false,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+  }
+
+  // ==========================================================================
+  // Runtime MCPL server lifecycle (agent-facing hot deploy/restart/unload)
+  // ==========================================================================
+
+  /**
+   * Connect a new MCPL server at runtime. Refreshes the tool list and
+   * notifies the agent of newly available tools. Throws if the MCPL
+   * subsystem is not initialized, the id is already connected, or the
+   * connection/handshake fails.
+   */
+  async connectMcplServer(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
+    // Lazily bring up the MCPL subsystem — a framework that started with zero
+    // configured servers can still deploy its first one at runtime.
+    if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
+      await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
+    }
+
+    // Same collision rules create() enforces at startup: the tool prefix must
+    // not shadow a module name or another server's prefix.
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
+      throw new Error(
+        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`,
+      );
+    }
+    const prefixOwner = this.mcplPrefixMap.get(prefix);
+    if (prefixOwner && prefixOwner !== config.id) {
+      throw new Error(
+        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`,
+      );
+    }
+
+    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    await this.connectMcplServerInternal(config);
+    await this.refreshMcplTools();
+    this.emitMcplToolDiff(oldToolNames, config.id);
+  }
+
+  /**
+   * Disconnect an MCPL server at runtime: close the connection (which also
+   * cleans feature sets and checkpoints via the 'close' handler), remove its
+   * channels from the registry, drop routing entries, and refresh tools.
+   * No-op-ish if the server is not connected (still clears routing state).
+   */
+  async disconnectMcplServer(id: string): Promise<void> {
+    if (!this.mcplServerRegistry) {
+      throw new Error('MCPL subsystem is not initialized');
+    }
+    const config = this.mcplServerConfigs.get(id);
+    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+
+    await this.mcplServerRegistry.removeServer(id);
+    this.channelRegistry?.removeServer(id);
+
+    const prefix = config?.toolPrefix ?? `mcpl--${id}`;
+    this.mcplPrefixMap.delete(prefix);
+    this.mcplServerConfigs.delete(id);
+
+    await this.refreshMcplTools();
+    this.emitMcplToolDiff(oldToolNames, id);
+  }
+
+  /**
+   * Restart an MCPL server at runtime: disconnect, then reconnect with the
+   * same (or an updated) config. This actually respawns a stdio child —
+   * unlike `reconnect: true`, which only retries after transport-level
+   * failures. Throws if the server has no stored config and none is given.
+   */
+  async restartMcplServer(
+    id: string,
+    newConfig?: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
+    const config = newConfig ?? this.mcplServerConfigs.get(id);
+    if (!config) {
+      throw new Error(`MCPL server "${id}" is not configured`);
+    }
+    await this.disconnectMcplServer(id);
+    await this.connectMcplServer(config);
+  }
+
+  /**
+   * List configured MCPL servers with live connection status and the number
+   * of tools each currently contributes.
+   */
+  listMcplServers(): Array<{
+    id: string;
+    connected: boolean;
+    toolPrefix: string;
+    toolCount: number;
+    command?: string;
+    url?: string;
+  }> {
+    const result: Array<{
+      id: string; connected: boolean; toolPrefix: string; toolCount: number;
+      command?: string; url?: string;
+    }> = [];
+    for (const [id, config] of this.mcplServerConfigs) {
+      const prefix = config.toolPrefix ?? `mcpl--${id}`;
+      const connection = this.mcplServerRegistry?.getServer(id) ?? null;
+      result.push({
+        id,
+        connected: connection?.isConnected ?? false,
+        toolPrefix: prefix,
+        toolCount: this.mcplTools.filter(t => t.name.startsWith(`${prefix}--`)).length,
+        command: config.command,
+        url: config.url,
+      });
+    }
+    return result;
   }
 
   /**
