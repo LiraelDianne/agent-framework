@@ -46,6 +46,8 @@ export class Agent {
   readonly thinking: AgentConfig['thinking'];
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
+  /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
+  readonly cacheTtl: AgentConfig['cacheTtl'];
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -73,6 +75,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
+    this.cacheTtl = config.cacheTtl;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -345,6 +348,7 @@ export class Agent {
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: true,
+      ...(this.cacheTtl !== undefined && { cacheTtl: this.cacheTtl }),
       assistantParticipant: this.name,
     };
   }
