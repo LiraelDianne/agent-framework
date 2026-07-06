@@ -73,6 +73,9 @@ interface PendingRequest {
  * - `'feature-sets-changed'` — Server sent `featureSets/changed`
  * - `'error'`              — Connection-level error
  * - `'close'`              — Connection closed
+ * - `'connect-failed'`     — Initial connect failed; background retry scheduled
+ * - `'reconnect-failed'`   — A background reconnect attempt failed; next retry scheduled
+ * - `'reconnect'`          — Background reconnect succeeded
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -97,7 +100,17 @@ export class McplServerConnection extends EventEmitter {
   private hostCapabilities: McplHostCapabilities | null = null;
   private reconnectEnabled = false;
   private reconnectIntervalMs = 5000;
+  private reconnectMaxIntervalMs = 300_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive failed connect attempts since the last successful handshake.
+   *  Drives the exponential backoff and is reported on reconnect events. */
+  private reconnectAttempts = 0;
+
+  /** Whether a background reconnect loop will revive this connection after a
+   *  drop. False once close() has been called (explicit close stops retrying). */
+  get willReconnect(): boolean {
+    return this.reconnectEnabled;
+  }
 
   /**
    * Private constructor. Use `McplServerConnection.connect()` instead.
@@ -174,6 +187,7 @@ export class McplServerConnection extends EventEmitter {
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
       connection.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
+      connection.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
     }
 
     return connection;
@@ -281,7 +295,12 @@ export class McplServerConnection extends EventEmitter {
 
       // Non-blocking start: create a disconnected stub that will reconnect in background
       console.error(`MCPL server "${config.id}" initial connect failed, will retry:`, (error as Error).message);
-      return McplServerConnection.createDisconnectedStub(config, hostCapabilities);
+      const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
+      // Surface the initial failure. The event is buffered by the emit()
+      // override until the host wires listeners and calls ready(), so it is
+      // not lost in the window before wireMcplEvents runs.
+      stub.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
+      return stub;
     }
   }
 
@@ -301,6 +320,8 @@ export class McplServerConnection extends EventEmitter {
     stub.hostCapabilities = hostCapabilities;
     stub.reconnectEnabled = true;
     stub.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
+    stub.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
+    stub.reconnectAttempts = 1; // the initial connect already failed
 
     // Schedule background reconnect
     stub.scheduleReconnect();
@@ -457,14 +478,26 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Schedule a background reconnection attempt.
+   *
+   * Delay grows exponentially with consecutive failures (base
+   * `reconnectIntervalMs`, doubling per failure, capped at
+   * `reconnectMaxIntervalMs`) with ±25% jitter so a fleet of servers that
+   * died together doesn't thundering-herd the same instant. The counter
+   * resets on a successful handshake, so a later disconnect starts over at
+   * the base interval.
    */
   private scheduleReconnect(): void {
     if (!this.reconnectEnabled || this.reconnectTimer) return;
 
+    const exponent = Math.max(0, Math.min(this.reconnectAttempts - 1, 30));
+    const uncapped = this.reconnectIntervalMs * 2 ** exponent;
+    const capped = Math.min(uncapped, this.reconnectMaxIntervalMs);
+    const delay = capped * (0.75 + Math.random() * 0.5);
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.attemptReconnect();
-    }, this.reconnectIntervalMs);
+    }, delay);
   }
 
   /**
@@ -475,6 +508,10 @@ export class McplServerConnection extends EventEmitter {
    */
   private async attemptReconnect(): Promise<void> {
     if (!this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+
+    // Ordinal of this attempt: 0 was the initial connect, so the Nth retry
+    // reports attempt N (reconnectAttempts counts failures so far).
+    const attempt = Math.max(1, this.reconnectAttempts);
 
     try {
       const { transport, capabilities } = await McplServerConnection.handshake(
@@ -494,9 +531,12 @@ export class McplServerConnection extends EventEmitter {
       this.readyFlag = true;
 
       console.error(`MCPL server "${this.id}" reconnected successfully`);
-      this.emit('reconnect');
+      this.reconnectAttempts = 0;
+      this.emit('reconnect', { attempts: attempt });
     } catch (error) {
       console.error(`MCPL server "${this.id}" reconnect failed:`, (error as Error).message);
+      this.reconnectAttempts = attempt + 1;
+      this.emit('reconnect-failed', { error: (error as Error).message, attempt });
       this.scheduleReconnect();
     }
   }

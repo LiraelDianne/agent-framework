@@ -4332,6 +4332,17 @@ export class AgentFramework {
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
+        // Reaching this catch means no stub was created, so nothing will
+        // retry — except in the edge case where addServer succeeded (with a
+        // reconnecting stub) and a later setup step threw; config.reconnect
+        // is the best cheap approximation of that.
+        this.emitTrace({
+          type: 'mcpl:server-connect-failed',
+          serverId: config.id,
+          error: err.message,
+          attempt: 0,
+          willRetry: config.reconnect === true,
+        });
       }
     }
 
@@ -4435,14 +4446,62 @@ export class AgentFramework {
     });
 
     // Also refresh tools on reconnect (server may have different tools)
-    connection.on('reconnect', () => {
+    connection.on('reconnect', (info?: { attempts?: number }) => {
       this.handleToolsListChanged(connection.id);
+      this.emitTrace({
+        type: 'mcpl:server-reconnected',
+        serverId: connection.id,
+        attempts: info?.attempts ?? 0,
+      });
+      // Mirror the module:removed emitted on 'close' so module-lifecycle
+      // consumers see the server come back, not just vanish.
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
+    });
+
+    // Surface connect/reconnect failures. Before these traces existed the
+    // only receipt was a console.error on the host's own stderr — invisible
+    // unless someone ssh'd in and read the process log.
+    connection.on('connect-failed', (params: { error: string; attempt: number }) => {
+      this.emitTrace({
+        type: 'mcpl:server-connect-failed',
+        serverId: connection.id,
+        error: params.error,
+        attempt: params.attempt,
+        willRetry: connection.willReconnect,
+      });
+    });
+    connection.on('reconnect-failed', (params: { error: string; attempt: number }) => {
+      this.emitTrace({
+        type: 'mcpl:server-connect-failed',
+        serverId: connection.id,
+        error: params.error,
+        attempt: params.attempt,
+        willRetry: connection.willReconnect,
+      });
+    });
+
+    // Connection-level errors (e.g. child process 'error' after spawn).
+    // Attaching this listener also keeps an unhandled EventEmitter 'error'
+    // from crashing the host process.
+    connection.on('error', (err: Error) => {
+      this.emitTrace({
+        type: 'mcpl:server-error',
+        serverId: connection.id,
+        error: err.message,
+      });
     });
 
     // Cleanup on disconnect
-    connection.on('close', () => {
+    connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
       this.checkpointManager?.removeServer(connection.id);
+      this.emitTrace({
+        type: 'mcpl:server-closed',
+        serverId: connection.id,
+        code: code ?? null,
+        signal: signal ?? null,
+        willReconnect: connection.willReconnect,
+      });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
     });
   }
