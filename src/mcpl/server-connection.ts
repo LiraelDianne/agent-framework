@@ -46,6 +46,13 @@ import { McplMethod } from './types.js';
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
 const INITIALIZE_TIMEOUT_MS = 30_000;
 
+/** Default per-request timeout in milliseconds (see McplServerConfig.requestTimeoutMs).
+ *  A live-but-wedged server (accepts requests, never answers, never closes its
+ *  transport) would otherwise freeze the awaiting agent turn forever — no
+ *  endTurn, no further wakes, zero errors anywhere. 60s is generous for real
+ *  tool work while still bounding the hang. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+
 /** MCP protocol version used in the initialize handshake. */
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 
@@ -56,6 +63,8 @@ interface PendingRequest {
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
   method: string;
+  /** Per-request timeout timer; cleared on response/close/timeout. */
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -97,6 +106,9 @@ export class McplServerConnection extends EventEmitter {
   private nextRequestId = 1;
   private pendingRequests = new Map<string | number, PendingRequest>();
   private closed = false;
+
+  /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
+  private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
   // Event buffering: events emitted before ready() are queued, not lost
   private readyFlag = false;
@@ -187,6 +199,7 @@ export class McplServerConnection extends EventEmitter {
     const { transport, capabilities } = await McplServerConnection.handshake(config, hostCapabilities);
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
+    connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Store config for reconnection
     if (config.reconnect) {
@@ -323,6 +336,7 @@ export class McplServerConnection extends EventEmitter {
     // Null transport — the stub is closed until its first background reconnect.
     const stub = new McplServerConnection(config.id, null, null);
     stub.closed = true;
+    stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
     stub.hostCapabilities = hostCapabilities;
     stub.reconnectEnabled = true;
@@ -469,6 +483,7 @@ export class McplServerConnection extends EventEmitter {
 
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
+      if (pending.timer) clearTimeout(pending.timer);
       pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
     }
     this.pendingRequests.clear();
@@ -555,6 +570,13 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a JSON-RPC request and return a promise that resolves with the result
    * or rejects with a JSON-RPC error.
+   *
+   * Every request carries a timeout (default 60s, configurable via
+   * McplServerConfig.requestTimeoutMs, 0 disables): a live-but-stuck server
+   * that accepts a request and never answers rejects the pending promise with
+   * a descriptive error instead of freezing the caller forever. For tools/call
+   * the framework maps the rejection to an isError tool_result, so a hung tool
+   * surfaces as a normal tool error and the turn completes.
    */
   private sendRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.closed) {
@@ -570,7 +592,20 @@ export class McplServerConnection extends EventEmitter {
     };
 
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject, method });
+      const pending: PendingRequest = { resolve, reject, method };
+      if (this.requestTimeoutMs > 0) {
+        pending.timer = setTimeout(() => {
+          this.pendingRequests.delete(id);
+          reject(new Error(
+            `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
+            `within ${this.requestTimeoutMs}ms — the server may be hung. ` +
+            `The request was abandoned; the connection remains open.`,
+          ));
+        }, this.requestTimeoutMs);
+        // Don't hold the event loop open for the watchdog alone.
+        pending.timer.unref?.();
+      }
+      this.pendingRequests.set(id, pending);
       this.transport!.writeLine(JSON.stringify(request));
     });
   }
@@ -677,6 +712,7 @@ export class McplServerConnection extends EventEmitter {
     }
 
     this.pendingRequests.delete(response.id);
+    if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
       pending.reject(
@@ -729,6 +765,7 @@ export class McplServerConnection extends EventEmitter {
 
         // Reject all pending requests
         for (const [id, pending] of this.pendingRequests) {
+          if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new Error(
               `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${info.reason ?? 'unknown'}) while awaiting ${pending.method} (id=${id})`,

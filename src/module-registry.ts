@@ -302,20 +302,35 @@ export class ModuleRegistry {
   /**
    * Gather context injections from all modules before inference.
    * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped silently.
+   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   *
+   * The per-module budget is `module.contextTimeoutMs` when declared, else the
+   * `timeoutMs` default (15s). Modules whose gatherContext does real work —
+   * e.g. a retrieval module making sequential LLM calls with backoff — should
+   * declare a larger `contextTimeoutMs` rather than silently losing their
+   * injection every turn to the shared default.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 5000): Promise<ContextInjection[]> {
+  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
     const injections: ContextInjection[] = [];
     const promises: Promise<void>[] = [];
 
     for (const module of this.modules.values()) {
       if (!module.gatherContext) continue;
 
+      const budgetMs = module.contextTimeoutMs ?? timeoutMs;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
         module.gatherContext(agentName).then(r => injections.push(...r)),
-        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs)),
-      ]).catch(err => console.error(`[${module.name}] gatherContext:`, err));
+        new Promise<void>((_, rej) => {
+          timer = setTimeout(
+            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            budgetMs,
+          );
+        }),
+      ])
+        .catch(err => console.error(`[${module.name}] gatherContext:`, err))
+        .finally(() => clearTimeout(timer));
 
       promises.push(promise as Promise<void>);
     }

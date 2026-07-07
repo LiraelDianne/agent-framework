@@ -16,7 +16,12 @@ import { join } from 'node:path';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
-const FIXTURE = join(import.meta.dirname, 'fixtures/flaky-mcpl-server.mjs');
+// The .mjs fixture is not compiled/copied by tsc, so when this test runs from
+// dist/test it must reach back into the source tree for it.
+const FIXTURE = [
+  join(import.meta.dirname, 'fixtures/flaky-mcpl-server.mjs'),
+  join(import.meta.dirname, '../../test/fixtures/flaky-mcpl-server.mjs'),
+].find((p) => existsSync(p))!;
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-reconnect');
 const FLAG_FILE = join(TMP_DIR, 'server-healthy');
 
