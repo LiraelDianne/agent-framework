@@ -599,7 +599,10 @@ export class McplServerConnection extends EventEmitter {
           reject(new Error(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
             `within ${this.requestTimeoutMs}ms — the server may be hung. ` +
-            `The request was abandoned; the connection remains open.`,
+            `The request was abandoned; the connection remains open. Note the ` +
+            `tool may still have completed server-side (this is only a response ` +
+            `timeout, not a cancellation) — verify state before retrying, as a ` +
+            `blind retry of a stateful/side-effecting tool may duplicate it.`,
           ));
         }, this.requestTimeoutMs);
         // Don't hold the event loop open for the watchdog alone.
@@ -708,6 +711,25 @@ export class McplServerConnection extends EventEmitter {
   private handleResponse(response: JsonRpcResponse): void {
     const pending = this.pendingRequests.get(response.id);
     if (!pending) {
+      // Orphaned response — the request already timed out (or was settled) and
+      // was removed from pendingRequests. Stateless late results are harmless to
+      // drop, but a late STATEFUL result carries a `state`/`checkpoint` the
+      // server has already advanced to: dropping it silently diverges the host's
+      // checkpoint tree from the server's, and every subsequent call then sends
+      // stale state. We can't safely re-inject it here (the dispatch context is
+      // gone), but we surface it so the divergence is greppable instead of
+      // invisible.
+      const result = response.result;
+      if (result && typeof result === 'object') {
+        const r = result as { state?: unknown; checkpoint?: unknown };
+        if (r.state !== undefined || r.checkpoint !== undefined) {
+          this.emit('orphaned-response', {
+            id: response.id,
+            hadState: r.state !== undefined,
+            hadCheckpoint: r.checkpoint !== undefined,
+          });
+        }
+      }
       return; // Orphaned response — ignore
     }
 

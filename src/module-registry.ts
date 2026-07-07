@@ -28,6 +28,15 @@ import type { Agent } from './agent.js';
 const MODULE_STATE_PREFIX = 'modules/';
 
 /**
+ * Hard ceiling for a single module's gatherContext budget, regardless of the
+ * `contextTimeoutMs` it declares. gatherContext runs on the critical path of
+ * every inference turn, so an unbounded self-declared budget would let one
+ * wedged module stall every agent. 30s is generous for legitimate work (e.g. a
+ * retrieval module's sequential LLM calls) while keeping the worst case bounded.
+ */
+const MAX_CONTEXT_TIMEOUT_MS = 30_000;
+
+/**
  * Registered speech handler.
  */
 interface SpeechHandler {
@@ -308,7 +317,8 @@ export class ModuleRegistry {
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
    * e.g. a retrieval module making sequential LLM calls with backoff — should
    * declare a larger `contextTimeoutMs` rather than silently losing their
-   * injection every turn to the shared default.
+   * injection every turn to the shared default. The declared value is clamped
+   * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
@@ -318,7 +328,15 @@ export class ModuleRegistry {
     for (const module of this.modules.values()) {
       if (!module.gatherContext) continue;
 
-      const budgetMs = module.contextTimeoutMs ?? timeoutMs;
+      // Clamp the per-module budget. A module declaring `contextTimeoutMs`
+      // legitimately needs more than the shared default (e.g. a retrieval
+      // module doing sequential LLM calls), but it must not be able to hold
+      // EVERY inference turn of EVERY agent hostage: the fail-open contract is
+      // "a wedged module never blocks inference for long", so cap the wait.
+      const budgetMs = Math.min(
+        module.contextTimeoutMs ?? timeoutMs,
+        MAX_CONTEXT_TIMEOUT_MS,
+      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
         module.gatherContext(agentName).then(r => injections.push(...r)),

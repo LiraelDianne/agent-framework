@@ -3127,9 +3127,13 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
-          // Drives the poison-history breaker: only a known NON-retryable
-          // failure (e.g. a 400 on a corrupt history) triggers auto-rewind.
+          // Drives the poison-history breaker. `retryable` is kept for
+          // observability, but the breaker gates on `errorType` — only an
+          // `invalid_request` (a 400-class rejection of the history itself)
+          // means retrying the same context can never succeed. auth/abort/
+          // context_length are also non-retryable but must NOT cost history.
           retryable: err instanceof MembraneError ? err.retryable : undefined,
+          errorType: err instanceof MembraneError ? err.type : undefined,
         });
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
@@ -3637,9 +3641,12 @@ export class AgentFramework {
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: err.message,
-                // Drives the poison-history breaker: only a known NON-retryable
-                // failure (e.g. a 400 on a corrupt history) triggers auto-rewind.
+                // Drives the poison-history breaker. `retryable` is kept for
+                // observability, but the breaker gates on `errorType` — only an
+                // `invalid_request` (a 400-class rejection of the history
+                // itself) means retrying the same context can never succeed.
                 retryable: err instanceof MembraneError ? err.retryable : undefined,
+                errorType: err instanceof MembraneError ? err.type : undefined,
               });
               this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
@@ -4121,6 +4128,7 @@ export class AgentFramework {
         (event.agentName as string) ?? 'unknown',
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
+        event.errorType as string | undefined,
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
@@ -4163,7 +4171,7 @@ export class AgentFramework {
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
-   *   4. breaker — when the failures are known NON-retryable (a 400-class
+   *   4. breaker — when the failures are an `invalid_request` (a 400-class
    *      rejection of the history itself, e.g. corrupted tool_use/tool_result
    *      pairing or an oversized attachment), retrying the same context can
    *      never succeed: every new push event wakes the agent onto the same
@@ -4173,7 +4181,12 @@ export class AgentFramework {
    *      tool_use/thinking block) and retry, bounded by the same rewind cap so
    *      the breaker can never eat the whole history.
    */
-  private noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean): void {
+  private noteInferenceExhausted(
+    agentName: string,
+    reason: string,
+    retryable?: boolean,
+    errorType?: string,
+  ): void {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
 
@@ -4209,9 +4222,16 @@ export class AgentFramework {
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
 
-      // (4) Poison-history breaker: only for known NON-retryable failures —
-      // a transient outage (overloaded/5xx) must never cost history.
-      if (retryable === false && agent) {
+      // (4) Poison-history breaker: ONLY for `invalid_request` — a 400-class
+      // rejection of the history itself. Deliberately NOT keyed on
+      // `retryable === false`, which membrane also returns for auth (expired
+      // key), abort (deliberate cancel), context_length (compression's job,
+      // and shedding newest is the wrong direction), safety and unsupported —
+      // none of which mean the history is poisoned, and all of which would
+      // otherwise shed good exchanges and stamp a false "the API kept
+      // rejecting your history" marker. `retryable` is kept only for the trace.
+      void retryable;
+      if (errorType === 'invalid_request' && agent) {
         this.quarantinePoisonedHistory(agent, reason);
       }
     }
@@ -4775,6 +4795,24 @@ export class AgentFramework {
       });
     });
 
+    // A late response to a tools/call that already timed out, carrying
+    // stateful data the server advanced to. The host can't re-inject it (the
+    // dispatch context is gone), but surfacing it makes the checkpoint-tree
+    // divergence greppable instead of a silent drift into stale state.
+    connection.on('orphaned-response', (info: {
+      id: string | number;
+      hadState: boolean;
+      hadCheckpoint: boolean;
+    }) => {
+      this.emitTrace({
+        type: 'mcpl:orphaned-response',
+        serverId: connection.id,
+        responseId: info.id,
+        hadState: info.hadState,
+        hadCheckpoint: info.hadCheckpoint,
+      });
+    });
+
     // Connection-level errors (e.g. child process 'error' after spawn).
     // Attaching this listener also keeps an unhandled EventEmitter 'error'
     // from crashing the host process.
@@ -4787,18 +4825,16 @@ export class AgentFramework {
     });
 
     // Cleanup on disconnect. Feature-set state is always dropped (the server
-    // can't be validated while down; reconnect re-registers it), but checkpoint
-    // trees are durable state: CheckpointManager.removeServer deletes them AND
-    // persists the deletion to Chronicle, so calling it on a TRANSIENT close
-    // would let a single crash/blip permanently destroy every checkpoint the
-    // server had. Only destroy checkpoints when the disconnect is permanent
-    // (explicit close / no reconnect loop); disconnectMcplServer also removes
-    // them explicitly for the already-closed-stub path.
+    // can't be validated while down; reconnect re-registers it). Checkpoint
+    // trees, however, are durable state: CheckpointManager.removeServer deletes
+    // them AND persists the deletion to Chronicle. The close handler must
+    // therefore NEVER destroy checkpoints — `willReconnect` is false on a clean
+    // stop() too (reconnectEnabled is cleared before 'close' fires), so gating
+    // on it would erase every checkpoint tree on an ordinary host restart while
+    // a SIGKILL preserves them. Permanent removal is owned solely by
+    // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
-      if (!connection.willReconnect) {
-        this.checkpointManager?.removeServer(connection.id);
-      }
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,

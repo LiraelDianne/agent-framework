@@ -8,7 +8,7 @@
  * registry default was raised to 15s. Fail-open behavior is preserved for
  * modules that actually exceed their budget.
  */
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { ModuleRegistry } from '../src/module-registry.js';
 import type { Module } from '../src/types/index.js';
@@ -77,6 +77,41 @@ test('modules without contextTimeoutMs use the shared default; fast ones are una
     assert.deepEqual(injections[0].content, [{ type: 'text', text: 'from fast' }]);
   } finally {
     console.error = orig;
+  }
+});
+
+test('a self-declared contextTimeoutMs is CLAMPED so no module can hold every turn hostage', async () => {
+  // A module declaring an absurd 10-minute budget must still be cut off at the
+  // 30s ceiling, or one wedged module stalls every inference turn of every
+  // agent. Fake timers so the test doesn't actually wait 30s.
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errs: string[] = [];
+  const orig = console.error;
+  console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
+  try {
+    const hanging: Module = {
+      name: 'wedged',
+      contextTimeoutMs: 600_000, // 10 minutes — must be clamped to 30s
+      start: async () => {},
+      stop: async () => {},
+      getTools: () => [],
+      handleToolCall: async () => ({ success: true }),
+      onProcess: async () => ({}),
+      gatherContext: () => new Promise(() => {}), // never resolves
+    };
+    const registry = makeRegistry([hanging]);
+    const p = registry.gatherContext('agent', 5000);
+    // Advance to the 30s ceiling; if the budget weren't clamped, nothing fires.
+    mock.timers.tick(30_000);
+    const injections = await p;
+    assert.equal(injections.length, 0, 'the wedged module fails open at the ceiling');
+    assert.ok(
+      errs.some((e) => e.includes('[wedged]') && e.includes('timed out after 30000ms')),
+      `expected clamp to 30000ms, saw: ${errs.join(' | ')}`,
+    );
+  } finally {
+    console.error = orig;
+    mock.timers.reset();
   }
 });
 

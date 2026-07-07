@@ -65,14 +65,14 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
 
-test('at the threshold, non-retryable failures trigger an automatic rewind + retry', () => {
+test('at the threshold, invalid_request failures trigger an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
   try {
-    fw.noteInferenceExhausted('cairn', REASON, false); // 1
-    fw.noteInferenceExhausted('cairn', REASON, false); // 2
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 1
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 2
     assert.equal(removed.length, 0, 'no rewind before the threshold');
 
-    fw.noteInferenceExhausted('cairn', REASON, false); // 3 → breaker trips
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 3 → breaker trips
   } finally { restore(); }
 
   // The poisoned tool exchange was shed as a COMPLETE pair (no orphans).
@@ -95,11 +95,33 @@ test('at the threshold, non-retryable failures trigger an automatic rewind + ret
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {
-    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true);
-    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', 'weird transport error', undefined);
+    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true, 'server');
+    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', 'weird transport error', undefined, undefined);
   } finally { restore(); }
   assert.equal(removed.length, 0, 'transient failures must not consume history');
   assert.equal(fw.pendingRequests.length, 0);
+});
+
+test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER shed history', () => {
+  // The breaker keys on the membrane error TYPE, not on `retryable`. membrane
+  // marks auth (expired key), context_length, abort, safety and unsupported all
+  // non-retryable — but none of them mean the history is poisoned. Shedding
+  // good exchanges + stamping a false "the API kept rejecting your history"
+  // marker on an expired API key is exactly the category error this guards.
+  for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
+    const { fw, removed, added, restore } = makeHarness();
+    try {
+      // Well past the hard-down threshold, all with retryable === false.
+      for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', `non-retryable ${errorType}`, false, errorType);
+    } finally { restore(); }
+    assert.equal(removed.length, 0, `${errorType}: history must not be shed`);
+    assert.equal(fw.pendingRequests.length, 0, `${errorType}: no rewind-retry queued`);
+    assert.equal(
+      added.filter((m) => m.meta.kind === 'refusal-rewind').length,
+      0,
+      `${errorType}: no false rejection marker`,
+    );
+  }
 });
 
 test('the breaker is capped: repeated failures stop shedding at maxRewinds', () => {
@@ -115,7 +137,7 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   try {
     // 10 consecutive non-retryable failures: the breaker fires from streak 3 on,
     // but only sheds up to the cap (2), then holds.
-    for (let i = 0; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false);
+    for (let i = 0; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
   } finally { restore(); }
 
   assert.equal(removed.length, 2, `cap of 2 respected, shed: ${removed.join(', ')}`);
@@ -128,9 +150,9 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
 test('a successful inference resets both the streak and the rewind budget', () => {
   const { fw, removed, restore } = makeHarness();
   try {
-    fw.noteInferenceExhausted('cairn', REASON, false);
-    fw.noteInferenceExhausted('cairn', REASON, false);
-    fw.noteInferenceExhausted('cairn', REASON, false); // shed #1
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // shed #1
     assert.equal(removed.length, 2); // one complete tool exchange
 
     fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
@@ -146,7 +168,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
     ],
   });
   try {
-    for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', REASON, false);
+    for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
   } finally { restore(); }
   assert.equal(removed.length, 0);
   assert.equal(fw.pendingRequests.length, 0, 'no retry queued when nothing was repaired');

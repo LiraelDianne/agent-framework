@@ -100,6 +100,20 @@ test('requestTimeoutMs: 0 disables the per-request watchdog', async () => {
   assert.equal(settled, true);
 });
 
+test('the timeout error warns the model the tool may have completed server-side', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 150 }), HOST_CAPS);
+  connection.ready();
+  await assert.rejects(
+    connection.sendToolsCall('stuck', {}),
+    (err: Error) => {
+      // The model reads this string; it must not imply the call was cancelled.
+      assert.match(err.message, /may still have completed server-side/);
+      assert.match(err.message, /verify state before retrying/);
+      return true;
+    },
+  );
+});
+
 test('a timed-out request that later receives a response does not crash (orphaned response ignored)', async () => {
   // Server that answers tools/call after 500ms — beyond a 100ms timeout.
   const SLOW_SERVER = HUNG_SERVER.replace(
@@ -115,6 +129,34 @@ test('a timed-out request that later receives a response does not crash (orphane
   await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
   // Wait past the server's late response; it must be ignored, not crash.
   await new Promise((r) => setTimeout(r, 600));
+  const list = await connection.sendToolsList();
+  assert.equal(list.tools.length, 1);
+});
+
+test('a late STATEFUL orphaned response is surfaced via mcpl:orphaned-response (not silently dropped)', async () => {
+  // Server answers tools/call after 500ms with a checkpoint-carrying result —
+  // beyond a 100ms timeout. The host advanced no checkpoint; the server did.
+  // That divergence must be greppable, so the connection emits an event.
+  const STATEFUL_SLOW = HUNG_SERVER.replace(
+    '// tools/call: deliberately NO response, connection stays open.',
+    "else if (m.method === 'tools/call') setTimeout(() => reply({ content: [], state: { checkpoint: 'cp-late', data: { n: 1 } } }), 500);",
+  );
+  connection = await McplServerConnection.connect(
+    { id: 'slow-stateful', command: process.execPath, args: ['-e', STATEFUL_SLOW], requestTimeoutMs: 100 },
+    HOST_CAPS,
+  );
+  connection.ready();
+
+  const orphaned: Array<{ hadState: boolean; hadCheckpoint: boolean }> = [];
+  connection.on('orphaned-response', (info) => orphaned.push(info));
+
+  await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
+  await new Promise((r) => setTimeout(r, 600));
+
+  assert.equal(orphaned.length, 1, 'the dropped stateful response must be surfaced');
+  assert.equal(orphaned[0].hadState, true, 'the event records that state was carried');
+
+  // The connection still works afterwards.
   const list = await connection.sendToolsList();
   assert.equal(list.tools.length, 1);
 });
