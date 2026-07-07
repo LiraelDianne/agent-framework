@@ -45,6 +45,22 @@ export interface AgentConfig {
   /** Per-agent context compile budget (input tokens). When unset, the
    *  ContextManager's built-in default (100k) applies. */
   contextBudgetTokens?: number;
+
+  /**
+   * Prompt-cache TTL forwarded to the provider (Anthropic `cache_control.ttl`).
+   * '5m' (provider default) or '1h'. When unset, Membrane's default applies.
+   *
+   * Why you'd set '1h': for persistent agents whose conversational cadence is
+   * slower than 5 minutes, the default TTL expires between turns and the full
+   * context is re-WRITTEN to cache on nearly every call. Cache writes carry a
+   * premium (1.25x base input for 5m, 2x for 1h) while reads cost 0.1x — so a
+   * chatty-but-not-rapid agent pays the write premium over and over. With '1h'
+   * the write happens once per idle-hour and subsequent turns hit cache reads;
+   * in practice cache writes can dominate spend for slow-cadence agents.
+   * Keep '5m' (or unset) for high-frequency loops with sub-5-minute cadence,
+   * where the cheaper write premium wins.
+   */
+  cacheTtl?: '5m' | '1h';
   /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
