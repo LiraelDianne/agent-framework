@@ -55,9 +55,8 @@ export interface AgentConfig {
    * context is re-WRITTEN to cache on nearly every call. Cache writes carry a
    * premium (1.25x base input for 5m, 2x for 1h) while reads cost 0.1x — so a
    * chatty-but-not-rapid agent pays the write premium over and over. With '1h'
-   * the write happens once per idle-hour and subsequent turns hit cache reads.
-   * Measured on a production resident (day one, ~130k live context, replies
-   * minutes apart): 85% of total spend was cache writes under the 5m default.
+   * the write happens once per idle-hour and subsequent turns hit cache reads;
+   * in practice cache writes can dominate spend for slow-cadence agents.
    * Keep '5m' (or unset) for high-frequency loops with sub-5-minute cadence,
    * where the cheaper write premium wins.
    */
