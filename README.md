@@ -206,6 +206,11 @@ framework.onTrace((event) => {
 });
 ```
 
+Trace events are observability-only. They are intended for logs, metrics, UI
+updates, and debugging, not framework-internal control flow. Internal lifecycle
+code should use state-machine signals or process events instead of consuming
+traces, so trace emit order does not become an API contract.
+
 Query raw inference logs:
 
 ```typescript
