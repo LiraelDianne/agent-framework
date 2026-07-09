@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -216,6 +217,10 @@ export class AgentFramework {
   private traceListeners: TraceEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
+  private staleWarnAt = new Map<string, number>();
+  /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
+  private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
@@ -467,6 +472,28 @@ export class AgentFramework {
       }
 
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
+    }
+
+    // Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
+    // (journal) without a restart. Shows the gate's `inferring` set + buffered-
+    // event count (the wake-wedge signature), active streams, pending requests.
+    try {
+      process.on('SIGUSR2', () => {
+        try {
+          const gate = framework.eventGate?.inferenceDiagnostics() ?? null;
+          console.error('[diagnostics] ' + JSON.stringify({
+            at: new Date().toISOString(),
+            gate,
+            activeStreams: [...framework.activeStreams.keys()],
+            pendingRequests: framework.pendingRequests.length,
+            agents: [...framework.agents.keys()],
+          }));
+        } catch (err) {
+          console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
+        }
+      });
+    } catch {
+      // SIGUSR2 not available on this platform — non-fatal.
     }
 
     return framework;
@@ -2439,6 +2466,7 @@ export class AgentFramework {
           requestCount: requests.length,
           oldestRequestAge: now - oldest,
         });
+        console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
         continue;
       }
 
@@ -2454,6 +2482,14 @@ export class AgentFramework {
             requestCount: requests.length,
             oldestRequestAge: now - oldest,
           });
+          // Loud (but throttled) note that requests are waiting on a busy agent.
+          if ((this.staleWarnAt.get(agentName) ?? 0) < now - 60_000) {
+            this.staleWarnAt.set(agentName, now);
+            console.error(
+              `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
+              `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
+            );
+          }
         }
         this.pendingRequests.push(...requests);
         continue;
@@ -2461,6 +2497,13 @@ export class AgentFramework {
 
       // Check policy
       if (!this.inferencePolicy.shouldInfer(agentName, requests, state)) {
+        // Loud drop: a queued request that dies here is otherwise invisible —
+        // the 2026-07-09 mythos "not responding" diagnosis burned hours on
+        // exactly this class of silent drop. One stderr line per drop.
+        console.error(
+          `[inference-dropped] agent=${agentName} reason=policy-skip ` +
+          `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
+        );
         continue;
       }
 
@@ -2479,6 +2522,7 @@ export class AgentFramework {
 
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
     this.eventGate?.onInferenceStarted(agent.name);
+    this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     try {
       const allTools = this.getAllTools();
@@ -3009,6 +3053,14 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // Clear the gate's inference flag on EVERY exit path (paired with the
+      // onInferenceStarted in startAgentStream). Branch-level calls are kept but
+      // best-effort; an exit path that bypassed them left the agent stuck in the
+      // gate's `inferring` set → all incoming events BUFFER and never trigger (a
+      // silent wake-wedge). onInferenceEnded is idempotent, so this is safe.
+      this.eventGate?.onInferenceEnded(agent.name);
+      this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
       this.channelRegistry?.stopTyping();
@@ -3455,12 +3507,44 @@ export class AgentFramework {
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
    */
+  /**
+   * Live health snapshot for /healthz and doctor tooling: gate state, queued
+   * work, per-agent status + last inference activity. Cheap and read-only.
+   */
+  healthSnapshot(): Record<string, unknown> {
+    return {
+      at: new Date().toISOString(),
+      uptimeSec: Math.round(process.uptime()),
+      gate: this.eventGate?.inferenceDiagnostics() ?? null,
+      pendingRequests: this.pendingRequests.length,
+      activeStreams: [...this.activeStreams.keys()],
+      agents: [...this.agents.entries()].map(([name, agent]) => ({
+        name,
+        status: agent.state.status,
+        consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
+        lastInference: this.lastInferenceAt.get(name) ?? null,
+      })),
+    };
+  }
+
   private noteInferenceExhausted(agentName: string, reason: string): void {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+
+    // (1b) Machine-greppable durable record, independent of journald/unit log
+    // redirects: logs/failures.log under the host's working directory. This is
+    // what connectome-doctor reads.
+    try {
+      mkdirSync('logs', { recursive: true });
+      appendFileSync(
+        'logs/failures.log',
+        JSON.stringify({ at: new Date().toISOString(), agent: agentName, consecutive: streak, reason }) + '\n',
+      );
+    } catch { /* best-effort */ }
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
@@ -3490,6 +3574,17 @@ export class AgentFramework {
         `[inference-hard-down] agent=${agentName} has FAILED ${streak} consecutive ` +
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
+      // Optional ops alert: set CONNECTOME_OPS_WEBHOOK to a Discord webhook URL.
+      const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+      if (hook) {
+        fetch(hook, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            content: `\u{1F6A8} **${agentName}** hard-down: ${streak} consecutive inference failures.\nLast reason: ${reason.slice(0, 500)}`,
+          }),
+        }).catch((err) => console.error('[inference-hard-down] webhook post failed:', err instanceof Error ? err.message : err));
+      }
     }
   }
 
@@ -4078,7 +4173,7 @@ export class AgentFramework {
       return;
     }
 
-    const { until } = gate.setSleep(seconds, input.message);
+    const { until } = gate.setSleep(seconds, input.message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`

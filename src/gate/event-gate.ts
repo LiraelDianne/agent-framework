@@ -336,6 +336,8 @@ export class EventGate {
   private sleepUntil = 0;
   private sleepNote: string | undefined;
   private sleepSuppressed = 0;
+  private sleepTimer: ReturnType<typeof setTimeout> | null = null;
+  private sleepAgent: string | undefined;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -955,6 +957,16 @@ export class EventGate {
     }
   }
 
+  /** Live inference-gating snapshot for diagnostics (SIGUSR2 dump). A non-empty
+   *  `inferring` with growing `bufferedEvents` is the wake-wedge signature. */
+  inferenceDiagnostics(): { inferring: string[]; bufferedEvents: number; sleepUntil: number } {
+    return {
+      inferring: [...this.inferring],
+      bufferedEvents: this.inferenceBuffer.length,
+      sleepUntil: this.sleepUntil,
+    };
+  }
+
   // =========================================================================
   // Inference buffer cap
   // =========================================================================
@@ -978,11 +990,14 @@ export class EventGate {
   // =========================================================================
 
   /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string): { until: number } {
+  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
     this.sleepNote = note;
+    this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
+    if (this.sleepTimer) clearTimeout(this.sleepTimer);
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1000,7 +1015,30 @@ export class EventGate {
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
     this.sleepNote = undefined;
+    this.sleepAgent = undefined;
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     return wasAsleep;
+  }
+
+  private wakeFromSleep(reason: string): void {
+    this.sleepTimer = null;
+    if (this.sleepUntil === 0 || this.sleepUntil > this.now()) return;
+    const note = this.sleepNote;
+    const agent = this.sleepAgent;
+    this.sleepUntil = 0;
+    this.sleepNote = undefined;
+    this.sleepAgent = undefined;
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'sleep:expired',
+      matchedPolicy: 'asleep',
+      trigger: true,
+      behavior: 'always',
+      timestamp: this.now(),
+    });
+    const detail = note ? `${reason}: ${note}` : reason;
+    const targets = agent ? [agent] : this.getAgentNamesFn();
+    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
   }
 
   /** Current sleep state, or null if awake. */
