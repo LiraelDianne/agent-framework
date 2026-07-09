@@ -10,6 +10,7 @@ import { AgentFramework } from '../src/framework.js';
 function makeHarness() {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map<string, number>();
+  fw.lastInferenceAt = new Map<string, unknown>();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
