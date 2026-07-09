@@ -220,6 +220,13 @@ interface RewindRecord {
   discordRef?: { channelId: string; messageId: string };
 }
 
+/** Cap an API error message for inline use in a rewind marker: keep enough to
+ *  identify the failure class without pasting a wall of provider JSON into the
+ *  agent's context. */
+function truncateReason(reason: string, max = 160): string {
+  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -263,6 +270,11 @@ export class AgentFramework {
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
+  /** Per-agent count of poison-history rewinds performed by the hard-down
+   *  breaker (noteInferenceExhausted). Reset on any successful inference.
+   *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
+   *  the refusal loop, so the breaker can never shed the whole history. */
+  private exhaustionRewinds: Map<string, number> = new Map();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -1471,15 +1483,24 @@ export class AgentFramework {
    * sits at the tail giving the model something actionable to answer once the
    * refusal clears. Returns the running count.
    */
-  private updateRewindMarker(agent: Agent, category: string): number {
+  private updateRewindMarker(
+    agent: Agent,
+    category: string,
+    cause: 'refusal' | 'inference-failure' = 'refusal',
+  ): number {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
+    const why = cause === 'refusal'
+      ? `the model refused on them (content filter: ${category}). Their content is ` +
+        `not reproduced here (so this note can't re-trigger the filter); the ` +
+        `originals remain in the raw record`
+      : `the model API kept rejecting the conversation on them (${category}). ` +
+        `Their content is not reproduced here (so this note can't re-trigger the ` +
+        `rejection); the originals remain in the raw record`;
     const text =
       `[refusal-rewind] The ${count} most recent turn(s) were set aside because ` +
-      `the model refused on them (content filter: ${category}). Their content is ` +
-      `not reproduced here (so this note can't re-trigger the filter); the ` +
-      `originals remain in the raw record. You are clear to continue — if you ` +
+      `${why}. You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -1488,7 +1509,7 @@ export class AgentFramework {
       this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
     } else {
       const id = cm.addMessage('user', blocks, {
-        system: true, kind: 'refusal-rewind', category, count,
+        system: true, kind: 'refusal-rewind', category, count, cause,
       });
       this.rewindEpisode.set(agent.name, { markerId: id, count, category });
     }
@@ -3098,7 +3119,8 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
-      // Module gatherContext (fail-open, 5s timeout per module)
+      // Module gatherContext (fail-open, per-module timeout — the module's
+      // contextTimeoutMs, else the registry default)
       // NOTE: module injections are NOT channel-scoped — only the MCPL hook
       // injections below pass through scopeInjectionsForAgent (channel
       // context arrives via beforeInference hooks by adapter convention). A
@@ -3152,6 +3174,13 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
+          // Drives the poison-history breaker. `retryable` is kept for
+          // observability, but the breaker gates on `errorType` — only an
+          // `invalid_request` (a 400-class rejection of the history itself)
+          // means retrying the same context can never succeed. auth/abort/
+          // context_length are also non-retryable but must NOT cost history.
+          retryable: err instanceof MembraneError ? err.retryable : undefined,
+          errorType: err instanceof MembraneError ? err.type : undefined,
         });
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
@@ -3659,6 +3688,12 @@ export class AgentFramework {
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: err.message,
+                // Drives the poison-history breaker. `retryable` is kept for
+                // observability, but the breaker gates on `errorType` — only an
+                // `invalid_request` (a 400-class rejection of the history
+                // itself) means retrying the same context can never succeed.
+                retryable: err instanceof MembraneError ? err.retryable : undefined,
+                errorType: err instanceof MembraneError ? err.type : undefined,
               });
               this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
@@ -3816,7 +3851,10 @@ export class AgentFramework {
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
     }
-    let content = JSON.stringify(afResult.data);
+    // JSON.stringify returns the VALUE undefined (not a string) for undefined
+    // input — a module tool returning `{ success: true }` with no data would
+    // otherwise make `content.length` below throw a TypeError mid-turn.
+    let content = JSON.stringify(afResult.data) ?? '';
     if (maxChars && content.length > maxChars) {
       content = safeSlice(content, 0, maxChars)
         + '\n\n[truncated — original was ' + content.length + ' chars]';
@@ -4146,13 +4184,19 @@ export class AgentFramework {
       this.noteInferenceExhausted(
         (event.agentName as string) ?? 'unknown',
         (event.error as string) ?? 'unknown error',
+        event.retryable as boolean | undefined,
+        event.errorType as string | undefined,
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
-      // agent isn't hard-down; clear its consecutive-failure streak.
+      // agent isn't hard-down; clear its consecutive-failure streak (and the
+      // poison-history breaker's rewind budget).
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
         this.consecutiveInferenceFailures.set(name, 0);
+      }
+      if (name && this.exhaustionRewinds.get(name)) {
+        this.exhaustionRewinds.set(name, 0);
       }
     }
 
@@ -4184,6 +4228,15 @@ export class AgentFramework {
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
+   *   4. breaker — when the failures are an `invalid_request` (a 400-class
+   *      rejection of the history itself, e.g. corrupted tool_use/tool_result
+   *      pairing or an oversized attachment), retrying the same context can
+   *      never succeed: every new push event wakes the agent onto the same
+   *      poisoned history forever. At the hard-down threshold, automatically
+   *      quarantine: shed the newest complete exchange (the same forced-rewind
+   *      primitive `/unstick` uses — shedNewestTurn never orphans a
+   *      tool_use/thinking block) and retry, bounded by the same rewind cap so
+   *      the breaker can never eat the whole history.
    */
   /**
    * Live health snapshot for /healthz and doctor tooling: gate state, queued
@@ -4205,7 +4258,12 @@ export class AgentFramework {
     };
   }
 
-  private noteInferenceExhausted(agentName: string, reason: string): void {
+  private noteInferenceExhausted(
+    agentName: string,
+    reason: string,
+    retryable?: boolean,
+    errorType?: string,
+  ): void {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
@@ -4252,6 +4310,7 @@ export class AgentFramework {
         `[inference-hard-down] agent=${agentName} has FAILED ${streak} consecutive ` +
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
+
       // Optional ops alert: set CONNECTOME_OPS_WEBHOOK to a Discord webhook URL.
       const hook = process.env.CONNECTOME_OPS_WEBHOOK;
       if (hook) {
@@ -4263,7 +4322,70 @@ export class AgentFramework {
           }),
         }).catch((err) => console.error('[inference-hard-down] webhook post failed:', err instanceof Error ? err.message : err));
       }
+
+      // (4) Poison-history breaker: ONLY for `invalid_request` — a 400-class
+      // rejection of the history itself. Deliberately NOT keyed on
+      // `retryable === false`, which membrane also returns for auth (expired
+      // key), abort (deliberate cancel), context_length (compression's job,
+      // and shedding newest is the wrong direction), safety and unsupported —
+      // none of which mean the history is poisoned, and all of which would
+      // otherwise shed good exchanges and stamp a false "the API kept
+      // rejecting your history" marker. `retryable` is kept only for the trace.
+      void retryable;
+      if (errorType === 'invalid_request' && agent) {
+        this.quarantinePoisonedHistory(agent, reason);
+      }
     }
+  }
+
+  /**
+   * Automatic poison-history quarantine (the actual "breaker"). Sheds the
+   * newest complete exchange from the agent's history — reusing the same
+   * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
+   * the single consolidated episode marker) — and queues a retry so the
+   * rewound history is verified immediately instead of waiting for the next
+   * push event to wake the agent onto the same poisoned context.
+   *
+   * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
+   * sheds per failure episode; the budget resets on any successful inference.
+   * At the cap (or with nothing left to shed) it stops — the agent stays up
+   * and hard-down logging continues, but no further history is consumed.
+   */
+  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+    const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
+    const used = this.exhaustionRewinds.get(agent.name) ?? 0;
+    if (used >= cap) {
+      console.error(
+        `[inference-rewind] agent=${agent.name} rewind cap ${cap} reached — ` +
+        `not shedding further history. Manual repair (/unstick or /undo) needed.`,
+      );
+      return;
+    }
+
+    const rec = this.shedNewestTurn(agent);
+    if (!rec) {
+      console.error(
+        `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
+        `history is only system markers. Manual repair needed.`,
+      );
+      return;
+    }
+
+    this.exhaustionRewinds.set(agent.name, used + 1);
+    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    console.error(
+      `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
+      `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
+      `inference failures — retrying on the rewound history.`,
+    );
+
+    // Retry immediately on the repaired history (bounded by the cap above).
+    this.pendingRequests.push({
+      agentName: agent.name,
+      reason: 'inference-failure-rewind-retry',
+      source: 'framework',
+      timestamp: Date.now(),
+    });
   }
 
   // ==========================================================================
@@ -4445,43 +4567,65 @@ export class AgentFramework {
     connection.ready();
 
     // Initialize feature sets if server advertises MCPL capabilities
-    if (connection.capabilities) {
-      const updateParams = this.featureSetManager!.initializeServer(
-        config.id,
-        connection.capabilities,
-        {
-          enabledFeatureSets: config.enabledFeatureSets,
-          disabledFeatureSets: config.disabledFeatureSets,
-        },
-      );
+    this.registerMcplServerFeatures(config, connection);
 
-      // Inform server which feature sets are enabled/disabled
-      if (updateParams.enabled?.length || updateParams.disabled?.length) {
-        connection.sendFeatureSetsUpdate(updateParams);
-      }
+    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+  }
 
-      // Configure scope whitelist/blacklist patterns
-      if (config.scopes) {
-        this.scopeManager!.configureAll(config.scopes);
-      }
+  /**
+   * (Re-)establish a server's host-side MCPL registration: feature-set state
+   * (plus the featureSets/update sent to the server), scope patterns, and
+   * stateful-feature-set checkpoint registration.
+   *
+   * Called on initial connect (connectMcplServerInternal) AND after every
+   * auto-reconnect. The 'close' handler drops the feature-set registration, so
+   * without the reconnect re-run FeatureSetManager.validateInbound would throw
+   * "Unknown server" forever — every push event and inference request from the
+   * revived server silently rejected until a full host restart.
+   *
+   * CheckpointManager.registerFeatureSet is idempotent (no-op for a key that
+   * already has a tree), so checkpoint trees preserved across a transient
+   * disconnect are resumed, not reset.
+   */
+  private registerMcplServerFeatures(
+    config: import('./mcpl/types.js').McplServerConfig,
+    connection: McplServerConnection,
+  ): void {
+    if (!connection.capabilities) return;
 
-      // Register stateful feature sets with checkpoint manager (Step 8)
-      if (this.checkpointManager) {
-        const declared = this.featureSetManager!.getDeclaredFeatureSets(config.id);
-        if (declared) {
-          for (const [fsName, fsDecl] of Object.entries(declared)) {
-            if (fsDecl.rollback || fsDecl.hostState) {
-              this.checkpointManager.registerFeatureSet(config.id, fsName, {
-                hostState: fsDecl.hostState ?? false,
-                rollback: fsDecl.rollback ?? false,
-              });
-            }
+    const updateParams = this.featureSetManager!.initializeServer(
+      config.id,
+      connection.capabilities,
+      {
+        enabledFeatureSets: config.enabledFeatureSets,
+        disabledFeatureSets: config.disabledFeatureSets,
+      },
+    );
+
+    // Inform server which feature sets are enabled/disabled
+    if (updateParams.enabled?.length || updateParams.disabled?.length) {
+      connection.sendFeatureSetsUpdate(updateParams);
+    }
+
+    // Configure scope whitelist/blacklist patterns
+    if (config.scopes) {
+      this.scopeManager!.configureAll(config.scopes);
+    }
+
+    // Register stateful feature sets with checkpoint manager (Step 8)
+    if (this.checkpointManager) {
+      const declared = this.featureSetManager!.getDeclaredFeatureSets(config.id);
+      if (declared) {
+        for (const [fsName, fsDecl] of Object.entries(declared)) {
+          if (fsDecl.rollback || fsDecl.hostState) {
+            this.checkpointManager.registerFeatureSet(config.id, fsName, {
+              hostState: fsDecl.hostState ?? false,
+              rollback: fsDecl.rollback ?? false,
+            });
           }
         }
       }
     }
-
-    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
 
   // ==========================================================================
@@ -4525,9 +4669,10 @@ export class AgentFramework {
   }
 
   /**
-   * Disconnect an MCPL server at runtime: close the connection (which also
-   * cleans feature sets and checkpoints via the 'close' handler), remove its
-   * channels from the registry, drop routing entries, and refresh tools.
+   * Disconnect an MCPL server at runtime: close the connection, destroy its
+   * feature-set and checkpoint state (permanent removal — unlike a transient
+   * transport close, which preserves checkpoints for the reconnect), remove
+   * its channels from the registry, drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
    */
   async disconnectMcplServer(id: string): Promise<void> {
@@ -4539,6 +4684,13 @@ export class AgentFramework {
 
     await this.mcplServerRegistry.removeServer(id);
     this.channelRegistry?.removeServer(id);
+
+    // Permanent removal: also destroy feature-set and checkpoint state
+    // explicitly. The 'close' handler usually does this, but a connection that
+    // already transiently closed (reconnect pending) emits no second 'close'
+    // from close(), and the transient path deliberately preserves checkpoints.
+    this.featureSetManager?.removeServer(id);
+    this.checkpointManager?.removeServer(id);
 
     const prefix = config?.toolPrefix ?? `mcpl--${id}`;
     this.mcplPrefixMap.delete(prefix);
@@ -4692,8 +4844,25 @@ export class AgentFramework {
       this.handleToolsListChanged(connection.id);
     });
 
-    // Also refresh tools on reconnect (server may have different tools)
+    // Re-establish full server registration on reconnect. The 'close' handler
+    // removed the feature-set state, so pushes / inference requests from the
+    // revived server would otherwise be rejected with "Unknown server" until a
+    // host restart. Re-runs the same init as the initial connect path (the
+    // fresh handshake refreshed connection.capabilities); checkpoint trees
+    // preserved across the transient close are resumed by idempotent
+    // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
+      try {
+        const config = this.mcplServerConfigs.get(connection.id);
+        if (config) {
+          this.registerMcplServerFeatures(config, connection);
+        }
+      } catch (error) {
+        console.error(
+          `MCPL server "${connection.id}" re-registration after reconnect failed:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
       this.handleToolsListChanged(connection.id);
       this.emitTrace({
         type: 'mcpl:server-reconnected',
@@ -4727,6 +4896,24 @@ export class AgentFramework {
       });
     });
 
+    // A late response to a tools/call that already timed out, carrying
+    // stateful data the server advanced to. The host can't re-inject it (the
+    // dispatch context is gone), but surfacing it makes the checkpoint-tree
+    // divergence greppable instead of a silent drift into stale state.
+    connection.on('orphaned-response', (info: {
+      id: string | number;
+      hadState: boolean;
+      hadCheckpoint: boolean;
+    }) => {
+      this.emitTrace({
+        type: 'mcpl:orphaned-response',
+        serverId: connection.id,
+        responseId: info.id,
+        hadState: info.hadState,
+        hadCheckpoint: info.hadCheckpoint,
+      });
+    });
+
     // Connection-level errors (e.g. child process 'error' after spawn).
     // Attaching this listener also keeps an unhandled EventEmitter 'error'
     // from crashing the host process.
@@ -4738,10 +4925,17 @@ export class AgentFramework {
       });
     });
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect. Feature-set state is always dropped (the server
+    // can't be validated while down; reconnect re-registers it). Checkpoint
+    // trees, however, are durable state: CheckpointManager.removeServer deletes
+    // them AND persists the deletion to Chronicle. The close handler must
+    // therefore NEVER destroy checkpoints — `willReconnect` is false on a clean
+    // stop() too (reconnectEnabled is cleared before 'close' fires), so gating
+    // on it would erase every checkpoint tree on an ordinary host restart while
+    // a SIGKILL preserves them. Permanent removal is owned solely by
+    // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
-      this.checkpointManager?.removeServer(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,

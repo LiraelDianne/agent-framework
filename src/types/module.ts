@@ -37,6 +37,15 @@ export interface Module {
   readonly name: string;
 
   /**
+   * Per-module budget (ms) for gatherContext() before the framework skips this
+   * module's injection for the turn (fail-open). Defaults to the registry-wide
+   * default (15s) when omitted. Declare a larger budget when gatherContext
+   * does real work — e.g. sequential LLM calls with provider backoff — so the
+   * injection isn't silently dropped every turn.
+   */
+  readonly contextTimeoutMs?: number;
+
+  /**
    * Start the module.
    * Called when the framework starts or when the module is added.
    */

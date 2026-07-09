@@ -248,6 +248,16 @@ export interface McplServerConfig {
   reconnectMaxIntervalMs?: number;
 
   /**
+   * Per-request timeout in milliseconds for outbound JSON-RPC requests
+   * (tools/call, tools/list, channels/*, hooks). A live-but-stuck server that
+   * accepts a request and never responds would otherwise freeze the awaiting
+   * agent turn forever; with the timeout the pending request rejects with a
+   * descriptive error, which the framework surfaces as a normal isError
+   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   */
+  requestTimeoutMs?: number;
+
+  /**
    * Optional callback to filter which incoming channel messages should trigger
    * agent inference. Receives the text content and message metadata.
    * Return true to trigger inference, false to silently accept the message.
