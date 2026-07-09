@@ -2333,6 +2333,9 @@ export class AgentFramework {
   async runUntilIdle(): Promise<void> {
     while (
       !this.queue.isEmpty ||
+      // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
+      // event queue — without this the loop can exit before they're drained.
+      this.pendingRequests.length > 0 ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
