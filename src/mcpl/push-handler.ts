@@ -171,12 +171,16 @@ export class PushHandler {
       const reason = err instanceof McplFeatureSetError
         ? err.message
         : 'Feature set validation failed';
+      // Loud rejection — a rejected push event is an agent that silently
+      // never hears the message. (2026-07-09 diagnosability pass.)
+      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${reason}`);
       responder?.respond({ accepted: false, reason });
       return;
     }
 
     // 2. Deduplicate by eventId
     if (this.dedup.checkAndAdd(params.eventId)) {
+      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });
       return;
     }
