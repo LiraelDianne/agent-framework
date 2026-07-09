@@ -468,6 +468,49 @@ class ModuleContextImpl implements ModuleContext {
     this.store.setStateJson(this.stateId, fullState);
   }
 
+  private logStateId(name: string): string {
+    if (!name || name === 'state' || name.includes('/')) {
+      throw new Error(
+        `Invalid module log state name '${name}': must be non-empty, not 'state', and contain no '/'`
+      );
+    }
+    return `${MODULE_STATE_PREFIX}${this.moduleName}/${name}`;
+  }
+
+  registerLogState(
+    name: string,
+    opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
+  ): void {
+    const id = this.logStateId(name);
+    try {
+      this.store.registerState({
+        id,
+        strategy: 'append_log',
+        deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
+        fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
+      });
+    } catch {
+      // Already registered (previous run)
+    }
+  }
+
+  appendToLog<T>(name: string, item: T): void {
+    this.store.appendToStateJson(this.logStateId(name), item);
+  }
+
+  editLogItem<T>(name: string, index: number, item: T): void {
+    this.store.editStateItem(this.logStateId(name), index, Buffer.from(JSON.stringify(item)));
+  }
+
+  getLog<T>(name: string): T[] {
+    const data = this.store.getStateJson(this.logStateId(name));
+    return Array.isArray(data) ? (data as T[]) : [];
+  }
+
+  getLogLength(name: string): number {
+    return this.store.getStateLen(this.logStateId(name)) ?? 0;
+  }
+
   getModule<T extends Module>(name: string): T | null {
     return this.registry.getModule<T>(name);
   }

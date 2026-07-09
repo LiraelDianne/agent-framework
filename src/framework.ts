@@ -298,6 +298,7 @@ export class AgentFramework {
   // Undo/redo state
   private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
   private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
+  private registeredCheckpointSlots: Set<string> = new Set(); // per-agent checkpoint state ids
 
   /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
   private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
@@ -1038,6 +1039,7 @@ export class AgentFramework {
         clearInterval(completionWatchdog);
         this.offTrace(traceListener);
         this.agents.delete(agent.name);
+        this.evictTurnCheckpoints(agent.name);
       };
 
       // Watchdog: if inference never starts within 30s, the agent is a zombie.
@@ -2270,18 +2272,58 @@ export class AgentFramework {
     this.saveTurnCheckpoints(agentName, checkpoints);
   }
 
+  /**
+   * Checkpoints live in one state slot per agent (`framework/turn-checkpoints/<name>`)
+   * rather than a single Record<agentName, TurnCheckpoint[]> map. Subagent names are
+   * unique per spawn and nothing evicted departed keys, so the map grew without bound
+   * in agents-ever-spawned — and the whole map was rewritten on every turn of every
+   * agent. A per-agent slot write is O(MAX_TURN_CHECKPOINTS), independent of fleet
+   * history. The legacy map state (TURN_CHECKPOINTS_ID) is kept as a read-only
+   * fallback for stores written before the split.
+   */
+  private ensureCheckpointSlot(agentName: string): string {
+    const id = `${TURN_CHECKPOINTS_ID}/${agentName}`;
+    if (!this.registeredCheckpointSlots.has(id)) {
+      try {
+        this.store.registerState({ id, strategy: 'snapshot' });
+      } catch {
+        // Already registered
+      }
+      this.registeredCheckpointSlots.add(id);
+    }
+    return id;
+  }
+
   private getTurnCheckpoints(agentName: string): TurnCheckpoint[] {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    if (!data || typeof data !== 'object') return [];
-    const allCheckpoints = data as Record<string, TurnCheckpoint[]>;
+    const slot = this.store.getStateJson(this.ensureCheckpointSlot(agentName));
+    if (Array.isArray(slot)) return [...slot];
+    const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+    if (!legacy || typeof legacy !== 'object') return [];
+    const allCheckpoints = legacy as Record<string, TurnCheckpoint[]>;
     return Array.isArray(allCheckpoints[agentName]) ? [...allCheckpoints[agentName]] : [];
   }
 
   private saveTurnCheckpoints(agentName: string, checkpoints: TurnCheckpoint[]): void {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    const allCheckpoints = (data && typeof data === 'object' ? data : {}) as Record<string, TurnCheckpoint[]>;
-    allCheckpoints[agentName] = checkpoints;
-    this.store.setStateJson(TURN_CHECKPOINTS_ID, allCheckpoints);
+    this.store.setStateJson(this.ensureCheckpointSlot(agentName), checkpoints);
+  }
+
+  /**
+   * Drop a departed agent's checkpoint slot and turn/redo bookkeeping. Without
+   * this, spawn-and-dispose agents leave a slot (and in-memory map entries)
+   * behind for the life of the store/session.
+   */
+  private evictTurnCheckpoints(agentName: string): void {
+    this.turnCounters.delete(agentName);
+    this.redoStacks.delete(agentName);
+    // Diagnostics maps are also keyed by agent name and never evicted —
+    // spawn-and-dispose fleets would grow them for the session's life.
+    this.staleWarnAt.delete(agentName);
+    this.lastInferenceAt.delete(agentName);
+    const id = this.ensureCheckpointSlot(agentName);
+    const slot = this.store.getStateJson(id);
+    if (Array.isArray(slot) && slot.length > 0) {
+      this.store.setStateJson(id, []);
+    }
   }
 
   /**
@@ -2823,6 +2865,7 @@ export class AgentFramework {
     this.agents.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
+    this.evictTurnCheckpoints(agentName);
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -3955,11 +3998,11 @@ export class AgentFramework {
       }
     }
 
-    // Append to the inference log state
-    const data = this.store.getStateJson(INFERENCE_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(INFERENCE_LOG_ID, entries);
+    // Append one record per inference. A read-modify-write via setStateJson
+    // would emit a whole-array Set — record size then grows with accumulated
+    // history (O(n²) aggregate disk) and the append_log strategy registered
+    // for this state never sees an append.
+    this.store.appendToStateJson(INFERENCE_LOG_ID, entryToStore);
   }
 
   private logProcessEvent(event: ProcessEvent, responses: ModuleProcessResponse[]): void {
@@ -3979,11 +4022,8 @@ export class AgentFramework {
       entryToStore.responses = { blobId };
     }
 
-    // Append to the process log state
-    const data = this.store.getStateJson(PROCESS_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(PROCESS_LOG_ID, entries);
+    // Append one record per event — same rationale as logInference.
+    this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
   /**

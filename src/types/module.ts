@@ -110,8 +110,51 @@ export interface ModuleContext {
 
   /**
    * Set persistent state for this module.
+   *
+   * This rewrites the module's full state object every call — appropriate for
+   * small, bounded state only. For accumulating collections (registries,
+   * corpora, histories) use a log state (`registerLogState`/`appendToLog`)
+   * instead: a setState of an ever-growing object makes every persisted record
+   * proportional to accumulated content, i.e. O(n²) aggregate disk.
    */
   setState<T>(state: T): void;
+
+  /**
+   * Register an auxiliary append-log state for this module, stored as
+   * `modules/<module>/<name>`. Idempotent — safe to call on every start().
+   * Items are appended with `appendToLog` (one O(item) record per append) and
+   * point-edited with `editLogItem`; Chronicle's append_log snapshot cadence
+   * handles consolidation. `name` must not be 'state' (reserved for the main
+   * snapshot state) and must not contain '/'.
+   */
+  registerLogState(
+    name: string,
+    opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
+  ): void;
+
+  /**
+   * Append one item to a log state registered via registerLogState.
+   * Record size is O(item), independent of accumulated log length.
+   */
+  appendToLog<T>(name: string, item: T): void;
+
+  /**
+   * Overwrite the item at `index` in a log state. Indices are stable —
+   * appends assign the next index and nothing is ever removed.
+   */
+  editLogItem<T>(name: string, index: number, item: T): void;
+
+  /**
+   * Read the full contents of a log state (empty array if never written).
+   * Intended for one-shot reconstruction at start(); keep hot-path reads
+   * against the in-memory copy.
+   */
+  getLog<T>(name: string): T[];
+
+  /**
+   * Number of items in a log state (0 if never written).
+   */
+  getLogLength(name: string): number;
 
   /**
    * Process queue for pushing events from external listeners.
