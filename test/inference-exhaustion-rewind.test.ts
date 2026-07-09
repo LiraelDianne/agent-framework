@@ -46,6 +46,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
   fw.rewindEpisode = new Map();
+  fw.lastInferenceAt = new Map(); // upstream last-inference tracking; noteInferenceExhausted writes it
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;

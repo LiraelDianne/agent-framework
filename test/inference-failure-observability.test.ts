@@ -13,6 +13,7 @@ function makeHarness() {
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
+  fw.lastInferenceAt = new Map(); // upstream last-inference tracking; noteInferenceExhausted writes it
   fw.pendingRequests = [];
 
   const markers: Array<{ text: string; meta: any }> = [];

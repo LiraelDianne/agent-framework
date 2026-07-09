@@ -1102,6 +1102,18 @@ export class EventGate {
     }
   }
 
+  /** Live inference-gating snapshot for diagnostics (e.g. a SIGUSR2 dump).
+   *  A non-empty `inferring` with a stale timestamp + growing `bufferedEvents`
+   *  is the signature of the wake-wedge: an agent stuck mid-"inference" so all
+   *  incoming events buffer and never trigger. */
+  inferenceDiagnostics(): { inferring: string[]; bufferedEvents: number; sleepUntil: number } {
+    return {
+      inferring: [...this.inferring],
+      bufferedEvents: this.inferenceBuffer.length,
+      sleepUntil: this.sleepUntil,
+    };
+  }
+
   // =========================================================================
   // Inference buffer cap
   // =========================================================================
