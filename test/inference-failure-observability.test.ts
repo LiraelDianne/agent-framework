@@ -11,6 +11,7 @@ function makeHarness() {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
+  fw.lastInferenceAt = new Map<string, object>();
 
   const markers: Array<{ text: string; meta: any }> = [];
   fw.agents = new Map([['cairn', {
