@@ -541,6 +541,31 @@ export class AgentFramework {
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
+    // Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
+    // (journal) without a restart — for catching the wake-wedge on the running
+    // process. Shows the gate's `inferring` set + buffered-event count (the
+    // wedge signature), active streams, and pending inference requests.
+    try {
+      process.on('SIGUSR2', () => {
+        try {
+          const gate = framework.eventGate?.inferenceDiagnostics() ?? null;
+          console.error(
+            '[diagnostics] ' + JSON.stringify({
+              at: new Date().toISOString(),
+              gate,
+              activeStreams: [...framework.activeStreams.keys()],
+              pendingRequests: framework.pendingRequests.length,
+              agents: [...framework.agents.keys()],
+            }),
+          );
+        } catch (err) {
+          console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
+        }
+      });
+    } catch {
+      // SIGUSR2 not available on this platform — non-fatal.
+    }
+
     return framework;
   }
 
@@ -3670,6 +3695,15 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // Clear the gate's inference flag on EVERY exit path (paired with the
+      // onInferenceStarted in startAgentStream). The branch-level calls above
+      // are kept but are best-effort; if any exit path bypassed them the agent
+      // stayed stuck in the gate's `inferring` set, which permanently BUFFERS
+      // all incoming events → the agent silently stops waking on messages
+      // (typing still stops, compression still runs — matching the observed
+      // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
+      this.eventGate?.onInferenceEnded(agent.name);
+
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
       this.channelRegistry?.stopTyping();
