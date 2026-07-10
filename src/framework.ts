@@ -4304,6 +4304,29 @@ export class AgentFramework {
       }
     }
 
+    // (2b) OverBudget deadlock breaker. When compile fails with
+    // OverBudgetError ("...exceed hard budget..."), the normal compression
+    // drain never runs: it is driven by successful activity, which the
+    // over-budget state prevents - a closed loop with no internal exit.
+    // Field data (2026-07-10, resident agent): 36 minutes hard-down, zero
+    // self-rescue; only an operator raising the budget externally could
+    // break the loop. Break it here instead: kick the strategy drain
+    // directly so folding/merging frees space for the next compile.
+    // Bounded ticks, best-effort, never throws.
+    if (agent && /exceed hard budget|OverBudget/i.test(reason)) {
+      (async () => {
+        try {
+          const cm = agent.getContextManager();
+          for (let i = 0; i < 8; i++) {
+            await cm.tick();
+          }
+          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, 8 ticks)`);
+        } catch (err) {
+          console.error(`[inference-failed] drain kick failed for ${agentName}:`, err);
+        }
+      })();
+    }
+
     // (3) Hard-down escalation on repeated identical failure.
     if (streak >= this.inferenceFailureEscalationThreshold) {
       console.error(
