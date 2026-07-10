@@ -336,6 +336,26 @@ export class Agent {
 
     let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
+    // Sanitize: strip empty/whitespace text blocks and drop messages left with
+    // no content. The Anthropic API rejects empty text blocks with 400
+    // "messages: text content blocks must be non-empty"; when such a block
+    // reaches a live activation request the agent cannot complete ANY turn
+    // ([inference-failed] on every attempt) until the offending message ages
+    // out of the window. Empty text blocks occur naturally: tool-only turns,
+    // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
+    // through unchanged, so tool pairing is unaffected. (Field-observed
+    // 2026-07-10 on a resident agent: one empty block muted the agent's live
+    // path entirely; twin of context-manager's stripEmptyTextBlocks on the
+    // compression path.)
+    messages = messages
+      .map((m) => ({
+        ...m,
+        content: m.content.filter(
+          (b: any) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+        ),
+      }))
+      .filter((m) => m.content.length > 0);
+
     // Safety: ensure messages don't end with an assistant message.
     // Some models reject trailing assistant messages ("prefill not supported"),
     // and after context compression a stale assistant turn can end up last.
