@@ -3646,6 +3646,7 @@ export class AgentFramework {
 
           case 'aborted': {
             if (this.turnEndedStreams.delete(`${agent.name}:${myStreamId}`)) {
+              this.eventGate?.onInferenceEnded(agent.name);
               return;
             }
             const reason = event.reason ?? 'unknown';
