@@ -836,8 +836,9 @@ export class AgentFramework {
     // Module gatherContext (fail-open, matches startAgentStream)
     try {
       const moduleInjections = await this.moduleRegistry.gatherContext(agentName);
-      if (moduleInjections.length > 0) {
-        injections = moduleInjections;
+      const scopedModuleInjections = this.scopeInjectionsForAgent(agentName, moduleInjections);
+      if (scopedModuleInjections.length > 0) {
+        injections = scopedModuleInjections;
       }
     } catch (error) {
       console.error('Module gatherContext error (preview):', error);
@@ -848,7 +849,10 @@ export class AgentFramework {
     if (this.hookOrchestrator) {
       try {
         const hookParams = this.buildBeforeInferenceParams(agent);
-        const hookInjections = await this.hookOrchestrator.beforeInference(hookParams);
+        const hookInjections = this.scopeInjectionsForAgent(
+          agentName,
+          await this.hookOrchestrator.beforeInference(hookParams),
+        );
         if (hookInjections.length > 0) {
           injections = injections ? [...injections, ...hookInjections] : hookInjections;
         }
@@ -3120,14 +3124,15 @@ export class AgentFramework {
       let injections: ContextInjection[] | undefined;
 
       // Module gatherContext (fail-open, per-module timeout — the module's
-      // contextTimeoutMs, else the registry default)
-      // NOTE: module injections are NOT channel-scoped — only the MCPL hook
-      // injections below pass through scopeInjectionsForAgent (channel
-      // context arrives via beforeInference hooks by adapter convention). A
-      // module that starts emitting per-channel context must scope it per
-      // agent itself, or conversation forks will see cross-channel content.
+      // contextTimeoutMs, else the registry default). Injections are
+      // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
+      // injections below, so conversation forks don't see cross-channel
+      // content.
       try {
-        const moduleInjections = await this.moduleRegistry.gatherContext(agent.name);
+        const moduleInjections = this.scopeInjectionsForAgent(
+          agent.name,
+          await this.moduleRegistry.gatherContext(agent.name),
+        );
         if (moduleInjections.length > 0) {
           injections = moduleInjections;
         }
