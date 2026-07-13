@@ -144,6 +144,10 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** Poll pending context-strategy maintenance independently of user activity. */
+const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
+/** Bound one pass so a large backlog yields to inference and other agents. */
+const MAINTENANCE_TICKS_PER_PASS = 8;
 
 /**
  * Extract fields the EventGate cares about from a ProcessEvent. The set of
@@ -253,6 +257,9 @@ export class AgentFramework {
   private traceListeners: TraceEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private maintenanceIntervalMs: number;
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  private maintenancePass: Promise<void> | null = null;
   /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -356,6 +363,7 @@ export class AgentFramework {
     inferencePolicy: InferencePolicy,
     errorPolicy: ErrorPolicy,
     syncIntervalMs: number,
+    maintenanceIntervalMs: number,
     processLoggingPersist: boolean,
     processLoggingBroadcast: boolean
   ) {
@@ -365,6 +373,7 @@ export class AgentFramework {
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
     this.syncIntervalMs = syncIntervalMs;
+    this.maintenanceIntervalMs = maintenanceIntervalMs;
     this.processLoggingPersist = processLoggingPersist;
     this.processLoggingBroadcast = processLoggingBroadcast;
     this.queue = new ProcessQueueImpl();
@@ -455,6 +464,7 @@ export class AgentFramework {
       config.inferencePolicy ?? new DefaultInferencePolicy(),
       config.errorPolicy ?? new DefaultErrorPolicy(),
       config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
+      config.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS,
       processLoggingPersist,
       processLoggingBroadcast
     );
@@ -610,6 +620,16 @@ export class AgentFramework {
         }
       }, this.syncIntervalMs);
     }
+
+    if (this.maintenanceIntervalMs > 0) {
+      this.maintenanceTimer = setInterval(() => {
+        this.startQueuedMaintenance();
+      }, this.maintenanceIntervalMs);
+      this.maintenanceTimer.unref?.();
+      // Do not make a restored queue wait a full interval before its first
+      // attempt. MCPL/module initialization has completed before start().
+      this.startQueuedMaintenance();
+    }
   }
 
   /**
@@ -636,6 +656,14 @@ export class AgentFramework {
     if (this.syncTimer) {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
+    }
+
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+    if (this.maintenancePass) {
+      await this.maintenancePass;
     }
 
     if (this.loopPromise) {
@@ -666,6 +694,52 @@ export class AgentFramework {
     if (this.ownsStore) {
       this.store.close();
     }
+  }
+
+  /**
+   * Advance queued ContextManager work without requiring a new message.
+   *
+   * Tool definitions are refreshed first because compression replays stored
+   * tool cycles and providers reject those requests when the corresponding
+   * schemas are absent. Passes never overlap; each agent gets a bounded drain
+   * so maintenance cannot monopolize the framework event loop.
+   */
+  private startQueuedMaintenance(): void {
+    if (this.maintenancePass || !this.running) return;
+    const pass = this.runQueuedMaintenance().catch((error) => {
+      console.error(
+        '[context-maintenance] pass failed:',
+        error instanceof Error ? error.message : error,
+      );
+    });
+    this.maintenancePass = pass;
+    void pass.finally(() => {
+      if (this.maintenancePass === pass) this.maintenancePass = null;
+    });
+  }
+
+  private async runQueuedMaintenance(): Promise<void> {
+    const allTools = this.getAllTools();
+    await Promise.all([...this.agents.values()].map(async (agent) => {
+      const cm = agent.getContextManager();
+      const tools = allTools.filter((tool) => agent.canUseTool(tool.name));
+      cm.setToolDefinitions(tools);
+
+      try {
+        for (
+          let i = 0;
+          i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
+          i++
+        ) {
+          await cm.tick();
+        }
+      } catch (error) {
+        console.error(
+          `[context-maintenance] agent=${agent.name} failed:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }));
   }
 
   /**

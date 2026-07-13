@@ -56,6 +56,13 @@ export interface FrameworkConfig {
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
 
+  /**
+   * Interval for queued context-maintenance polling in milliseconds
+   * (default: 5000ms, 0 to disable). Each pass refreshes the agent's live tool
+   * definitions, then advances pending compression/indexing work.
+   */
+  maintenanceIntervalMs?: number;
+
   /** Process logging configuration (default: disabled) */
   processLogging?: ProcessLoggingConfig;
 
