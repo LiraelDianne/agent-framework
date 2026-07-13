@@ -30,8 +30,10 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SLOPE_LIMIT = 0.3;
 const MIN_RECORDS_FOR_FIT = 8;
-/** ≥ MAX_TURN_CHECKPOINTS × generous per-checkpoint size; a whole-map rewrite
- *  under fleet load blows far past this. */
+/** Bounded-by-design families get a hard per-record ceiling instead of a
+ *  slope fit: the checkpoint tree's ops are O(key) and its periodic
+ *  consolidation snapshots are O(live keys) — both far under this, while a
+ *  whole-map rewrite under fleet load blows past it. */
 const CAPPED_MAX_RECORD_BYTES = 16 * 1024;
 const CAPPED_FAMILIES = [/^framework\/turn-checkpoints\//];
 
@@ -166,11 +168,28 @@ describe('whole-store scaling sweep (e2e)', () => {
     const processLog = families.get('framework/process-log') ?? [];
     assert.ok(inferenceLog.length >= TURNS, `inference log exercised (${inferenceLog.length} records)`);
     assert.ok(processLog.length >= TURNS, `process log exercised (${processLog.length} records)`);
-    const checkpointSlots = [...families.keys()].filter((id) => id.startsWith('framework/turn-checkpoints/'));
-    assert.ok(checkpointSlots.length >= SPAWNS, `per-agent checkpoint slots exercised (${checkpointSlots.length})`);
+    const checkpointTree = families.get('framework/turn-checkpoints/tree') ?? [];
+    assert.ok(checkpointTree.length >= TURNS + SPAWNS, `checkpoint tree exercised (${checkpointTree.length} records)`);
 
-    // The sweep: every family, classified, no exemptions beyond the rules.
+    // Disposal actually removed the scouts' keys — the tree stays O(live
+    // agents), and no per-agent state registration leaked into chronicle's
+    // state index (which is rewritten + fsynced on every sync tick).
+    for (let s = 0; s < SPAWNS; s++) {
+      assert.strictEqual(
+        store.treeGet('framework/turn-checkpoints/tree', `e2e-scout-${s}`),
+        null,
+        `disposed scout ${s} evicted from checkpoint tree`
+      );
+    }
+    assert.ok(store.treeGet('framework/turn-checkpoints/tree', 'assistant'), 'persistent agent keeps its checkpoints');
+    const stateCount = store.listStates().length;
+    const checkpointStates = store.listStates().filter((s: { id: string }) => s.id.startsWith('framework/turn-checkpoints')).length;
+    assert.strictEqual(checkpointStates, 1, `exactly one checkpoint state registered (index has ${stateCount} states total)`);
+
+    // The sweep: every family, classified, no exemptions beyond the rules —
+    // and no silent caps: families too small for a slope fit are listed.
     const violations: string[] = [];
+    const skipped: string[] = [];
     for (const [stateId, sizes] of families) {
       if (CAPPED_FAMILIES.some((re) => re.test(stateId))) {
         const max = Math.max(...sizes);
@@ -179,7 +198,10 @@ describe('whole-store scaling sweep (e2e)', () => {
         }
         continue;
       }
-      if (sizes.length < MIN_RECORDS_FOR_FIT) continue;
+      if (sizes.length < MIN_RECORDS_FOR_FIT) {
+        skipped.push(`${stateId} (${sizes.length})`);
+        continue;
+      }
       const slope = logLogSlope(sizes);
       if (slope >= SLOPE_LIMIT) {
         violations.push(
@@ -187,6 +209,12 @@ describe('whole-store scaling sweep (e2e)', () => {
           `(${sizes[0]} B → ${sizes[sizes.length - 1]} B) — superlinear growth`
         );
       }
+    }
+    if (skipped.length > 0) {
+      console.log(
+        `[state-scaling-e2e] ${skipped.length} families below the ${MIN_RECORDS_FOR_FIT}-record fit threshold ` +
+        `(unaudited by the slope gate): ${skipped.join(', ')}`
+      );
     }
     assert.deepStrictEqual(violations, [], `superlinear state families:\n  ${violations.join('\n  ')}`);
 

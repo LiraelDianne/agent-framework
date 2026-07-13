@@ -43,7 +43,7 @@ import type {
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry } from './module-registry.js';
+import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
@@ -81,7 +81,8 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
-const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
+const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
+const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
@@ -298,7 +299,6 @@ export class AgentFramework {
   // Undo/redo state
   private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
   private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
-  private registeredCheckpointSlots: Set<string> = new Set(); // per-agent checkpoint state ids
 
   /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
   private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
@@ -422,10 +422,12 @@ export class AgentFramework {
       // Already registered
     }
 
+    // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
+    // registered for new stores — it's read-only fallback data in old ones.
     try {
-      store.registerState({ id: TURN_CHECKPOINTS_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
+      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
+    } catch (error) {
+      if (!isStateExistsError(error)) throw error;
     }
 
     // Process logging config (default: disabled)
@@ -2273,44 +2275,69 @@ export class AgentFramework {
   }
 
   /**
-   * Checkpoints live in one state slot per agent (`framework/turn-checkpoints/<name>`)
-   * rather than a single Record<agentName, TurnCheckpoint[]> map. Subagent names are
-   * unique per spawn and nothing evicted departed keys, so the map grew without bound
-   * in agents-ever-spawned — and the whole map was rewritten on every turn of every
-   * agent. A per-agent slot write is O(MAX_TURN_CHECKPOINTS), independent of fleet
-   * history. The legacy map state (TURN_CHECKPOINTS_ID) is kept as a read-only
-   * fallback for stores written before the split.
+   * Checkpoints live in one Tree state (TURN_CHECKPOINTS_TREE_ID) keyed by agent
+   * name, each key pointing at a JSON blob of that agent's ≤MAX_TURN_CHECKPOINTS
+   * list. This kills two unbounded-in-agents-ever dimensions at once:
+   *
+   *  - the original single Record<agentName, list> map was rewritten whole on
+   *    every turn of every agent and never evicted a departed subagent's key;
+   *  - the intermediate design (one state slot per agent) fixed the writes but
+   *    leaked a permanent chronicle state *registration* per spawn — chronicle
+   *    has no deregistration, and the state index is rewritten and fsynced on
+   *    every sync tick, so per-tick cost grew with fleet history anyway.
+   *
+   * A tree gives per-key O(entry) writes, real key removal (treeRemove), and
+   * exactly one registration for the life of the store. The legacy map state
+   * (TURN_CHECKPOINTS_ID) is kept as a read-only fallback for stores written
+   * before the split; eviction tombstones legacy keys so a reused agent name
+   * can't inherit a dead agent's checkpoints through the fallback.
    */
-  private ensureCheckpointSlot(agentName: string): string {
-    const id = `${TURN_CHECKPOINTS_ID}/${agentName}`;
-    if (!this.registeredCheckpointSlots.has(id)) {
-      try {
-        this.store.registerState({ id, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
-      this.registeredCheckpointSlots.add(id);
+  private legacyCheckpointKeys: Set<string> | null = null;
+
+  private hasLegacyCheckpoints(agentName: string): boolean {
+    if (!this.legacyCheckpointKeys) {
+      const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+      this.legacyCheckpointKeys = new Set(
+        legacy && typeof legacy === 'object' ? Object.keys(legacy) : []
+      );
     }
-    return id;
+    return this.legacyCheckpointKeys.has(agentName);
   }
 
   private getTurnCheckpoints(agentName: string): TurnCheckpoint[] {
-    const slot = this.store.getStateJson(this.ensureCheckpointSlot(agentName));
-    if (Array.isArray(slot)) return [...slot];
-    const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    if (!legacy || typeof legacy !== 'object') return [];
-    const allCheckpoints = legacy as Record<string, TurnCheckpoint[]>;
-    return Array.isArray(allCheckpoints[agentName]) ? [...allCheckpoints[agentName]] : [];
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (entry) {
+      const blob = this.store.getBlob(entry.blobHash);
+      if (!blob) return [];
+      try {
+        const parsed = JSON.parse(blob.toString());
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (!this.hasLegacyCheckpoints(agentName)) return [];
+    const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID) as
+      | Record<string, TurnCheckpoint[]>
+      | null;
+    const list = legacy?.[agentName];
+    return Array.isArray(list) ? [...list] : [];
   }
 
   private saveTurnCheckpoints(agentName: string, checkpoints: TurnCheckpoint[]): void {
-    this.store.setStateJson(this.ensureCheckpointSlot(agentName), checkpoints);
+    const bytes = Buffer.from(JSON.stringify(checkpoints));
+    const blobHash = this.store.storeBlob(bytes, 'application/json');
+    this.store.treeSet(TURN_CHECKPOINTS_TREE_ID, agentName, {
+      blobHash,
+      size: bytes.length,
+      mode: 0o644,
+    });
   }
 
   /**
-   * Drop a departed agent's checkpoint slot and turn/redo bookkeeping. Without
-   * this, spawn-and-dispose agents leave a slot (and in-memory map entries)
-   * behind for the life of the store/session.
+   * Drop a departed agent's checkpoint tree key and turn/redo bookkeeping.
+   * Without this, spawn-and-dispose agents leave a key (and in-memory map
+   * entries) behind for the life of the store/session.
    */
   private evictTurnCheckpoints(agentName: string): void {
     this.turnCounters.delete(agentName);
@@ -2319,10 +2346,18 @@ export class AgentFramework {
     // spawn-and-dispose fleets would grow them for the session's life.
     this.staleWarnAt.delete(agentName);
     this.lastInferenceAt.delete(agentName);
-    const id = this.ensureCheckpointSlot(agentName);
-    const slot = this.store.getStateJson(id);
-    if (Array.isArray(slot) && slot.length > 0) {
-      this.store.setStateJson(id, []);
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (this.hasLegacyCheckpoints(agentName)) {
+      // A bare treeRemove would resurrect the legacy map's list through the
+      // fallback next time this name is reused — shadow it with an empty
+      // tombstone instead. size <= 2 ⇔ the blob is already "[]".
+      if (!entry || entry.size > 2) {
+        this.saveTurnCheckpoints(agentName, []);
+      }
+      return;
+    }
+    if (entry) {
+      this.store.treeRemove(TURN_CHECKPOINTS_TREE_ID, agentName);
     }
   }
 

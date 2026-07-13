@@ -21,6 +21,7 @@ import { MockMembrane } from './helpers/mock-membrane.js';
 
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
+const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /**
  * Payload sizes of all state_update records for states matching `match`,
@@ -134,7 +135,7 @@ describe('state scaling regression gates', () => {
     await framework.stop();
   });
 
-  it('turn checkpoints: record size is independent of agents-ever-spawned', async () => {
+  it('turn checkpoints: record size and state count independent of agents-ever-spawned', async () => {
     const storePath = join(tempDir, 'checkpoints.chronicle');
     const framework = await createFramework(storePath);
     const store = framework.getStore();
@@ -153,22 +154,31 @@ describe('state scaling regression gates', () => {
       (framework as any).recordTurnCheckpoint('assistant');
     }
 
-    const sizes = stateUpdateSizes(store, (id) => id.startsWith(`${TURN_CHECKPOINTS_ID}/`));
-    // Every write is one agent's ≤MAX_TURN_CHECKPOINTS list: flat across the
-    // whole run even though M unique agents came and went.
-    assertFlat(sizes, `${TURN_CHECKPOINTS_ID}/*`, 4);
+    // Every write is one tree op (path + blob hash): flat across the whole
+    // run even though M unique agents came and went.
+    const sizes = stateUpdateSizes(store, (id) => id === TURN_CHECKPOINTS_TREE_ID);
+    assertFlat(sizes, TURN_CHECKPOINTS_TREE_ID, 4);
 
-    // Disposal wrote an empty list, so no slot still holds a dead agent's data.
+    // Disposal removed the key outright — the tree holds only live agents...
     for (let m = 0; m < M; m++) {
-      const slot = store.getStateJson(`${TURN_CHECKPOINTS_ID}/spawn-task-d1-${1000 + m}`);
-      assert.deepStrictEqual(slot, [], 'disposed agent slot is empty');
+      assert.strictEqual(
+        store.treeGet(TURN_CHECKPOINTS_TREE_ID, `spawn-task-d1-${1000 + m}`),
+        null,
+        'disposed agent key removed from checkpoint tree'
+      );
     }
     assert.strictEqual((framework as any).getTurnCheckpoints('assistant').length, 5);
+
+    // ...and no per-agent state registration leaked into the state index —
+    // chronicle has no deregistration and rewrites + fsyncs the index on
+    // every sync tick, so index entries must not scale with spawns-ever.
+    const checkpointStates = store.listStates().filter((s: { id: string }) => s.id.startsWith(TURN_CHECKPOINTS_ID));
+    assert.strictEqual(checkpointStates.length, 1, 'exactly one checkpoint state registered');
 
     await framework.stop();
   });
 
-  it('turn checkpoints: legacy single-map stores are readable and migrate on save', async () => {
+  it('turn checkpoints: legacy single-map stores are readable, migrate on save, and evict without ghosts', async () => {
     const storePath = join(tempDir, 'legacy-checkpoints.chronicle');
 
     {
@@ -178,22 +188,39 @@ describe('state scaling regression gates', () => {
         assistant: [
           { agentName: 'assistant', turnIndex: 0, sequenceBefore: 1, branchName: 'main', timestamp: 1 },
         ],
+        'spawn-ghost-d1-1234': [
+          { agentName: 'spawn-ghost-d1-1234', turnIndex: 3, sequenceBefore: 9, branchName: 'main', timestamp: 2 },
+        ],
       });
       store.close();
     }
 
     const framework = await createFramework(storePath);
+    const store = framework.getStore();
 
     // Legacy entry visible through the fallback read...
     const before = (framework as any).getTurnCheckpoints('assistant');
     assert.strictEqual(before.length, 1);
     assert.strictEqual(before[0].turnIndex, 0);
 
-    // ...and the first new turn migrates the list into the per-agent slot.
+    // ...and the first new turn migrates the list into the tree.
     (framework as any).recordTurnCheckpoint('assistant');
-    const slot = framework.getStore().getStateJson(`${TURN_CHECKPOINTS_ID}/assistant`);
-    assert.strictEqual(slot.length, 2);
-    assert.strictEqual(slot[0].turnIndex, 0);
+    const entry = store.treeGet(TURN_CHECKPOINTS_TREE_ID, 'assistant');
+    assert.ok(entry, 'tree entry created on first save');
+    const migrated = (framework as any).getTurnCheckpoints('assistant');
+    assert.strictEqual(migrated.length, 2);
+    assert.strictEqual(migrated[0].turnIndex, 0);
+
+    // Evicting an agent whose checkpoints live only in the legacy map writes
+    // an empty tombstone — a later agent reusing the name must NOT inherit
+    // the dead agent's checkpoints through the fallback.
+    (framework as any).evictTurnCheckpoints('spawn-ghost-d1-1234');
+    assert.deepStrictEqual((framework as any).getTurnCheckpoints('spawn-ghost-d1-1234'), []);
+    // Idempotent: a second evict doesn't rewrite the tombstone (blob "[]" is
+    // content-addressed, but the tree op record would still be new).
+    const recordsBefore = store.getRecordIdsByType('state_update').length;
+    (framework as any).evictTurnCheckpoints('spawn-ghost-d1-1234');
+    assert.strictEqual(store.getRecordIdsByType('state_update').length, recordsBefore);
 
     await framework.stop();
   });
@@ -248,6 +275,12 @@ describe('state scaling regression gates', () => {
     // Reserved / invalid names are rejected.
     assert.throws(() => ctx.registerLogState('state'));
     assert.throws(() => ctx.appendToLog('nested/name', {}));
+    // Writes to a never-registered name fail immediately — chronicle would
+    // accept the append but never snapshot the state, turning a typo into a
+    // silent full-chain-replay-on-restore trap.
+    assert.throws(() => ctx.appendToLog('lgo', { oops: true }), /not registered/);
+    assert.throws(() => ctx.editLogItem('lgo', 0, {}), /not registered/);
+    assert.strictEqual(ctx.getLogLength('log'), N, 'registered log still intact');
 
     await framework.stop();
   });
