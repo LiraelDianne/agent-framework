@@ -3719,8 +3719,31 @@ export class AgentFramework {
             break;
           }
 
-          case 'usage':
+          case 'usage': {
             agent.lastStreamInputTokens = event.usage.inputTokens;
+
+            // Closed-loop estimator calibration (2026-07-12). Sample the REAL
+            // prefix size of THIS API call (fresh + cache write + cache read)
+            // and hand it to the context strategy, which accepts exactly one
+            // sample per compile (its arm-once gate) and rejects out-of-band
+            // ratios. It must be sampled HERE, per call: `response.details.
+            // usage` at turn completion is CUMULATIVE across the tool-use
+            // loop (5 calls x ~160k reported as 884k), which is not a
+            // window-shaped number and drove the multiplier to 2.37 before
+            // the guards caught it.
+            try {
+              const realTotal =
+                (event.usage.inputTokens ?? 0) +
+                (event.usage.cacheCreationTokens ?? 0) +
+                (event.usage.cacheReadTokens ?? 0);
+              const strat = (agent as unknown as {
+                getContextManager?: () => { getStrategy?: () => unknown };
+              }).getContextManager?.()?.getStrategy?.() as
+                | { reportRealInputTokens?: (n: number) => void }
+                | undefined;
+              strat?.reportRealInputTokens?.(realTotal);
+            } catch { /* calibration is best-effort */ }
+
             this.emitTrace({
               type: 'inference:usage',
               agentName: agent.name,
@@ -3732,6 +3755,7 @@ export class AgentFramework {
               },
             });
             break;
+          }
         }
       }
     } catch (error) {
