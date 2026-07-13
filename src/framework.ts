@@ -40,6 +40,9 @@ import type {
   AgentState,
   Module,
   SpeechContext,
+  ContextMaintenanceRun,
+  ContextMaintenanceAgentRun,
+  ContextMaintenanceSnapshot,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -260,6 +263,9 @@ export class AgentFramework {
   private maintenanceIntervalMs: number;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private maintenancePass: Promise<void> | null = null;
+  private maintenanceRunId = 0;
+  private currentMaintenanceRun: ContextMaintenanceRun | null = null;
+  private maintenanceHistory: ContextMaintenanceRun[] = [];
   /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -720,26 +726,77 @@ export class AgentFramework {
 
   private async runQueuedMaintenance(): Promise<void> {
     const allTools = this.getAllTools();
-    await Promise.all([...this.agents.values()].map(async (agent) => {
+    const queued = [...this.agents.values()].flatMap((agent) => {
       const cm = agent.getContextManager();
       const tools = allTools.filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
+      if (cm.isReady()) return [];
+      const pending = cm.getPendingWork()?.description;
+      const progress = this.contextProgress(cm);
+      const record: ContextMaintenanceAgentRun = {
+        agentName: agent.name,
+        startedAt: Date.now(),
+        ticks: 0,
+        readyBefore: false,
+        ...(pending ? { pendingBefore: pending } : {}),
+        ...(progress ? { progressBefore: progress } : {}),
+      };
+      return [{
+        agent,
+        cm,
+        record,
+      }];
+    });
+    if (queued.length === 0) return;
 
-      try {
-        for (
-          let i = 0;
-          i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
-          i++
-        ) {
-          await cm.tick();
+    const run: ContextMaintenanceRun = {
+      id: ++this.maintenanceRunId,
+      startedAt: Date.now(),
+      agents: queued.map(item => item.record),
+    };
+    this.currentMaintenanceRun = run;
+
+    try {
+      await Promise.all(queued.map(async ({ agent, cm, record }) => {
+        try {
+          for (
+            let i = 0;
+            i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
+            i++
+          ) {
+            await cm.tick();
+            record.ticks++;
+          }
+        } catch (error) {
+          record.error = error instanceof Error ? error.message : String(error);
+          console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
+        } finally {
+          const pending = cm.getPendingWork()?.description;
+          record.finishedAt = Date.now();
+          record.readyAfter = cm.isReady();
+          if (pending) record.pendingAfter = pending;
+          const progress = this.contextProgress(cm);
+          if (progress) record.progressAfter = progress;
         }
-      } catch (error) {
-        console.error(
-          `[context-maintenance] agent=${agent.name} failed:`,
-          error instanceof Error ? error.message : error,
-        );
-      }
-    }));
+      }));
+    } finally {
+      run.finishedAt = Date.now();
+      run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
+      this.currentMaintenanceRun = null;
+      this.maintenanceHistory.unshift(run);
+      if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
+    }
+  }
+
+  private contextProgress(cm: ContextManager): Record<string, unknown> | undefined {
+    const strategy = cm.getStrategy() as {
+      getProgressSnapshot?: () => unknown;
+    };
+    if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
+    const progress = strategy.getProgressSnapshot();
+    return progress && typeof progress === 'object'
+      ? progress as Record<string, unknown>
+      : undefined;
   }
 
   /**
@@ -862,6 +919,28 @@ export class AgentFramework {
       return moduleTools;
     }
     return [...moduleTools, ...this.mcplTools, ...channelTools, ...gateTools];
+  }
+
+  /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
+  getContextMaintenanceSnapshot(): ContextMaintenanceSnapshot {
+    const agents = [...this.agents.values()].map((agent) => {
+      const cm = agent.getContextManager();
+      const pending = cm.getPendingWork()?.description;
+      const progress = this.contextProgress(cm);
+      return {
+        agentName: agent.name,
+        ready: cm.isReady(),
+        ...(pending ? { pending } : {}),
+        ...(progress ? { progress } : {}),
+      };
+    });
+    return structuredClone({
+      intervalMs: this.maintenanceIntervalMs,
+      ticksPerPass: MAINTENANCE_TICKS_PER_PASS,
+      current: this.currentMaintenanceRun,
+      history: this.maintenanceHistory,
+      agents,
+    });
   }
 
   /**

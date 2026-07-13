@@ -99,6 +99,43 @@ export interface FrameworkConfig {
   conversations?: ConversationRouterConfig;
 }
 
+/** One agent's outcome within a periodic context-maintenance pass. */
+export interface ContextMaintenanceAgentRun {
+  agentName: string;
+  startedAt: number;
+  finishedAt?: number;
+  ticks: number;
+  readyBefore: boolean;
+  readyAfter?: boolean;
+  pendingBefore?: string;
+  pendingAfter?: string;
+  progressBefore?: Record<string, unknown>;
+  progressAfter?: Record<string, unknown>;
+  error?: string;
+}
+
+/** A bounded periodic context-maintenance pass. */
+export interface ContextMaintenanceRun {
+  id: number;
+  startedAt: number;
+  finishedAt?: number;
+  agents: ContextMaintenanceAgentRun[];
+}
+
+/** Debug-safe maintenance state. Contains counts and errors, never messages. */
+export interface ContextMaintenanceSnapshot {
+  intervalMs: number;
+  ticksPerPass: number;
+  current: ContextMaintenanceRun | null;
+  history: ContextMaintenanceRun[];
+  agents: Array<{
+    agentName: string;
+    ready: boolean;
+    pending?: string;
+    progress?: Record<string, unknown>;
+  }>;
+}
+
 /**
  * Policy for deciding when to run inference.
  */

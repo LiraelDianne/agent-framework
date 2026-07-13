@@ -108,6 +108,12 @@ describe('queued context maintenance timer', () => {
       framework.start();
       await waitFor(() => strategy.ticks >= 2);
       assert.deepEqual(strategy.toolCounts, [1, 1]);
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length === 1);
+      const snapshot = framework.getContextMaintenanceSnapshot();
+      assert.equal(snapshot.current, null);
+      assert.equal(snapshot.history[0].agents[0].ticks, 2);
+      assert.equal(snapshot.history[0].agents[0].readyAfter, true);
+      assert.deepEqual(snapshot.agents, [{ agentName: 'agent', ready: true }]);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
