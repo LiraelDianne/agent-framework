@@ -28,6 +28,16 @@ import type { Agent } from './agent.js';
 const MODULE_STATE_PREFIX = 'modules/';
 
 /**
+ * True when a registerState failure means "this state id already exists" —
+ * the one failure that is safe to swallow on an idempotent re-registration.
+ * Anything else (closed store, IO error) must propagate: swallowing it defers
+ * the real error to a later write with far worse context.
+ */
+export function isStateExistsError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('State already exists');
+}
+
+/**
  * Hard ceiling for a single module's gatherContext budget, regardless of the
  * `contextTimeoutMs` it declares. gatherContext runs on the critical path of
  * every inference turn, so an unbounded self-declared budget would let one
@@ -466,6 +476,72 @@ class ModuleContextImpl implements ModuleContext {
       externalIdMap: Object.fromEntries(this.externalIdMap),
     };
     this.store.setStateJson(this.stateId, fullState);
+  }
+
+  /** Log-state names this context has registered (registerLogState is
+   *  contract-required in start(), so this is populated before any use). */
+  private registeredLogStates = new Set<string>();
+
+  private logStateId(name: string): string {
+    if (!name || name === 'state' || name.includes('/')) {
+      throw new Error(
+        `Invalid module log state name '${name}': must be non-empty, not 'state', and contain no '/'`
+      );
+    }
+    return `${MODULE_STATE_PREFIX}${this.moduleName}/${name}`;
+  }
+
+  /**
+   * Like logStateId, but only for names that went through registerLogState.
+   * Chronicle happily appends to an unregistered state — it just never gets a
+   * snapshot strategy, so every reconstruction replays the full op chain from
+   * record one. A forgotten registration or a typo'd name in one call site
+   * must be an immediate, attributable error, not a silent O(n²)-read trap.
+   */
+  private registeredLogStateId(name: string): string {
+    if (!this.registeredLogStates.has(name)) {
+      throw new Error(
+        `Module log state '${name}' is not registered for module '${this.moduleName}' — ` +
+        `call registerLogState('${name}') in start() before using it`
+      );
+    }
+    return this.logStateId(name);
+  }
+
+  registerLogState(
+    name: string,
+    opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
+  ): void {
+    const id = this.logStateId(name);
+    try {
+      this.store.registerState({
+        id,
+        strategy: 'append_log',
+        deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
+        fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
+      });
+    } catch (err) {
+      if (!isStateExistsError(err)) throw err;
+      // Already registered (previous run) — idempotent path.
+    }
+    this.registeredLogStates.add(name);
+  }
+
+  appendToLog<T>(name: string, item: T): void {
+    this.store.appendToStateJson(this.registeredLogStateId(name), item);
+  }
+
+  editLogItem<T>(name: string, index: number, item: T): void {
+    this.store.editStateItem(this.registeredLogStateId(name), index, Buffer.from(JSON.stringify(item)));
+  }
+
+  getLog<T>(name: string): T[] {
+    const data = this.store.getStateJson(this.registeredLogStateId(name));
+    return Array.isArray(data) ? (data as T[]) : [];
+  }
+
+  getLogLength(name: string): number {
+    return this.store.getStateLen(this.registeredLogStateId(name)) ?? 0;
   }
 
   getModule<T extends Module>(name: string): T | null {

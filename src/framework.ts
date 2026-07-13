@@ -43,7 +43,7 @@ import type {
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry } from './module-registry.js';
+import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
@@ -81,7 +81,8 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
-const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
+const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
+const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
@@ -421,10 +422,12 @@ export class AgentFramework {
       // Already registered
     }
 
+    // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
+    // registered for new stores — it's read-only fallback data in old ones.
     try {
-      store.registerState({ id: TURN_CHECKPOINTS_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
+      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
+    } catch (error) {
+      if (!isStateExistsError(error)) throw error;
     }
 
     // Process logging config (default: disabled)
@@ -1042,6 +1045,7 @@ export class AgentFramework {
         clearInterval(completionWatchdog);
         this.offTrace(traceListener);
         this.agents.delete(agent.name);
+        this.evictTurnCheckpoints(agent.name);
       };
 
       // Watchdog: if inference never starts within 30s, the agent is a zombie.
@@ -2274,18 +2278,91 @@ export class AgentFramework {
     this.saveTurnCheckpoints(agentName, checkpoints);
   }
 
+  /**
+   * Checkpoints live in one Tree state (TURN_CHECKPOINTS_TREE_ID) keyed by agent
+   * name, each key pointing at a JSON blob of that agent's ≤MAX_TURN_CHECKPOINTS
+   * list. This kills two unbounded-in-agents-ever dimensions at once:
+   *
+   *  - the original single Record<agentName, list> map was rewritten whole on
+   *    every turn of every agent and never evicted a departed subagent's key;
+   *  - the intermediate design (one state slot per agent) fixed the writes but
+   *    leaked a permanent chronicle state *registration* per spawn — chronicle
+   *    has no deregistration, and the state index is rewritten and fsynced on
+   *    every sync tick, so per-tick cost grew with fleet history anyway.
+   *
+   * A tree gives per-key O(entry) writes, real key removal (treeRemove), and
+   * exactly one registration for the life of the store. The legacy map state
+   * (TURN_CHECKPOINTS_ID) is kept as a read-only fallback for stores written
+   * before the split; eviction tombstones legacy keys so a reused agent name
+   * can't inherit a dead agent's checkpoints through the fallback.
+   */
+  private legacyCheckpointKeys: Set<string> | null = null;
+
+  private hasLegacyCheckpoints(agentName: string): boolean {
+    if (!this.legacyCheckpointKeys) {
+      const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+      this.legacyCheckpointKeys = new Set(
+        legacy && typeof legacy === 'object' ? Object.keys(legacy) : []
+      );
+    }
+    return this.legacyCheckpointKeys.has(agentName);
+  }
+
   private getTurnCheckpoints(agentName: string): TurnCheckpoint[] {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    if (!data || typeof data !== 'object') return [];
-    const allCheckpoints = data as Record<string, TurnCheckpoint[]>;
-    return Array.isArray(allCheckpoints[agentName]) ? [...allCheckpoints[agentName]] : [];
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (entry) {
+      const blob = this.store.getBlob(entry.blobHash);
+      if (!blob) return [];
+      try {
+        const parsed = JSON.parse(blob.toString());
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (!this.hasLegacyCheckpoints(agentName)) return [];
+    const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID) as
+      | Record<string, TurnCheckpoint[]>
+      | null;
+    const list = legacy?.[agentName];
+    return Array.isArray(list) ? [...list] : [];
   }
 
   private saveTurnCheckpoints(agentName: string, checkpoints: TurnCheckpoint[]): void {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    const allCheckpoints = (data && typeof data === 'object' ? data : {}) as Record<string, TurnCheckpoint[]>;
-    allCheckpoints[agentName] = checkpoints;
-    this.store.setStateJson(TURN_CHECKPOINTS_ID, allCheckpoints);
+    const bytes = Buffer.from(JSON.stringify(checkpoints));
+    const blobHash = this.store.storeBlob(bytes, 'application/json');
+    this.store.treeSet(TURN_CHECKPOINTS_TREE_ID, agentName, {
+      blobHash,
+      size: bytes.length,
+      mode: 0o644,
+    });
+  }
+
+  /**
+   * Drop a departed agent's checkpoint tree key and turn/redo bookkeeping.
+   * Without this, spawn-and-dispose agents leave a key (and in-memory map
+   * entries) behind for the life of the store/session.
+   */
+  private evictTurnCheckpoints(agentName: string): void {
+    this.turnCounters.delete(agentName);
+    this.redoStacks.delete(agentName);
+    // Diagnostics maps are also keyed by agent name and never evicted —
+    // spawn-and-dispose fleets would grow them for the session's life.
+    this.staleWarnAt.delete(agentName);
+    this.lastInferenceAt.delete(agentName);
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (this.hasLegacyCheckpoints(agentName)) {
+      // A bare treeRemove would resurrect the legacy map's list through the
+      // fallback next time this name is reused — shadow it with an empty
+      // tombstone instead. size <= 2 ⇔ the blob is already "[]".
+      if (!entry || entry.size > 2) {
+        this.saveTurnCheckpoints(agentName, []);
+      }
+      return;
+    }
+    if (entry) {
+      this.store.treeRemove(TURN_CHECKPOINTS_TREE_ID, agentName);
+    }
   }
 
   /**
@@ -2295,6 +2372,9 @@ export class AgentFramework {
   async runUntilIdle(): Promise<void> {
     while (
       !this.queue.isEmpty ||
+      // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
+      // event queue — without this the loop can exit before they're drained.
+      this.pendingRequests.length > 0 ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
@@ -2827,6 +2907,7 @@ export class AgentFramework {
     this.agents.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
+    this.evictTurnCheckpoints(agentName);
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -3713,11 +3794,27 @@ export class AgentFramework {
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
+              const durationMs = Date.now() - startTime;
               agent.reset();
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: `Stream aborted: ${reason}`,
+              });
+              // Postmortem 2026-05-28 P2 #7: persist the abort to the
+              // inference log so future investigations can attribute the
+              // terminal cause without relying on live in-memory reducer
+              // state. Without this, abort-terminated inferences are
+              // invisible to forensic queries (only request-side telemetry
+              // via llm-calls.jsonl shows them, and only by absence).
+              this.logInference({
+                timestamp: startTime,
+                agentName: agent.name,
+                requestId,
+                success: false,
+                error: `Stream aborted: ${reason}`,
+                request: compiledRequest ?? { note: 'streaming request aborted' },
+                durationMs,
               });
               this.eventGate?.onInferenceEnded(agent.name);
             }
@@ -3767,6 +3864,7 @@ export class AgentFramework {
       // Stream itself threw (unexpected) — no retry path here, so also emit
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
+      const durationMs = Date.now() - startTime;
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -3777,6 +3875,18 @@ export class AgentFramework {
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
+      });
+      // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
+      // threw) were previously only visible via in-memory trace listeners.
+      // Persist to inference log for forensic attribution.
+      this.logInference({
+        timestamp: startTime,
+        agentName: agent.name,
+        requestId,
+        success: false,
+        error: `Stream threw: ${err.message}`,
+        request: compiledRequest ?? { note: 'streaming request threw' },
+        durationMs,
       });
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
@@ -3955,11 +4065,11 @@ export class AgentFramework {
       }
     }
 
-    // Append to the inference log state
-    const data = this.store.getStateJson(INFERENCE_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(INFERENCE_LOG_ID, entries);
+    // Append one record per inference. A read-modify-write via setStateJson
+    // would emit a whole-array Set — record size then grows with accumulated
+    // history (O(n²) aggregate disk) and the append_log strategy registered
+    // for this state never sees an append.
+    this.store.appendToStateJson(INFERENCE_LOG_ID, entryToStore);
   }
 
   private logProcessEvent(event: ProcessEvent, responses: ModuleProcessResponse[]): void {
@@ -3979,11 +4089,8 @@ export class AgentFramework {
       entryToStore.responses = { blobId };
     }
 
-    // Append to the process log state
-    const data = this.store.getStateJson(PROCESS_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(PROCESS_LOG_ID, entries);
+    // Append one record per event — same rationale as logInference.
+    this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
   /**
