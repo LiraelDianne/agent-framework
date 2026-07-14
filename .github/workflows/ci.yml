@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Both platforms: a package-lock.json regenerated over an existing
+      # node_modules tree records only that machine's native binaries, so a
+      # lock made on macOS breaks Linux installs and vice versa. Each runner
+      # catches the lock the other's platform produced. Tests run on ubuntu.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      # Root lockfiles are deliberately gitignored in this repo, so plain
+      # npm install (matching publish.yml). No lock to guard here.
+      - name: Install dependencies
+        run: npm install
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        if: matrix.os == 'ubuntu-latest'
+        run: npm test
