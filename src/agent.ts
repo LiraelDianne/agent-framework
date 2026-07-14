@@ -355,7 +355,9 @@ export class Agent {
       .map((m) => ({
         ...m,
         content: m.content.filter(
-          (b: any) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+          // typeof guard is deliberate runtime defense: history loaded from
+          // disk can carry a non-string `text` despite what the types claim.
+          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
         ),
       }))
       .filter((m) => m.content.length > 0);
