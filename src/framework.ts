@@ -79,6 +79,7 @@ import type {
   ChannelsIncomingParams,
 } from './mcpl/types.js';
 import type { ContextInjection } from '@animalabs/context-manager';
+import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
@@ -374,6 +375,8 @@ export class AgentFramework {
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
+  /** Presentation-only wall-clock zone; persistence remains UTC/epoch. */
+  private readonly timeZone: string;
 
   private constructor(
     store: JsStore,
@@ -384,7 +387,8 @@ export class AgentFramework {
     syncIntervalMs: number,
     maintenanceIntervalMs: number,
     processLoggingPersist: boolean,
-    processLoggingBroadcast: boolean
+    processLoggingBroadcast: boolean,
+    timeZone: string,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -395,6 +399,7 @@ export class AgentFramework {
     this.maintenanceIntervalMs = maintenanceIntervalMs;
     this.processLoggingPersist = processLoggingPersist;
     this.processLoggingBroadcast = processLoggingBroadcast;
+    this.timeZone = timeZone;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -485,7 +490,8 @@ export class AgentFramework {
       config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
       config.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS,
       processLoggingPersist,
-      processLoggingBroadcast
+      processLoggingBroadcast,
+      resolveTimeZone(config.timeZone),
     );
 
     // Restore persisted usage data (if any) from prior session
@@ -5764,7 +5770,16 @@ export class AgentFramework {
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
     // endTurn: the agent stops here and goes idle for the duration.
-    finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
+    finish({
+      success: true,
+      data: {
+        sleepingFor: human,
+        until,
+        untilLocal: formatZonedDateTime(until, this.timeZone),
+        timeZone: this.timeZone,
+      },
+      endTurn: true,
+    });
   }
 
   /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected

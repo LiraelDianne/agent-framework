@@ -9,6 +9,9 @@ import type { ContentBlock } from '@animalabs/membrane';
 // ============================================================================
 
 export interface DiscordModuleConfig {
+  /** IANA zone for timestamps returned to the agent by fetch_history. */
+  timeZone?: string;
+
   /** Discord bot token */
   token: string;
 
