@@ -32,6 +32,13 @@ export interface ProcessLoggingConfig {
  * Configuration for the agent framework.
  */
 export interface FrameworkConfig {
+  /**
+   * IANA zone used only when rendering wall-clock times for the agent.
+   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
+   * then the process zone.
+   */
+  timeZone?: string;
+
   /** Path to Chronicle store */
   storePath?: string;
 
