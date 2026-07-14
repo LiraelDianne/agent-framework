@@ -59,6 +59,30 @@ import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { splitProseSegments } from './prose-segments.js';
+
+/**
+ * Tools whose presence suppresses auto-routing of the surrounding prose,
+ * for two distinct reasons:
+ *   - `skip_reply` — the agent EXPLICITLY chose not to reply (the deliberate
+ *     "stay silent" signal).
+ *   - explicit delivery tools (channel_publish / *send_message /
+ *     *reply_message / *send_dm) — already sent the message, so routing the
+ *     prose again would double-post.
+ * `think` is deliberately NOT here: it is silent *reasoning*, but prose
+ * written around a think is the agent's actual voice and must be delivered.
+ *
+ * Scope: mid-turn rounds apply this PER ROUND (a round's prose is suppressed
+ * only by a silencing tool in that same round — live delivery can't be
+ * retracted by a later round's skip_reply); the turn's TRAILING prose keeps
+ * the historical turn-wide rule (any silencing tool anywhere in the turn
+ * suppresses it), preserving the "send_message then 'sent it.' postscript"
+ * double-post guard.
+ */
+const SILENCING_TOOLS = new Set([
+  'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
+]);
+/** Strip the `server--` MCPL prefix from a tool name. */
+const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate } from './gate/event-gate.js';
@@ -292,6 +316,13 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+
+  /** Per-agent output locus pinned for the CURRENT logical turn (see
+   *  resolveTurnLocus in driveStream). Lives here — not in driveStream
+   *  locals — so the pin survives a context-budget stream restart, which
+   *  continues the same logical turn in a fresh driveStream. Cleared at the
+   *  start of every non-restart turn. */
+  private turnLocusPins: Map<string, string> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -2708,16 +2739,51 @@ export class AgentFramework {
           }));
           agent.getContextManager().addMessage('user', toolResultContent);
 
-          // Flush any messages that were deferred while waiting for tool results.
-          // Route to the PRIMARY agent — deferred messages are framework-level
-          // (e.g. subagent return notifications) meant for the main conversation.
+          // Flush any messages that were deferred while this turn was in
+          // flight. Route to the PRIMARY agent — deferred messages are
+          // framework-level (module messages, push events, subagent return
+          // notifications) meant for the main conversation.
+          //
+          // Hear-while-acting: messages flushed into THIS agent's own window
+          // are also collected for mid-turn injection — passed to the membrane
+          // with the tool results below, so the NEXT inference round of the
+          // live turn sees them instead of the agent staying deaf until the
+          // turn ends. The window stores them here, right after the
+          // tool_result message, which is exactly where the membrane appends
+          // them in the live conversation — same participant, same content
+          // blocks, same metadata, and compile() emits recent messages
+          // verbatim, so the next turn's compiled prefix byte-matches the
+          // live request (prompt-cache safe).
+          //
+          // The queue is drained ONLY at the target agent's own boundary:
+          // draining at another agent's boundary would store the messages
+          // mid-turn in the target's window without injecting them into the
+          // target's live stream (deaf agent + window/live divergence). Left
+          // queued, they flush at the target's own next boundary — with
+          // injection — or in driveStream's finally when its turn ends.
+          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           if (this.deferredMessages.length > 0) {
-            const deferred = this.deferredMessages.splice(0);
-            const primary = this.primaryAgentName
-              ? this.agents.get(this.primaryAgentName)
-              : agent;
-            for (const msg of deferred) {
-              (primary ?? agent).getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+            const target = (this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined) ?? agent;
+            if (target === agent) {
+              const deferred = this.deferredMessages.splice(0);
+              for (const msg of deferred) {
+                target.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+                // Injection guards: tool blocks would corrupt the tool-cycle
+                // structure the membrane enforces, and a message named as the
+                // agent itself would render as an ASSISTANT turn on the wire
+                // (an unintended prefill the model would continue). Such
+                // messages stay window-only — visible next turn.
+                const hasToolBlocks = msg.content.some(
+                  (b) => b.type === 'tool_use' || b.type === 'tool_result'
+                );
+                if (!hasToolBlocks && msg.participant !== agent.name) {
+                  midTurnInjections.push({
+                    participant: msg.participant,
+                    content: msg.content,
+                    ...(msg.metadata ? { metadata: msg.metadata } : {}),
+                  });
+                }
+              }
             }
           }
 
@@ -2769,13 +2835,23 @@ export class AgentFramework {
               timestamp: Date.now(),
             });
           } else if (currentState.stream) {
-            // Streaming path: convert results and resume the stream
+            // Streaming path: convert results and resume the stream.
+            // Mid-turn messages collected above ride along as injected user
+            // messages (membrane ≥0.5.72) — appended after the tool_result
+            // envelope so the next round of THIS turn hears them.
             const membraneResults = currentState.toolResults.map(tc =>
               this.toMembraneToolResult(tc.id, tc.result, maxChars)
             );
-            currentState.stream.provideToolResults(membraneResults);
+            currentState.stream.provideToolResults(
+              membraneResults,
+              midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
+            );
             agent.setStreaming(currentState.stream);
-            this.emitTrace({ type: 'inference:stream_resumed', agentName: agent.name });
+            this.emitTrace({
+              type: 'inference:stream_resumed',
+              agentName: agent.name,
+              ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
+            });
           } else {
             // Non-streaming fallback: schedule re-inference
             this.pendingRequests.push({
@@ -3547,6 +3623,60 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
 
+    // ---- Present-while-acting turn state ---------------------------------
+    // Output locus for THIS turn: resolved lazily at the first routed prose
+    // segment and pinned for the rest of the turn (mid-turn rounds AND the
+    // trailing prose at 'complete'), so one turn's voice stays in one channel
+    // even when a queued inbound from another channel overwrites the
+    // per-agent triggering channel between segments (PR #32). The pin lives
+    // in `turnLocusPins` so it survives a context-budget stream restart. A
+    // null resolution is NOT pinned — a turn whose locus is unresolvable
+    // early (e.g. heartbeat-triggered) may still resolve a channel by the
+    // time later prose routes.
+    if (trigger?.reason !== 'context_budget_restart') {
+      this.turnLocusPins.delete(agent.name);
+    }
+    const resolveTurnLocus = (): string | null => {
+      let locus = this.turnLocusPins.get(agent.name) ?? null;
+      if (locus === null && this.channelRegistry) {
+        locus = this.channelRegistry.resolveLocus(agent.name);
+        if (locus !== null) this.turnLocusPins.set(agent.name, locus);
+      }
+      return locus;
+    };
+
+    // Ordered delivery chain for live-routed prose. Links are enqueued
+    // WITHOUT awaiting in the stream-event loop — an awaited network post
+    // here would stall consumption of the next round's events by
+    // segments × RTT on every prose-bearing round. The 'complete' case
+    // awaits the chain before routing trailing prose, so in-channel ordering
+    // is preserved end-to-end. Each link catches its own error: one failed
+    // post must not silence the rest of the turn.
+    let turnSpeechChain: Promise<void> = Promise.resolve();
+    const enqueueSpeech = (text: string, locus: string | null): void => {
+      turnSpeechChain = turnSpeechChain
+        .then(async () => {
+          await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+        })
+        .catch((err) => console.error('mid-turn speech routing failed:', err));
+    };
+
+    // Sticky silencing: once any round uses a SILENCING_TOOLS member,
+    // prose from that round ONWARD is suppressed — skip_reply means "stay
+    // silent", an explicit send means "I deliver my own words". Earlier
+    // rounds' prose was already delivered live and cannot be retracted.
+    let turnSilenced = false;
+
+    // Live routing is only trusted when the membrane provides verbatim
+    // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
+    // The fallback `preamble` is CUMULATIVE in XML mode (assistant prefill +
+    // all earlier rounds' prose and raw tool/thinking XML) — live-routing it
+    // would repost the transcript and leak thinking every round. When no
+    // round was live-routed, the 'complete' case falls back to the
+    // historical whole-turn routing so fallback-mode prose is still
+    // delivered exactly once, at turn end.
+    let liveProseRouting = false;
+
     // Typing indicator: show "<agent> is typing…" in the channel she's
     // responding to, for the whole duration of this turn. Started here (paired
     // with the finally below, so it can never leak) and refreshed on a 7s
@@ -3625,6 +3755,43 @@ export class AgentFramework {
 
             for (const call of event.calls) {
               this.dispatchToolCall(agent.name, call);
+            }
+
+            // Speak-while-acting: route THIS round's prose to the locus NOW
+            // instead of batching every segment to the end of the turn. Long
+            // tool-using turns (robot control, live sessions) otherwise dump
+            // the whole narration in one blob when the turn finally settles —
+            // and, worse, make "talking" and "acting" feel mutually exclusive
+            // to the agent. Mid-turn prose is speech (delivered live, in
+            // order, via the turn's speech chain — never awaited here); the
+            // `think` tool remains the private channel. Silencing is STICKY
+            // from the round it occurs (see SILENCING_TOOLS). Only rounds
+            // with verbatim roundContent are live-routed (see liveProseRouting
+            // note above — the fallback preamble is cumulative in XML mode).
+            if (this.channelRegistry) {
+              const roundToolNames = event.calls.map((c) => c.name);
+              if (roundToolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)))) {
+                turnSilenced = true;
+              }
+              if (roundContent && roundContent.length > 0) {
+                liveProseRouting = true;
+                const roundSegments = splitProseSegments(assistantBlocks);
+                if (roundSegments.length > 0) {
+                  if (turnSilenced) {
+                    console.error(
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
+                    );
+                  } else {
+                    const locus = resolveTurnLocus();
+                    console.error(
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${locus ?? '(default)'}`,
+                    );
+                    for (const seg of roundSegments) {
+                      enqueueSpeech(seg, locus);
+                    }
+                  }
+                }
+              }
             }
             // Stream's async iterator blocks on next() until provideToolResults() is called
             break;
@@ -3730,10 +3897,13 @@ export class AgentFramework {
               }
             }
 
-            // Separate speech from thoughts.
-            // When tools were used, ALL text is thoughts (the tools themselves are
-            // the agent's actions — surrounding text is just reasoning).
-            // When no tools were used, all text is speech.
+            // Separate speech from thoughts — for MODULE dispatch only
+            // (dispatchSpeech / TUI rendering below). This split does NOT
+            // decide what reaches the channel: mid-turn prose is routed live
+            // per round (see the 'tool-calls' case) and trailing prose is
+            // routed after this block. On a tool-using turn the module-level
+            // convention remains "text is thoughts"; on a text-only turn all
+            // text is speech.
             const isTextBlock = (block: ContentBlock): block is ContentBlock & { type: 'text' } =>
               block.type === 'text';
             const allText = response.content.filter(isTextBlock);
@@ -3933,70 +4103,54 @@ export class AgentFramework {
                 }
               }
             } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
-              // Tool-call turn that also produced prose. Per design, route the
-              // prose to the locus as a reply UNLESS the turn used an explicit
-              // send/publish tool (channel_publish, *--send_message,
-              // *--reply_message, *--send_dm) — already delivered, so routing
-              // again would double-post. `think` and other non-sending tools
-              // (shell, workspace, etc.) still let the agent speak in the same
-              // turn. The global speech/thoughts split is left untouched
-              // (module/TUI rendering unaffected) — this only governs what
-              // reaches the channel.
-              // Tools whose presence suppresses the trailing prose, for two
-              // distinct reasons:
-              //   - `skip_reply` — the agent EXPLICITLY chose not to reply this
-              //     turn (the deliberate "stay silent" signal).
-              //   - explicit delivery tools (channel_publish / *send_message /
-              //     *reply_message / *send_dm) — already sent the message, so
-              //     routing it again would double-post.
-              // `think` is deliberately NOT here: it is silent *reasoning*, but
-              // prose written after a think is the agent's actual reply and must
-              // be delivered. (A think-only turn has no trailing prose and stays
-              // silent via the `!t` check below.)
-              const SILENCING = new Set([
-                'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
-              ]);
-              const bare = (n: string) => (n.includes('--') ? n.split('--').pop()! : n);
+              // Tool-call turn that also produced prose. When live routing was
+              // active (native roundContent), each mid-turn round's prose was
+              // already delivered when that round yielded — only the TRAILING
+              // prose (blocks after the last tool round) remains here. On the
+              // fallback path (XML tool mode / older membrane: no roundContent,
+              // so nothing was live-routed) the historical behavior applies:
+              // route the whole turn's parsed segments, once, now. The global
+              // speech/thoughts split is left untouched (module/TUI rendering
+              // unaffected) — this only governs what reaches the channel.
+              //
+              // Silencing here is the sticky flag ∪ turn-wide scan: the scan
+              // (over the whole turn's tool_use blocks) covers the fallback
+              // path and the "send_message then a 'sent it.' postscript"
+              // double-post guard; the sticky flag is its live-rounds twin.
               const toolNames = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => (b as unknown as { name?: string }).name)
                 .filter((n): n is string => typeof n === 'string');
-              const silenced = toolNames.some((n) => SILENCING.has(bare(n)));
+              const silenced = turnSilenced || toolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)));
 
-              // Split the turn's content into ordered prose segments, broken at
-              // each tool_use / tool_result boundary. `response.content` holds the
-              // WHOLE turn's blocks in provider order — earlier tool rounds
-              // included (see the trailing-slice note above, which slices exactly
-              // because the full turn is present) — so a left-to-right walk
-              // reconstructs the emission order. Interleaved prose
-              // ("msgA → [tool] → msgB → [tool] → msgC") is then delivered as
-              // separate messages IN ORDER instead of being collapsed into one
-              // trailing post (item 4). The silencing rule stays turn-wide: an
-              // explicit send / skip suppresses ALL auto-routed prose this turn,
-              // preserving the double-post guard.
-              const segments = splitProseSegments(response.content);
+              const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
+
+              // Preserve in-channel ordering: everything enqueued live must
+              // land before the trailing prose. Awaited even when silenced —
+              // the chain may still be flushing earlier rounds' posts.
+              await turnSpeechChain;
 
               if (silenced || segments.length === 0) {
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> NOT routed ` +
-                  `(${silenced ? 'silencing tool / explicit send' : 'no prose'})`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
+                  `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
                 );
               } else {
-                // Snapshot the locus ONCE. This loop dispatches AFTER the agent
-                // is idle (see PR #32 note below), so a queued inbound from
-                // another channel can start a NEW turn and overwrite the per-agent
-                // triggering channel (`activeTriggerChannels`) BETWEEN segments —
-                // splitting one turn's reply across channels (the residual
-                // multi-segment race left by 83dedf8's per-agent locus). Pin every
-                // segment of THIS turn to the channel resolved right now.
-                const turnLocus = this.channelRegistry.resolveLocus(agent.name);
+                // Reuse the locus pinned at the turn's first live-routed
+                // segment (or resolve it now for a turn whose only prose is
+                // trailing). This dispatch runs AFTER the agent is idle (see
+                // PR #32 note below), so a queued inbound from another channel
+                // could otherwise overwrite the per-agent triggering channel
+                // between segments — and a turn that narrated live into one
+                // channel must not land its postscript in another.
+                const locus = resolveTurnLocus();
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} prose segment(s) in order -> ${turnLocus ?? '(default)'}`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(default)'}`,
                 );
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    await this.channelRegistry.routeSpeech(agent.name, seg, turnLocus);
+                    await this.channelRegistry.routeSpeech(agent.name, seg, locus);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -4538,12 +4692,19 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
 
-    // If any agent has pending assistant blocks (tool_use not yet flushed),
-    // defer non-tool_result messages to preserve tool_use → tool_result adjacency.
+    // Defer non-tool_result messages while a tool cycle is mid-flight
+    // (pendingAssistantBlocks: preserves tool_use → tool_result adjacency)
+    // OR while the target agent has a live stream at all. A message stored
+    // mid-stream lands BEFORE the turn's assistant blocks in the window even
+    // though the live conversation never saw it — so the next compile
+    // diverges from the live prefix (prompt-cache bust) and the message
+    // misses mid-turn injection. Deferred messages flush at the agent's next
+    // tool boundary (where they are ALSO injected into the live stream —
+    // hear-while-acting) or in driveStream's finally when the turn ends.
     const hasToolResult = content.some(b => b.type === 'tool_result');
-    if (!hasToolResult && this.pendingAssistantBlocks.size > 0) {
+    if (!hasToolResult && (this.pendingAssistantBlocks.size > 0 || this.activeStreams.has(agent.name))) {
       this.deferredMessages.push({ participant, content, metadata });
-      return '' as MessageId; // Deferred — will be added after tool_result flush
+      return '' as MessageId; // Deferred — flushed at the next boundary
     }
 
     return agent.getContextManager().addMessage(participant, content, metadata);

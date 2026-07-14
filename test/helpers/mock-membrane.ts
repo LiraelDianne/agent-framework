@@ -51,6 +51,10 @@ export class MockYieldingStream implements YieldingStream {
   private _toolDepth = 0;
   private pendingResolve: (() => void) | null = null;
   receivedToolResults: unknown[][] = [];
+  /** Options passed alongside each provideToolResults call (mid-turn injection). */
+  receivedToolResultOptions: Array<
+    { injectedMessages?: Array<{ participant?: string; content: unknown[] }> } | undefined
+  > = [];
 
   constructor(private responses: NormalizedResponse[]) {
     this.processResponse(0);
@@ -100,6 +104,10 @@ export class MockYieldingStream implements YieldingStream {
           depth: this._toolDepth,
           previousResults: [],
           accumulated: '',
+          // membrane ≥0.5.64: verbatim blocks of the current round, in
+          // provider order — lets the framework store the assistant turn
+          // verbatim and (≥0.5.72) route the round's prose live.
+          roundContent: response.content,
         },
       } as StreamEvent);
     } else {
@@ -108,9 +116,13 @@ export class MockYieldingStream implements YieldingStream {
     }
   }
 
-  provideToolResults(results: unknown[]): void {
+  provideToolResults(
+    results: unknown[],
+    options?: { injectedMessages?: Array<{ participant?: string; content: unknown[] }> },
+  ): void {
     if (!this._isWaitingForTools) throw new Error('Not waiting for tools');
     this.receivedToolResults.push(results);
+    this.receivedToolResultOptions.push(options);
     this._isWaitingForTools = false;
     this._pendingToolCallIds = [];
     this._toolDepth++;

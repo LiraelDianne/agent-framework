@@ -109,6 +109,8 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
       agentName: string;
+      /** Count of mid-turn messages injected into the resumed round (hear-while-acting). */
+      injectedMessages?: number;
     })
   | (TraceEventBase & {
       type: 'inference:stream_restarted';
