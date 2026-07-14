@@ -303,6 +303,13 @@ export class AgentFramework {
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
    *  the refusal loop, so the breaker can never shed the whole history. */
   private exhaustionRewinds: Map<string, number> = new Map();
+  /** Agents with an OverBudget drain kick currently in flight. The breaker in
+   *  noteInferenceExhausted fires on EVERY matching failure and the scenario it
+   *  exists for is "every activation fails, repeatedly" — without this guard,
+   *  overlapping kicks race the strategy's own pendingCompression gate and the
+   *  tick counts in the success log stop meaning anything. One kick per agent
+   *  at a time; cleared when the kick settles (success or failure). */
+  private overBudgetDrainInFlight: Set<string> = new Set();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -3432,13 +3439,14 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
-          // Drives the poison-history breaker. `retryable` is kept for
-          // observability, but the breaker gates on `errorType` — only an
-          // `invalid_request` (a 400-class rejection of the history itself)
-          // means retrying the same context can never succeed. auth/abort/
-          // context_length are also non-retryable but must NOT cost history.
-          retryable: err instanceof MembraneError ? err.retryable : undefined,
-          errorType: err instanceof MembraneError ? err.type : undefined,
+          // Drives the poison-history breaker (`invalid_request`: a 400-class
+          // rejection of the history itself — retrying the same context can
+          // never succeed; auth/abort/context_length are also non-retryable
+          // but must NOT cost history) and the OverBudget drain breaker
+          // (`over_budget`: compile refused to fit the hard budget — this is
+          // the site that sees it, since compile runs before the stream
+          // exists). `retryable` is kept for observability.
+          ...this.classifyInferenceError(err),
         });
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
@@ -3950,11 +3958,10 @@ export class AgentFramework {
                 agentName: agent.name,
                 error: err.message,
                 // Drives the poison-history breaker. `retryable` is kept for
-                // observability, but the breaker gates on `errorType` — only an
+                // observability, but the breakers gate on `errorType` — only an
                 // `invalid_request` (a 400-class rejection of the history
                 // itself) means retrying the same context can never succeed.
-                retryable: err instanceof MembraneError ? err.retryable : undefined,
-                errorType: err instanceof MembraneError ? err.type : undefined,
+                ...this.classifyInferenceError(err),
               });
               this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
@@ -4050,6 +4057,7 @@ export class AgentFramework {
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
+        ...this.classifyInferenceError(err),
       });
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
@@ -4667,6 +4675,28 @@ export class AgentFramework {
     return streak;
   }
 
+  /**
+   * Classify a terminal inference error for the `inference:exhausted` trace.
+   * Single-sourced for every emit site: the downstream breakers (poison-history
+   * quarantine, OverBudget drain kick) gate on `errorType`, so classification
+   * drift between sites would silently disable a safety net.
+   *
+   * context-manager's OverBudgetError is recognized by `err.name`: CM does not
+   * export the class from its package root, so a cross-package `instanceof` is
+   * unavailable — but `name` is set in its constructor and survives the package
+   * boundary. Deliberately NOT a message match: the message wording belongs to
+   * CM and can be reworded without warning.
+   */
+  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
+    if (err instanceof MembraneError) {
+      return { retryable: err.retryable, errorType: err.type };
+    }
+    if (err.name === 'OverBudgetError') {
+      return { errorType: 'over_budget' };
+    }
+    return {};
+  }
+
   private noteInferenceExhausted(
     agentName: string,
     reason: string,
@@ -4705,6 +4735,41 @@ export class AgentFramework {
       } catch (err) {
         console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
       }
+    }
+
+    // (2b) OverBudget deadlock breaker. When compile fails with
+    // OverBudgetError, the normal compression drain never runs: it is driven
+    // by successful activity, which the over-budget state prevents - a closed
+    // loop with no internal exit. Field data (2026-07-10, resident agent):
+    // 36 minutes hard-down, zero self-rescue; only an operator raising the
+    // budget externally could break the loop. Break it here instead: kick the
+    // strategy drain directly so folding/merging frees space for the next
+    // compile. Bounded ticks, best-effort, never throws, one kick per agent
+    // at a time (see overBudgetDrainInFlight).
+    //
+    // Gates on the classified errorType (see classifyInferenceError); the
+    // message match is only a fallback for paths that lost the Error object
+    // (e.g. a reason string that crossed a serialization boundary). It matches
+    // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
+    // errorType gate is the one that's load-bearing.
+    const overBudget = errorType === 'over_budget' || /exceed hard budget/i.test(reason);
+    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
+      this.overBudgetDrainInFlight.add(agentName);
+      void (async () => {
+        let ticks = 0;
+        try {
+          const cm = agent.getContextManager();
+          while (ticks < 8) {
+            await cm.tick();
+            ticks++;
+          }
+          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
+        } catch (err) {
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+        } finally {
+          this.overBudgetDrainInFlight.delete(agentName);
+        }
+      })();
     }
 
     // (3) Hard-down escalation on repeated identical failure.
