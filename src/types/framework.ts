@@ -32,6 +32,13 @@ export interface ProcessLoggingConfig {
  * Configuration for the agent framework.
  */
 export interface FrameworkConfig {
+  /**
+   * IANA zone used only when rendering wall-clock times for the agent.
+   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
+   * then the process zone.
+   */
+  timeZone?: string;
+
   /** Path to Chronicle store */
   storePath?: string;
 
@@ -55,6 +62,13 @@ export interface FrameworkConfig {
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
+
+  /**
+   * Interval for queued context-maintenance polling in milliseconds
+   * (default: 5000ms, 0 to disable). Each pass refreshes the agent's live tool
+   * definitions, then advances pending compression/indexing work.
+   */
+  maintenanceIntervalMs?: number;
 
   /** Process logging configuration (default: disabled) */
   processLogging?: ProcessLoggingConfig;
@@ -90,6 +104,43 @@ export interface FrameworkConfig {
    * unchanged (all messages go to the primary agent).
    */
   conversations?: ConversationRouterConfig;
+}
+
+/** One agent's outcome within a periodic context-maintenance pass. */
+export interface ContextMaintenanceAgentRun {
+  agentName: string;
+  startedAt: number;
+  finishedAt?: number;
+  ticks: number;
+  readyBefore: boolean;
+  readyAfter?: boolean;
+  pendingBefore?: string;
+  pendingAfter?: string;
+  progressBefore?: Record<string, unknown>;
+  progressAfter?: Record<string, unknown>;
+  error?: string;
+}
+
+/** A bounded periodic context-maintenance pass. */
+export interface ContextMaintenanceRun {
+  id: number;
+  startedAt: number;
+  finishedAt?: number;
+  agents: ContextMaintenanceAgentRun[];
+}
+
+/** Debug-safe maintenance state. Contains counts and errors, never messages. */
+export interface ContextMaintenanceSnapshot {
+  intervalMs: number;
+  ticksPerPass: number;
+  current: ContextMaintenanceRun | null;
+  history: ContextMaintenanceRun[];
+  agents: Array<{
+    agentName: string;
+    ready: boolean;
+    pending?: string;
+    progress?: Record<string, unknown>;
+  }>;
 }
 
 /**

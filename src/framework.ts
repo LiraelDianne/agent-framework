@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -40,10 +41,13 @@ import type {
   AgentState,
   Module,
   SpeechContext,
+  ContextMaintenanceRun,
+  ContextMaintenanceAgentRun,
+  ContextMaintenanceSnapshot,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry } from './module-registry.js';
+import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
@@ -76,12 +80,14 @@ import type {
   ChannelsIncomingParams,
 } from './mcpl/types.js';
 import type { ContextInjection } from '@animalabs/context-manager';
+import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
-const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
+const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
+const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
@@ -143,6 +149,10 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** Poll pending context-strategy maintenance independently of user activity. */
+const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
+/** Bound one pass so a large backlog yields to inference and other agents. */
+const MAINTENANCE_TICKS_PER_PASS = 8;
 
 /**
  * Extract fields the EventGate cares about from a ProcessEvent. The set of
@@ -232,6 +242,13 @@ interface AgentSettleProgress {
   toolCallsCount: number;
 }
 
+/** Cap an API error message for inline use in a rewind marker: keep enough to
+ *  identify the failure class without pasting a wall of provider JSON into the
+ *  agent's context. */
+function truncateReason(reason: string, max = 160): string {
+  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -257,6 +274,16 @@ export class AgentFramework {
   private traceListeners: TraceEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private maintenanceIntervalMs: number;
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  private maintenancePass: Promise<void> | null = null;
+  private maintenanceRunId = 0;
+  private currentMaintenanceRun: ContextMaintenanceRun | null = null;
+  private maintenanceHistory: ContextMaintenanceRun[] = [];
+  /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
+  private staleWarnAt = new Map<string, number>();
+  /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
+  private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
@@ -270,10 +297,35 @@ export class AgentFramework {
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
   private readonly inferenceFailureEscalationThreshold = 3;
+  /** Per-(agent,kind) timestamp of the last ops webhook post. Throttles
+   *  opsAlert() so a persistent failure re-posts once per cooldown window
+   *  instead of on every occurrence. */
+  private opsAlertLastSent: Map<string, number> = new Map();
+  /** Cooldown between webhook posts for the same (agent, kind). */
+  private readonly opsAlertCooldownMs = 15 * 60_000;
+  /** Per-agent refusal bookkeeping for observability — exposed via
+   *  healthSnapshot() and mirrored to failures.log / ops alerts. */
+  private refusalStats: Map<string, { total: number; byCategory: Record<string, number>; lastAt: number; lastCategory: string }> = new Map();
+  /** Per-agent count of consecutive refusals (reset on any non-refusal
+   *  completion). Distinct from refusalRewinds, which budgets the auto-rewind
+   *  loop — this one drives ops alerting. */
+  private refusalStreak: Map<string, number> = new Map();
   /** Per-agent count of consecutive refusal-driven rewinds in the current turn
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
+  /** Per-agent count of poison-history rewinds performed by the hard-down
+   *  breaker (noteInferenceExhausted). Reset on any successful inference.
+   *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
+   *  the refusal loop, so the breaker can never shed the whole history. */
+  private exhaustionRewinds: Map<string, number> = new Map();
+  /** Agents with an OverBudget drain kick currently in flight. The breaker in
+   *  noteInferenceExhausted fires on EVERY matching failure and the scenario it
+   *  exists for is "every activation fails, repeatedly" — without this guard,
+   *  overlapping kicks race the strategy's own pendingCompression gate and the
+   *  tick counts in the success log stop meaning anything. One kick per agent
+   *  at a time; cleared when the kick settles (success or failure). */
+  private overBudgetDrainInFlight: Set<string> = new Set();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -346,6 +398,8 @@ export class AgentFramework {
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
+  /** Presentation-only wall-clock zone; persistence remains UTC/epoch. */
+  private readonly timeZone: string;
 
   private constructor(
     store: JsStore,
@@ -354,8 +408,10 @@ export class AgentFramework {
     inferencePolicy: InferencePolicy,
     errorPolicy: ErrorPolicy,
     syncIntervalMs: number,
+    maintenanceIntervalMs: number,
     processLoggingPersist: boolean,
-    processLoggingBroadcast: boolean
+    processLoggingBroadcast: boolean,
+    timeZone: string,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -363,8 +419,10 @@ export class AgentFramework {
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
     this.syncIntervalMs = syncIntervalMs;
+    this.maintenanceIntervalMs = maintenanceIntervalMs;
     this.processLoggingPersist = processLoggingPersist;
     this.processLoggingBroadcast = processLoggingBroadcast;
+    this.timeZone = timeZone;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -420,10 +478,12 @@ export class AgentFramework {
       // Already registered
     }
 
+    // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
+    // registered for new stores — it's read-only fallback data in old ones.
     try {
-      store.registerState({ id: TURN_CHECKPOINTS_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
+      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
+    } catch (error) {
+      if (!isStateExistsError(error)) throw error;
     }
 
     // Process logging config (default: disabled)
@@ -451,8 +511,10 @@ export class AgentFramework {
       config.inferencePolicy ?? new DefaultInferencePolicy(),
       config.errorPolicy ?? new DefaultErrorPolicy(),
       config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
+      config.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS,
       processLoggingPersist,
-      processLoggingBroadcast
+      processLoggingBroadcast,
+      resolveTimeZone(config.timeZone),
     );
 
     // Restore persisted usage data (if any) from prior session
@@ -557,6 +619,31 @@ export class AgentFramework {
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
+    // Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
+    // (journal) without a restart — for catching the wake-wedge on the running
+    // process. Shows the gate's `inferring` set + buffered-event count (the
+    // wedge signature), active streams, and pending inference requests.
+    try {
+      process.on('SIGUSR2', () => {
+        try {
+          const gate = framework.eventGate?.inferenceDiagnostics() ?? null;
+          console.error(
+            '[diagnostics] ' + JSON.stringify({
+              at: new Date().toISOString(),
+              gate,
+              activeStreams: [...framework.activeStreams.keys()],
+              pendingRequests: framework.pendingRequests.length,
+              agents: [...framework.agents.keys()],
+            }),
+          );
+        } catch (err) {
+          console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
+        }
+      });
+    } catch {
+      // SIGUSR2 not available on this platform — non-fatal.
+    }
+
     return framework;
   }
 
@@ -580,6 +667,16 @@ export class AgentFramework {
           console.error('Periodic sync error:', error);
         }
       }, this.syncIntervalMs);
+    }
+
+    if (this.maintenanceIntervalMs > 0) {
+      this.maintenanceTimer = setInterval(() => {
+        this.startQueuedMaintenance();
+      }, this.maintenanceIntervalMs);
+      this.maintenanceTimer.unref?.();
+      // Do not make a restored queue wait a full interval before its first
+      // attempt. MCPL/module initialization has completed before start().
+      this.startQueuedMaintenance();
     }
   }
 
@@ -607,6 +704,14 @@ export class AgentFramework {
     if (this.syncTimer) {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
+    }
+
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+    if (this.maintenancePass) {
+      await this.maintenancePass;
     }
 
     if (this.loopPromise) {
@@ -637,6 +742,103 @@ export class AgentFramework {
     if (this.ownsStore) {
       this.store.close();
     }
+  }
+
+  /**
+   * Advance queued ContextManager work without requiring a new message.
+   *
+   * Tool definitions are refreshed first because compression replays stored
+   * tool cycles and providers reject those requests when the corresponding
+   * schemas are absent. Passes never overlap; each agent gets a bounded drain
+   * so maintenance cannot monopolize the framework event loop.
+   */
+  private startQueuedMaintenance(): void {
+    if (this.maintenancePass || !this.running) return;
+    const pass = this.runQueuedMaintenance().catch((error) => {
+      console.error(
+        '[context-maintenance] pass failed:',
+        error instanceof Error ? error.message : error,
+      );
+    });
+    this.maintenancePass = pass;
+    void pass.finally(() => {
+      if (this.maintenancePass === pass) this.maintenancePass = null;
+    });
+  }
+
+  private async runQueuedMaintenance(): Promise<void> {
+    const allTools = this.getAllTools();
+    const queued = [...this.agents.values()].flatMap((agent) => {
+      const cm = agent.getContextManager();
+      const tools = allTools.filter((tool) => agent.canUseTool(tool.name));
+      cm.setToolDefinitions(tools);
+      if (cm.isReady()) return [];
+      const pending = cm.getPendingWork()?.description;
+      const progress = this.contextProgress(cm);
+      const record: ContextMaintenanceAgentRun = {
+        agentName: agent.name,
+        startedAt: Date.now(),
+        ticks: 0,
+        readyBefore: false,
+        ...(pending ? { pendingBefore: pending } : {}),
+        ...(progress ? { progressBefore: progress } : {}),
+      };
+      return [{
+        agent,
+        cm,
+        record,
+      }];
+    });
+    if (queued.length === 0) return;
+
+    const run: ContextMaintenanceRun = {
+      id: ++this.maintenanceRunId,
+      startedAt: Date.now(),
+      agents: queued.map(item => item.record),
+    };
+    this.currentMaintenanceRun = run;
+
+    try {
+      await Promise.all(queued.map(async ({ agent, cm, record }) => {
+        try {
+          for (
+            let i = 0;
+            i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
+            i++
+          ) {
+            await cm.tick();
+            record.ticks++;
+          }
+        } catch (error) {
+          record.error = error instanceof Error ? error.message : String(error);
+          console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
+        } finally {
+          const pending = cm.getPendingWork()?.description;
+          record.finishedAt = Date.now();
+          record.readyAfter = cm.isReady();
+          if (pending) record.pendingAfter = pending;
+          const progress = this.contextProgress(cm);
+          if (progress) record.progressAfter = progress;
+        }
+      }));
+    } finally {
+      run.finishedAt = Date.now();
+      run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
+      this.currentMaintenanceRun = null;
+      this.maintenanceHistory.unshift(run);
+      if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
+    }
+  }
+
+  private contextProgress(cm: ContextManager): Record<string, unknown> | undefined {
+    const strategy = cm.getStrategy() as {
+      getProgressSnapshot?: () => unknown;
+    };
+    if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
+    const progress = strategy.getProgressSnapshot();
+    return progress && typeof progress === 'object'
+      ? progress as Record<string, unknown>
+      : undefined;
   }
 
   /**
@@ -761,6 +963,28 @@ export class AgentFramework {
     return [...moduleTools, ...this.mcplTools, ...channelTools, ...gateTools];
   }
 
+  /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
+  getContextMaintenanceSnapshot(): ContextMaintenanceSnapshot {
+    const agents = [...this.agents.values()].map((agent) => {
+      const cm = agent.getContextManager();
+      const pending = cm.getPendingWork()?.description;
+      const progress = this.contextProgress(cm);
+      return {
+        agentName: agent.name,
+        ready: cm.isReady(),
+        ...(pending ? { pending } : {}),
+        ...(progress ? { progress } : {}),
+      };
+    });
+    return structuredClone({
+      intervalMs: this.maintenanceIntervalMs,
+      ticksPerPass: MAINTENANCE_TICKS_PER_PASS,
+      current: this.currentMaintenanceRun,
+      history: this.maintenanceHistory,
+      agents,
+    });
+  }
+
   /**
    * Build the membrane-normalized request that WOULD be emitted if `agentName`
    * were activated right now — WITHOUT running inference, opening a stream, or
@@ -810,8 +1034,9 @@ export class AgentFramework {
     // Module gatherContext (fail-open, matches startAgentStream)
     try {
       const moduleInjections = await this.moduleRegistry.gatherContext(agentName);
-      if (moduleInjections.length > 0) {
-        injections = moduleInjections;
+      const scopedModuleInjections = this.scopeInjectionsForAgent(agentName, moduleInjections);
+      if (scopedModuleInjections.length > 0) {
+        injections = scopedModuleInjections;
       }
     } catch (error) {
       console.error('Module gatherContext error (preview):', error);
@@ -822,7 +1047,10 @@ export class AgentFramework {
     if (this.hookOrchestrator) {
       try {
         const hookParams = this.buildBeforeInferenceParams(agent);
-        const hookInjections = await this.hookOrchestrator.beforeInference(hookParams);
+        const hookInjections = this.scopeInjectionsForAgent(
+          agentName,
+          await this.hookOrchestrator.beforeInference(hookParams),
+        );
         if (hookInjections.length > 0) {
           injections = injections ? [...injections, ...hookInjections] : hookInjections;
         }
@@ -1096,6 +1324,10 @@ export class AgentFramework {
       this.agentSettles.delete(agent.name);
       this.agentSettleProgress.delete(agent.name);
       this.agents.delete(agent.name);
+      // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
+      // ephemeral agents leave checkpoint-tree keys and diagnostics map
+      // entries behind for the life of the store/session.
+      this.evictTurnCheckpoints(agent.name);
     }
   }
 
@@ -1429,15 +1661,24 @@ export class AgentFramework {
    * sits at the tail giving the model something actionable to answer once the
    * refusal clears. Returns the running count.
    */
-  private updateRewindMarker(agent: Agent, category: string): number {
+  private updateRewindMarker(
+    agent: Agent,
+    category: string,
+    cause: 'refusal' | 'inference-failure' = 'refusal',
+  ): number {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
+    const why = cause === 'refusal'
+      ? `the model refused on them (content filter: ${category}). Their content is ` +
+        `not reproduced here (so this note can't re-trigger the filter); the ` +
+        `originals remain in the raw record`
+      : `the model API kept rejecting the conversation on them (${category}). ` +
+        `Their content is not reproduced here (so this note can't re-trigger the ` +
+        `rejection); the originals remain in the raw record`;
     const text =
       `[refusal-rewind] The ${count} most recent turn(s) were set aside because ` +
-      `the model refused on them (content filter: ${category}). Their content is ` +
-      `not reproduced here (so this note can't re-trigger the filter); the ` +
-      `originals remain in the raw record. You are clear to continue — if you ` +
+      `${why}. You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -1446,7 +1687,7 @@ export class AgentFramework {
       this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
     } else {
       const id = cm.addMessage('user', blocks, {
-        system: true, kind: 'refusal-rewind', category, count,
+        system: true, kind: 'refusal-rewind', category, count, cause,
       });
       this.rewindEpisode.set(agent.name, { markerId: id, count, category });
     }
@@ -2207,18 +2448,91 @@ export class AgentFramework {
     this.saveTurnCheckpoints(agentName, checkpoints);
   }
 
+  /**
+   * Checkpoints live in one Tree state (TURN_CHECKPOINTS_TREE_ID) keyed by agent
+   * name, each key pointing at a JSON blob of that agent's ≤MAX_TURN_CHECKPOINTS
+   * list. This kills two unbounded-in-agents-ever dimensions at once:
+   *
+   *  - the original single Record<agentName, list> map was rewritten whole on
+   *    every turn of every agent and never evicted a departed subagent's key;
+   *  - the intermediate design (one state slot per agent) fixed the writes but
+   *    leaked a permanent chronicle state *registration* per spawn — chronicle
+   *    has no deregistration, and the state index is rewritten and fsynced on
+   *    every sync tick, so per-tick cost grew with fleet history anyway.
+   *
+   * A tree gives per-key O(entry) writes, real key removal (treeRemove), and
+   * exactly one registration for the life of the store. The legacy map state
+   * (TURN_CHECKPOINTS_ID) is kept as a read-only fallback for stores written
+   * before the split; eviction tombstones legacy keys so a reused agent name
+   * can't inherit a dead agent's checkpoints through the fallback.
+   */
+  private legacyCheckpointKeys: Set<string> | null = null;
+
+  private hasLegacyCheckpoints(agentName: string): boolean {
+    if (!this.legacyCheckpointKeys) {
+      const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+      this.legacyCheckpointKeys = new Set(
+        legacy && typeof legacy === 'object' ? Object.keys(legacy) : []
+      );
+    }
+    return this.legacyCheckpointKeys.has(agentName);
+  }
+
   private getTurnCheckpoints(agentName: string): TurnCheckpoint[] {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    if (!data || typeof data !== 'object') return [];
-    const allCheckpoints = data as Record<string, TurnCheckpoint[]>;
-    return Array.isArray(allCheckpoints[agentName]) ? [...allCheckpoints[agentName]] : [];
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (entry) {
+      const blob = this.store.getBlob(entry.blobHash);
+      if (!blob) return [];
+      try {
+        const parsed = JSON.parse(blob.toString());
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (!this.hasLegacyCheckpoints(agentName)) return [];
+    const legacy = this.store.getStateJson(TURN_CHECKPOINTS_ID) as
+      | Record<string, TurnCheckpoint[]>
+      | null;
+    const list = legacy?.[agentName];
+    return Array.isArray(list) ? [...list] : [];
   }
 
   private saveTurnCheckpoints(agentName: string, checkpoints: TurnCheckpoint[]): void {
-    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
-    const allCheckpoints = (data && typeof data === 'object' ? data : {}) as Record<string, TurnCheckpoint[]>;
-    allCheckpoints[agentName] = checkpoints;
-    this.store.setStateJson(TURN_CHECKPOINTS_ID, allCheckpoints);
+    const bytes = Buffer.from(JSON.stringify(checkpoints));
+    const blobHash = this.store.storeBlob(bytes, 'application/json');
+    this.store.treeSet(TURN_CHECKPOINTS_TREE_ID, agentName, {
+      blobHash,
+      size: bytes.length,
+      mode: 0o644,
+    });
+  }
+
+  /**
+   * Drop a departed agent's checkpoint tree key and turn/redo bookkeeping.
+   * Without this, spawn-and-dispose agents leave a key (and in-memory map
+   * entries) behind for the life of the store/session.
+   */
+  private evictTurnCheckpoints(agentName: string): void {
+    this.turnCounters.delete(agentName);
+    this.redoStacks.delete(agentName);
+    // Diagnostics maps are also keyed by agent name and never evicted —
+    // spawn-and-dispose fleets would grow them for the session's life.
+    this.staleWarnAt.delete(agentName);
+    this.lastInferenceAt.delete(agentName);
+    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+    if (this.hasLegacyCheckpoints(agentName)) {
+      // A bare treeRemove would resurrect the legacy map's list through the
+      // fallback next time this name is reused — shadow it with an empty
+      // tombstone instead. size <= 2 ⇔ the blob is already "[]".
+      if (!entry || entry.size > 2) {
+        this.saveTurnCheckpoints(agentName, []);
+      }
+      return;
+    }
+    if (entry) {
+      this.store.treeRemove(TURN_CHECKPOINTS_TREE_ID, agentName);
+    }
   }
 
   /**
@@ -2228,6 +2542,9 @@ export class AgentFramework {
   async runUntilIdle(): Promise<void> {
     while (
       !this.queue.isEmpty ||
+      // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
+      // event queue — without this the loop can exit before they're drained.
+      this.pendingRequests.length > 0 ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
@@ -2769,6 +3086,7 @@ export class AgentFramework {
     this.agents.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
+    this.evictTurnCheckpoints(agentName);
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -2975,6 +3293,7 @@ export class AgentFramework {
           requestCount: requests.length,
           oldestRequestAge: now - oldest,
         });
+        console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
         continue;
       }
 
@@ -2990,6 +3309,14 @@ export class AgentFramework {
             requestCount: requests.length,
             oldestRequestAge: now - oldest,
           });
+          // Loud (but throttled) note that requests are waiting on a busy agent.
+          if ((this.staleWarnAt.get(agentName) ?? 0) < now - 60_000) {
+            this.staleWarnAt.set(agentName, now);
+            console.error(
+              `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
+              `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
+            );
+          }
         }
         this.pendingRequests.push(...requests);
         continue;
@@ -2997,6 +3324,13 @@ export class AgentFramework {
 
       // Check policy
       if (!this.inferencePolicy.shouldInfer(agentName, requests, state)) {
+        // Loud drop: a queued request that dies here is otherwise invisible —
+        // the 2026-07-09 mythos "not responding" diagnosis burned hours on
+        // exactly this class of silent drop. One stderr line per drop.
+        console.error(
+          `[inference-dropped] agent=${agentName} reason=policy-skip ` +
+          `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
+        );
         continue;
       }
 
@@ -3040,6 +3374,7 @@ export class AgentFramework {
     this.touchAgentSettle(agent.name, true);
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
     this.eventGate?.onInferenceStarted(agent.name);
+    this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     try {
       const allTools = this.getAllTools();
@@ -3049,14 +3384,16 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
-      // Module gatherContext (fail-open, 5s timeout per module)
-      // NOTE: module injections are NOT channel-scoped — only the MCPL hook
-      // injections below pass through scopeInjectionsForAgent (channel
-      // context arrives via beforeInference hooks by adapter convention). A
-      // module that starts emitting per-channel context must scope it per
-      // agent itself, or conversation forks will see cross-channel content.
+      // Module gatherContext (fail-open, per-module timeout — the module's
+      // contextTimeoutMs, else the registry default). Injections are
+      // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
+      // injections below, so conversation forks don't see cross-channel
+      // content.
       try {
-        const moduleInjections = await this.moduleRegistry.gatherContext(agent.name);
+        const moduleInjections = this.scopeInjectionsForAgent(
+          agent.name,
+          await this.moduleRegistry.gatherContext(agent.name),
+        );
         if (moduleInjections.length > 0) {
           injections = moduleInjections;
         }
@@ -3109,6 +3446,14 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
+          // Drives the poison-history breaker (`invalid_request`: a 400-class
+          // rejection of the history itself — retrying the same context can
+          // never succeed; auth/abort/context_length are also non-retryable
+          // but must NOT cost history) and the OverBudget drain breaker
+          // (`over_budget`: compile refused to fit the hard budget — this is
+          // the site that sees it, since compile runs before the stream
+          // exists). `retryable` is kept for observability.
+          ...this.classifyInferenceError(err),
         });
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
@@ -3398,6 +3743,8 @@ export class AgentFramework {
                   (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
               );
 
+              this.noteRefusal(agent.name, category, tokenUsage);
+
               // Rewind: excise the turn that fed the refusal, drop a
               // metadata-only marker, and retry — keeping the agent on its own
               // model instead of substituting a fallback. Driven either by an
@@ -3475,6 +3822,7 @@ export class AgentFramework {
                 this.refusalRewinds.set(agent.name, 0);
               }
               this.rewindEpisode.delete(agent.name);
+              this.refusalStreak.delete(agent.name);
             }
 
             // Dispatch speech (and thoughts if any)
@@ -3635,6 +3983,11 @@ export class AgentFramework {
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: err.message,
+                // Drives the poison-history breaker. `retryable` is kept for
+                // observability, but the breakers gate on `errorType` — only an
+                // `invalid_request` (a 400-class rejection of the history
+                // itself) means retrying the same context can never succeed.
+                ...this.classifyInferenceError(err),
               });
               this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
@@ -3653,6 +4006,7 @@ export class AgentFramework {
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
+              const durationMs = Date.now() - startTime;
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -3667,13 +4021,51 @@ export class AgentFramework {
                 agentName: agent.name,
                 error: `Stream aborted: ${reason}`,
               });
+              // Postmortem 2026-05-28 P2 #7: persist the abort to the
+              // inference log so future investigations can attribute the
+              // terminal cause without relying on live in-memory reducer
+              // state. Without this, abort-terminated inferences are
+              // invisible to forensic queries (only request-side telemetry
+              // via llm-calls.jsonl shows them, and only by absence).
+              this.logInference({
+                timestamp: startTime,
+                agentName: agent.name,
+                requestId,
+                success: false,
+                error: `Stream aborted: ${reason}`,
+                request: compiledRequest ?? { note: 'streaming request aborted' },
+                durationMs,
+              });
               this.eventGate?.onInferenceEnded(agent.name);
             }
             break;
           }
 
-          case 'usage':
+          case 'usage': {
             agent.lastStreamInputTokens = event.usage.inputTokens;
+
+            // Closed-loop estimator calibration (2026-07-12). Sample the REAL
+            // prefix size of THIS API call (fresh + cache write + cache read)
+            // and hand it to the context strategy, which accepts exactly one
+            // sample per compile (its arm-once gate) and rejects out-of-band
+            // ratios. It must be sampled HERE, per call: `response.details.
+            // usage` at turn completion is CUMULATIVE across the tool-use
+            // loop (5 calls x ~160k reported as 884k), which is not a
+            // window-shaped number and drove the multiplier to 2.37 before
+            // the guards caught it.
+            try {
+              const realTotal =
+                (event.usage.inputTokens ?? 0) +
+                (event.usage.cacheCreationTokens ?? 0) +
+                (event.usage.cacheReadTokens ?? 0);
+              const strat = (agent as unknown as {
+                getContextManager?: () => { getStrategy?: () => unknown };
+              }).getContextManager?.()?.getStrategy?.() as
+                | { reportRealInputTokens?: (n: number) => void }
+                | undefined;
+              strat?.reportRealInputTokens?.(realTotal);
+            } catch { /* calibration is best-effort */ }
+
             this.emitTrace({
               type: 'inference:usage',
               agentName: agent.name,
@@ -3685,12 +4077,14 @@ export class AgentFramework {
               },
             });
             break;
+          }
         }
       }
     } catch (error) {
       // Stream itself threw (unexpected) — no retry path here, so also emit
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
+      const durationMs = Date.now() - startTime;
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -3709,10 +4103,33 @@ export class AgentFramework {
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
+        ...this.classifyInferenceError(err),
+      });
+      // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
+      // threw) were previously only visible via in-memory trace listeners.
+      // Persist to inference log for forensic attribution.
+      this.logInference({
+        timestamp: startTime,
+        agentName: agent.name,
+        requestId,
+        success: false,
+        error: `Stream threw: ${err.message}`,
+        request: compiledRequest ?? { note: 'streaming request threw' },
+        durationMs,
       });
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // Clear the gate's inference flag on EVERY exit path (paired with the
+      // onInferenceStarted in startAgentStream). The branch-level calls above
+      // are kept but are best-effort; if any exit path bypassed them the agent
+      // stayed stuck in the gate's `inferring` set, which permanently BUFFERS
+      // all incoming events → the agent silently stops waking on messages
+      // (typing still stops, compression still runs — matching the observed
+      // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
+      this.eventGate?.onInferenceEnded(agent.name);
+      this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
       this.channelRegistry?.stopTyping();
@@ -3803,7 +4220,10 @@ export class AgentFramework {
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
     }
-    let content = JSON.stringify(afResult.data);
+    // JSON.stringify returns the VALUE undefined (not a string) for undefined
+    // input — a module tool returning `{ success: true }` with no data would
+    // otherwise make `content.length` below throw a TypeError mid-turn.
+    let content = JSON.stringify(afResult.data) ?? '';
     if (maxChars && content.length > maxChars) {
       content = safeSlice(content, 0, maxChars)
         + '\n\n[truncated — original was ' + content.length + ' chars]';
@@ -3875,11 +4295,11 @@ export class AgentFramework {
       }
     }
 
-    // Append to the inference log state
-    const data = this.store.getStateJson(INFERENCE_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(INFERENCE_LOG_ID, entries);
+    // Append one record per inference. A read-modify-write via setStateJson
+    // would emit a whole-array Set — record size then grows with accumulated
+    // history (O(n²) aggregate disk) and the append_log strategy registered
+    // for this state never sees an append.
+    this.store.appendToStateJson(INFERENCE_LOG_ID, entryToStore);
   }
 
   private logProcessEvent(event: ProcessEvent, responses: ModuleProcessResponse[]): void {
@@ -3899,11 +4319,8 @@ export class AgentFramework {
       entryToStore.responses = { blobId };
     }
 
-    // Append to the process log state
-    const data = this.store.getStateJson(PROCESS_LOG_ID);
-    const entries = Array.isArray(data) ? data : [];
-    entries.push(entryToStore);
-    this.store.setStateJson(PROCESS_LOG_ID, entries);
+    // Append one record per event — same rationale as logInference.
+    this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
   /**
@@ -4133,13 +4550,19 @@ export class AgentFramework {
       this.noteInferenceExhausted(
         (event.agentName as string) ?? 'unknown',
         (event.error as string) ?? 'unknown error',
+        event.retryable as boolean | undefined,
+        event.errorType as string | undefined,
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
-      // agent isn't hard-down; clear its consecutive-failure streak.
+      // agent isn't hard-down; clear its consecutive-failure streak (and the
+      // poison-history breaker's rewind budget).
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
         this.consecutiveInferenceFailures.set(name, 0);
+      }
+      if (name && this.exhaustionRewinds.get(name)) {
+        this.exhaustionRewinds.set(name, 0);
       }
     }
 
@@ -4171,13 +4594,173 @@ export class AgentFramework {
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
+   *   4. breaker — when the failures are an `invalid_request` (a 400-class
+   *      rejection of the history itself, e.g. corrupted tool_use/tool_result
+   *      pairing or an oversized attachment), retrying the same context can
+   *      never succeed: every new push event wakes the agent onto the same
+   *      poisoned history forever. At the hard-down threshold, automatically
+   *      quarantine: shed the newest complete exchange (the same forced-rewind
+   *      primitive `/unstick` uses — shedNewestTurn never orphans a
+   *      tool_use/thinking block) and retry, bounded by the same rewind cap so
+   *      the breaker can never eat the whole history.
    */
-  private noteInferenceExhausted(agentName: string, reason: string): void {
+  /**
+   * Live health snapshot for /healthz and doctor tooling: gate state, queued
+   * work, per-agent status + last inference activity. Cheap and read-only.
+   */
+  healthSnapshot(): Record<string, unknown> {
+    return {
+      at: new Date().toISOString(),
+      uptimeSec: Math.round(process.uptime()),
+      gate: this.eventGate?.inferenceDiagnostics() ?? null,
+      pendingRequests: this.pendingRequests.length,
+      activeStreams: [...this.activeStreams.keys()],
+      agents: [...this.agents.entries()].map(([name, agent]) => ({
+        name,
+        status: agent.state.status,
+        consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
+        lastInference: this.lastInferenceAt.get(name) ?? null,
+        refusalStats: this.refusalStats.get(name) ?? null,
+      })),
+    };
+  }
+
+  /** Append a structured JSONL record to logs/failures.log (best-effort).
+   *  Durable and independent of journald/unit log redirects — this is what
+   *  connectome-doctor and fleet tooling read. Always stamps `at`. Legacy
+   *  records carry {at, agent, consecutive, reason}; new records add `kind`
+   *  and kind-specific fields (additive only — doctor parses by regex). */
+  private logFailure(record: Record<string, unknown>): void {
+    try {
+      mkdirSync('logs', { recursive: true });
+      appendFileSync(
+        'logs/failures.log',
+        JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+      );
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * Ops alert — the one escalation path for "a human should hear about this":
+   * (1) durable failures.log record (unless the caller already wrote one),
+   * (2) an `ops:alert` trace so authorized observers get it on the wire,
+   * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
+   *     (agent, kind) per cooldown window — a persistent failure re-posts
+   *     every ~15 min instead of flooding the channel on every occurrence.
+   * See connectome docs/observability.md.
+   */
+  private opsAlert(
+    kind: string,
+    agentName: string,
+    message: string,
+    opts?: { data?: Record<string, unknown>; skipLog?: boolean },
+  ): void {
+    if (!opts?.skipLog) {
+      this.logFailure({ agent: agentName, kind, reason: message, ...opts?.data });
+    }
+    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data: opts?.data });
+
+    const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+    if (!hook) return;
+    const key = `${agentName}:${kind}`;
+    const now = Date.now();
+    if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
+    // Stamp BEFORE the async post so a burst can't race past the cooldown.
+    this.opsAlertLastSent.set(key, now);
+    fetch(hook, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${message.slice(0, 500)}`,
+      }),
+    }).catch((err) => console.error(
+      `[ops-alert] webhook post failed (${key}):`,
+      err instanceof Error ? err.message : err,
+    ));
+  }
+
+  /**
+   * Record a model refusal for observability: per-agent stats + a
+   * consecutive-refusal streak (exposed via healthSnapshot), a durable
+   * failures.log record for EVERY refusal (previously invisible outside
+   * stderr), and a throttled ops alert once refusals repeat — one refusal is
+   * often survivable (auto-rewind may clear it); two in a row means stuck.
+   * The streak is reset by any non-refusal completion in the stream driver.
+   */
+  private noteRefusal(
+    agentName: string,
+    category: string,
+    tokens?: { input: number; output: number },
+  ): number {
+    const stats = this.refusalStats.get(agentName)
+      ?? { total: 0, byCategory: {}, lastAt: 0, lastCategory: '' };
+    stats.total += 1;
+    stats.byCategory[category] = (stats.byCategory[category] ?? 0) + 1;
+    stats.lastAt = Date.now();
+    stats.lastCategory = category;
+    this.refusalStats.set(agentName, stats);
+
+    const streak = (this.refusalStreak.get(agentName) ?? 0) + 1;
+    this.refusalStreak.set(agentName, streak);
+
+    this.logFailure({
+      agent: agentName,
+      kind: 'refusal',
+      category,
+      streak,
+      locus: this.channelRegistry?.buildChannelContext()?.incoming?.channelId ?? null,
+      tokens: tokens ?? null,
+    });
+    if (streak >= 2) {
+      this.opsAlert(
+        'refusal',
+        agentName,
+        `refusal streak ${streak}, category=${category}`,
+        { skipLog: true, data: { category, streak } },
+      );
+    }
+    return streak;
+  }
+
+  /**
+   * Classify a terminal inference error for the `inference:exhausted` trace.
+   * Single-sourced for every emit site: the downstream breakers (poison-history
+   * quarantine, OverBudget drain kick) gate on `errorType`, so classification
+   * drift between sites would silently disable a safety net.
+   *
+   * context-manager's OverBudgetError is recognized by `err.name`: CM does not
+   * export the class from its package root, so a cross-package `instanceof` is
+   * unavailable — but `name` is set in its constructor and survives the package
+   * boundary. Deliberately NOT a message match: the message wording belongs to
+   * CM and can be reworded without warning.
+   */
+  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
+    if (err instanceof MembraneError) {
+      return { retryable: err.retryable, errorType: err.type };
+    }
+    if (err.name === 'OverBudgetError') {
+      return { errorType: 'over_budget' };
+    }
+    return {};
+  }
+
+  private noteInferenceExhausted(
+    agentName: string,
+    reason: string,
+    retryable?: boolean,
+    errorType?: string,
+  ): void {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+
+    // (1b) Machine-greppable durable record, independent of journald/unit log
+    // redirects: logs/failures.log under the host's working directory. This is
+    // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
@@ -4201,13 +4784,121 @@ export class AgentFramework {
       }
     }
 
+    // (2b) OverBudget deadlock breaker. When compile fails with
+    // OverBudgetError, the normal compression drain never runs: it is driven
+    // by successful activity, which the over-budget state prevents - a closed
+    // loop with no internal exit. Field data (2026-07-10, resident agent):
+    // 36 minutes hard-down, zero self-rescue; only an operator raising the
+    // budget externally could break the loop. Break it here instead: kick the
+    // strategy drain directly so folding/merging frees space for the next
+    // compile. Bounded ticks, best-effort, never throws, one kick per agent
+    // at a time (see overBudgetDrainInFlight).
+    //
+    // Gates on the classified errorType (see classifyInferenceError); the
+    // message match is only a fallback for paths that lost the Error object
+    // (e.g. a reason string that crossed a serialization boundary). It matches
+    // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
+    // errorType gate is the one that's load-bearing.
+    const overBudget = errorType === 'over_budget' || /exceed hard budget/i.test(reason);
+    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
+      this.overBudgetDrainInFlight.add(agentName);
+      void (async () => {
+        let ticks = 0;
+        try {
+          const cm = agent.getContextManager();
+          while (ticks < 8) {
+            await cm.tick();
+            ticks++;
+          }
+          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
+        } catch (err) {
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+        } finally {
+          this.overBudgetDrainInFlight.delete(agentName);
+        }
+      })();
+    }
+
     // (3) Hard-down escalation on repeated identical failure.
     if (streak >= this.inferenceFailureEscalationThreshold) {
       console.error(
         `[inference-hard-down] agent=${agentName} has FAILED ${streak} consecutive ` +
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
+
+      // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
+      // a hard-down agent re-posts every ~15 min, not on every failed retry.
+      // failures.log already got the per-exhaustion record above.
+      this.opsAlert(
+        'hard-down',
+        agentName,
+        `${streak} consecutive inference failures. Last reason: ${reason}`,
+        { skipLog: true },
+      );
+
+      // (4) Poison-history breaker: ONLY for `invalid_request` — a 400-class
+      // rejection of the history itself. Deliberately NOT keyed on
+      // `retryable === false`, which membrane also returns for auth (expired
+      // key), abort (deliberate cancel), context_length (compression's job,
+      // and shedding newest is the wrong direction), safety and unsupported —
+      // none of which mean the history is poisoned, and all of which would
+      // otherwise shed good exchanges and stamp a false "the API kept
+      // rejecting your history" marker. `retryable` is kept only for the trace.
+      void retryable;
+      if (errorType === 'invalid_request' && agent) {
+        this.quarantinePoisonedHistory(agent, reason);
+      }
     }
+  }
+
+  /**
+   * Automatic poison-history quarantine (the actual "breaker"). Sheds the
+   * newest complete exchange from the agent's history — reusing the same
+   * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
+   * the single consolidated episode marker) — and queues a retry so the
+   * rewound history is verified immediately instead of waiting for the next
+   * push event to wake the agent onto the same poisoned context.
+   *
+   * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
+   * sheds per failure episode; the budget resets on any successful inference.
+   * At the cap (or with nothing left to shed) it stops — the agent stays up
+   * and hard-down logging continues, but no further history is consumed.
+   */
+  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+    const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
+    const used = this.exhaustionRewinds.get(agent.name) ?? 0;
+    if (used >= cap) {
+      console.error(
+        `[inference-rewind] agent=${agent.name} rewind cap ${cap} reached — ` +
+        `not shedding further history. Manual repair (/unstick or /undo) needed.`,
+      );
+      return;
+    }
+
+    const rec = this.shedNewestTurn(agent);
+    if (!rec) {
+      console.error(
+        `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
+        `history is only system markers. Manual repair needed.`,
+      );
+      return;
+    }
+
+    this.exhaustionRewinds.set(agent.name, used + 1);
+    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    console.error(
+      `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
+      `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
+      `inference failures — retrying on the rewound history.`,
+    );
+
+    // Retry immediately on the repaired history (bounded by the cap above).
+    this.pendingRequests.push({
+      agentName: agent.name,
+      reason: 'inference-failure-rewind-retry',
+      source: 'framework',
+      timestamp: Date.now(),
+    });
   }
 
   // ==========================================================================
@@ -4389,43 +5080,65 @@ export class AgentFramework {
     connection.ready();
 
     // Initialize feature sets if server advertises MCPL capabilities
-    if (connection.capabilities) {
-      const updateParams = this.featureSetManager!.initializeServer(
-        config.id,
-        connection.capabilities,
-        {
-          enabledFeatureSets: config.enabledFeatureSets,
-          disabledFeatureSets: config.disabledFeatureSets,
-        },
-      );
+    this.registerMcplServerFeatures(config, connection);
 
-      // Inform server which feature sets are enabled/disabled
-      if (updateParams.enabled?.length || updateParams.disabled?.length) {
-        connection.sendFeatureSetsUpdate(updateParams);
-      }
+    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+  }
 
-      // Configure scope whitelist/blacklist patterns
-      if (config.scopes) {
-        this.scopeManager!.configureAll(config.scopes);
-      }
+  /**
+   * (Re-)establish a server's host-side MCPL registration: feature-set state
+   * (plus the featureSets/update sent to the server), scope patterns, and
+   * stateful-feature-set checkpoint registration.
+   *
+   * Called on initial connect (connectMcplServerInternal) AND after every
+   * auto-reconnect. The 'close' handler drops the feature-set registration, so
+   * without the reconnect re-run FeatureSetManager.validateInbound would throw
+   * "Unknown server" forever — every push event and inference request from the
+   * revived server silently rejected until a full host restart.
+   *
+   * CheckpointManager.registerFeatureSet is idempotent (no-op for a key that
+   * already has a tree), so checkpoint trees preserved across a transient
+   * disconnect are resumed, not reset.
+   */
+  private registerMcplServerFeatures(
+    config: import('./mcpl/types.js').McplServerConfig,
+    connection: McplServerConnection,
+  ): void {
+    if (!connection.capabilities) return;
 
-      // Register stateful feature sets with checkpoint manager (Step 8)
-      if (this.checkpointManager) {
-        const declared = this.featureSetManager!.getDeclaredFeatureSets(config.id);
-        if (declared) {
-          for (const [fsName, fsDecl] of Object.entries(declared)) {
-            if (fsDecl.rollback || fsDecl.hostState) {
-              this.checkpointManager.registerFeatureSet(config.id, fsName, {
-                hostState: fsDecl.hostState ?? false,
-                rollback: fsDecl.rollback ?? false,
-              });
-            }
+    const updateParams = this.featureSetManager!.initializeServer(
+      config.id,
+      connection.capabilities,
+      {
+        enabledFeatureSets: config.enabledFeatureSets,
+        disabledFeatureSets: config.disabledFeatureSets,
+      },
+    );
+
+    // Inform server which feature sets are enabled/disabled
+    if (updateParams.enabled?.length || updateParams.disabled?.length) {
+      connection.sendFeatureSetsUpdate(updateParams);
+    }
+
+    // Configure scope whitelist/blacklist patterns
+    if (config.scopes) {
+      this.scopeManager!.configureAll(config.scopes);
+    }
+
+    // Register stateful feature sets with checkpoint manager (Step 8)
+    if (this.checkpointManager) {
+      const declared = this.featureSetManager!.getDeclaredFeatureSets(config.id);
+      if (declared) {
+        for (const [fsName, fsDecl] of Object.entries(declared)) {
+          if (fsDecl.rollback || fsDecl.hostState) {
+            this.checkpointManager.registerFeatureSet(config.id, fsName, {
+              hostState: fsDecl.hostState ?? false,
+              rollback: fsDecl.rollback ?? false,
+            });
           }
         }
       }
     }
-
-    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
 
   // ==========================================================================
@@ -4469,9 +5182,10 @@ export class AgentFramework {
   }
 
   /**
-   * Disconnect an MCPL server at runtime: close the connection (which also
-   * cleans feature sets and checkpoints via the 'close' handler), remove its
-   * channels from the registry, drop routing entries, and refresh tools.
+   * Disconnect an MCPL server at runtime: close the connection, destroy its
+   * feature-set and checkpoint state (permanent removal — unlike a transient
+   * transport close, which preserves checkpoints for the reconnect), remove
+   * its channels from the registry, drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
    */
   async disconnectMcplServer(id: string): Promise<void> {
@@ -4483,6 +5197,13 @@ export class AgentFramework {
 
     await this.mcplServerRegistry.removeServer(id);
     this.channelRegistry?.removeServer(id);
+
+    // Permanent removal: also destroy feature-set and checkpoint state
+    // explicitly. The 'close' handler usually does this, but a connection that
+    // already transiently closed (reconnect pending) emits no second 'close'
+    // from close(), and the transient path deliberately preserves checkpoints.
+    this.featureSetManager?.removeServer(id);
+    this.checkpointManager?.removeServer(id);
 
     const prefix = config?.toolPrefix ?? `mcpl--${id}`;
     this.mcplPrefixMap.delete(prefix);
@@ -4636,8 +5357,25 @@ export class AgentFramework {
       this.handleToolsListChanged(connection.id);
     });
 
-    // Also refresh tools on reconnect (server may have different tools)
+    // Re-establish full server registration on reconnect. The 'close' handler
+    // removed the feature-set state, so pushes / inference requests from the
+    // revived server would otherwise be rejected with "Unknown server" until a
+    // host restart. Re-runs the same init as the initial connect path (the
+    // fresh handshake refreshed connection.capabilities); checkpoint trees
+    // preserved across the transient close are resumed by idempotent
+    // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
+      try {
+        const config = this.mcplServerConfigs.get(connection.id);
+        if (config) {
+          this.registerMcplServerFeatures(config, connection);
+        }
+      } catch (error) {
+        console.error(
+          `MCPL server "${connection.id}" re-registration after reconnect failed:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
       this.handleToolsListChanged(connection.id);
       this.emitTrace({
         type: 'mcpl:server-reconnected',
@@ -4669,6 +5407,35 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
+      // The reconnect loop never gives up (backoff caps at ~300s), so
+      // "the server is effectively down" is an attempt-count judgment:
+      // 5 failed attempts ≈ a few minutes of outage. Throttled per
+      // (serverId, kind), so a long outage re-posts every ~15 min.
+      if (params.attempt >= 5) {
+        this.opsAlert(
+          'mcpl-down',
+          connection.id,
+          `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`,
+        );
+      }
+    });
+
+    // A late response to a tools/call that already timed out, carrying
+    // stateful data the server advanced to. The host can't re-inject it (the
+    // dispatch context is gone), but surfacing it makes the checkpoint-tree
+    // divergence greppable instead of a silent drift into stale state.
+    connection.on('orphaned-response', (info: {
+      id: string | number;
+      hadState: boolean;
+      hadCheckpoint: boolean;
+    }) => {
+      this.emitTrace({
+        type: 'mcpl:orphaned-response',
+        serverId: connection.id,
+        responseId: info.id,
+        hadState: info.hadState,
+        hadCheckpoint: info.hadCheckpoint,
+      });
     });
 
     // Connection-level errors (e.g. child process 'error' after spawn).
@@ -4682,10 +5449,17 @@ export class AgentFramework {
       });
     });
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect. Feature-set state is always dropped (the server
+    // can't be validated while down; reconnect re-registers it). Checkpoint
+    // trees, however, are durable state: CheckpointManager.removeServer deletes
+    // them AND persists the deletion to Chronicle. The close handler must
+    // therefore NEVER destroy checkpoints — `willReconnect` is false on a clean
+    // stop() too (reconnectEnabled is cleared before 'close' fires), so gating
+    // on it would erase every checkpoint tree on an ordinary host restart while
+    // a SIGKILL preserves them. Permanent removal is owned solely by
+    // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
-      this.checkpointManager?.removeServer(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
@@ -5108,7 +5882,16 @@ export class AgentFramework {
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
     // endTurn: the agent stops here and goes idle for the duration.
-    finish({ success: true, data: { sleepingFor: human, until }, endTurn: true });
+    finish({
+      success: true,
+      data: {
+        sleepingFor: human,
+        until,
+        untilLocal: formatZonedDateTime(until, this.timeZone),
+        timeZone: this.timeZone,
+      },
+      endTurn: true,
+    });
   }
 
   /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected

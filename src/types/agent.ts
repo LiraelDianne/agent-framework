@@ -48,7 +48,7 @@ export interface AgentConfig {
 
   /**
    * Prompt-cache TTL forwarded to the provider (Anthropic `cache_control.ttl`).
-   * '5m' (provider default) or '1h'. When unset, Membrane's default applies.
+   * '5m' or '1h'. Defaults to '1h'.
    *
    * Why you'd set '1h': for persistent agents whose conversational cadence is
    * slower than 5 minutes, the default TTL expires between turns and the full
@@ -57,10 +57,14 @@ export interface AgentConfig {
    * chatty-but-not-rapid agent pays the write premium over and over. With '1h'
    * the write happens once per idle-hour and subsequent turns hit cache reads;
    * in practice cache writes can dominate spend for slow-cadence agents.
-   * Keep '5m' (or unset) for high-frequency loops with sub-5-minute cadence,
+   * Set '5m' explicitly for high-frequency loops with sub-5-minute cadence,
    * where the cheaper write premium wins.
    */
   cacheTtl?: '5m' | '1h';
+
+  /** Provider-specific request parameters (for example Responses reasoning
+   * and server-side compaction settings). */
+  providerParams?: Record<string, unknown>;
   /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks

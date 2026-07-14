@@ -60,6 +60,13 @@ export type TraceEvent =
       type: 'inference:exhausted';
       agentName: string;
       error: string;
+      /** Whether membrane classified the failure as retryable (observability). */
+      retryable?: boolean;
+      /**
+       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length').
+       * The poison-history breaker fires only on 'invalid_request'.
+       */
+      errorType?: string;
     })
 
   // Streaming inference lifecycle
@@ -304,6 +311,32 @@ export type TraceEvent =
       type: 'mcpl:server-error';
       serverId: string;
       error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:orphaned-response';
+      serverId: string;
+      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      responseId: string | number;
+      /** True when the dropped response carried host-managed `state`. */
+      hadState: boolean;
+      /** True when the dropped response carried a server-managed `checkpoint`. */
+      hadCheckpoint: boolean;
+    })
+
+  // Ops / fleet observability. Everything the framework's opsAlert() escalates
+  // (refusals, hard-down, MCPL unreachable, …) mirrored onto the trace bus so
+  // authorized observers see alerts on the same wire as the rest of the
+  // agent's internal life. Discord (CONNECTOME_OPS_WEBHOOK) is one sink of
+  // this stream, not a separate system. See connectome docs/observability.md.
+  | (TraceEventBase & {
+      type: 'ops:alert';
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      kind: string;
+      /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
+      agentName: string;
+      message: string;
+      /** Kind-specific structured payload (mirrors the failures.log record). */
+      data?: Record<string, unknown>;
     });
 
 /**

@@ -47,7 +47,9 @@ export class Agent {
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
-  readonly cacheTtl: AgentConfig['cacheTtl'];
+  readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
+  /** Provider-specific request parameters forwarded unchanged by Membrane. */
+  readonly providerParams?: Record<string, unknown>;
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -75,7 +77,8 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
-    this.cacheTtl = config.cacheTtl;
+    this.cacheTtl = config.cacheTtl ?? '1h';
+    this.providerParams = config.providerParams;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -217,6 +220,7 @@ export class Agent {
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
       tools: tools.length > 0 ? tools : undefined,
+      ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
 
@@ -325,7 +329,38 @@ export class Agent {
     injections?: ContextInjection[],
     budget?: TokenBudget
   ): Promise<NormalizedRequest> {
+    // Keep the context manager's view of the live tool surface current: the
+    // autobiographical strategy must declare the same tools on its
+    // summarizer/compression requests, or transcripts containing tool blocks
+    // are refused by Anthropic's reasoning_extraction classifier (labclaude
+    // incident, 2026-07-09). Optional chaining: older context-manager
+    // versions don't have the hook.
+    (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
+      .setToolDefinitions?.(availableTools);
+
     let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+
+    // Sanitize: strip empty/whitespace text blocks and drop messages left with
+    // no content. The Anthropic API rejects empty text blocks with 400
+    // "messages: text content blocks must be non-empty"; when such a block
+    // reaches a live activation request the agent cannot complete ANY turn
+    // ([inference-failed] on every attempt) until the offending message ages
+    // out of the window. Empty text blocks occur naturally: tool-only turns,
+    // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
+    // through unchanged, so tool pairing is unaffected. (Field-observed
+    // 2026-07-10 on a resident agent: one empty block muted the agent's live
+    // path entirely; twin of context-manager's stripEmptyTextBlocks on the
+    // compression path.)
+    messages = messages
+      .map((m) => ({
+        ...m,
+        content: m.content.filter(
+          // typeof guard is deliberate runtime defense: history loaded from
+          // disk can carry a non-string `text` despite what the types claim.
+          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+        ),
+      }))
+      .filter((m) => m.content.length > 0);
 
     // Safety: ensure messages don't end with an assistant message.
     // Some models reject trailing assistant messages ("prefill not supported"),
@@ -348,7 +383,8 @@ export class Agent {
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: true,
-      ...(this.cacheTtl !== undefined && { cacheTtl: this.cacheTtl }),
+      cacheTtl: this.cacheTtl,
+      ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
   }
