@@ -284,18 +284,9 @@ export interface McplServerConfig {
   toolPrefix?: string;
 
   /**
-   * How channels registered by this server are opened.
-   * - `'auto'` (default) — every registered channel is auto-opened; the host
-   *   receives all traffic. Matches prior behavior. Right for agents that
-   *   should listen passively (e.g. a frontdesk clerk).
-   * - `'manual'` — registered channels are listed but not opened. The agent
-   *   must call the `channel_open` tool to start receiving messages. Right
-   *   for focused agents that should not be flooded with chatter from
-   *   servers that advertise many public channels (e.g. Zulip's full stream
-   *   list).
-   * - `string[]` — allow-list of channel ids; only matching channels are
-   *   auto-opened. Ids are server-scoped (the raw id the server registers,
-   *   e.g. `"zulip:tracker-miner-f"`).
+   * @deprecated One-time migration input for an installation's old auto,
+   * manual, or allow-list policy. Runtime lifecycle state is persisted in
+   * Chronicle and changed with channel_open/channel_close.
    */
   channelSubscription?: 'auto' | 'manual' | string[];
 }
@@ -797,6 +788,33 @@ export interface ChannelDescriptor {
 
   /** Arbitrary metadata */
   metadata?: Record<string, unknown>;
+
+  /**
+   * Server bootstrap preference, consulted only when the host has no durable
+   * desired state for this channel.
+   */
+  initiallyOpen?: boolean;
+
+  /** Optional generic capabilities exposed by this channel. */
+  capabilities?: ChannelCapabilities;
+}
+
+export interface ChannelCapabilities {
+  history?: {
+    maxMessages?: number;
+    supportsBeforeMessage?: boolean;
+    supportsSinceLastSeen?: boolean;
+  };
+  acknowledgment?: {
+    kind?: string;
+    supportsValue?: boolean;
+  };
+}
+
+export interface ChannelHistoryRequest {
+  limit: number;
+  beforeMessageId?: string;
+  sinceLastSeen?: boolean;
 }
 
 /**
@@ -858,9 +876,12 @@ export interface ChannelsListResult {
  * Spec Section 14.3.
  */
 export interface ChannelsOpenParams {
+  /** Exact registered id. Preferred over type/address matching. */
+  channelId?: string;
   type: string;
   address?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  history?: ChannelHistoryRequest;
 }
 
 /**
@@ -868,6 +889,8 @@ export interface ChannelsOpenParams {
  */
 export interface ChannelsOpenResult {
   channel: ChannelDescriptor;
+  history?: ChannelIncomingMessage[];
+  historyTruncated?: boolean;
 }
 
 /**
@@ -883,6 +906,19 @@ export interface ChannelsCloseParams {
  */
 export interface ChannelsCloseResult {
   closed: boolean;
+}
+
+export interface ChannelsAcknowledgeParams {
+  channelId: string;
+  messageId: string;
+  intent: string;
+  value?: string;
+}
+
+export interface ChannelsAcknowledgeResult {
+  acknowledged: boolean;
+  representation?: string;
+  reason?: string;
 }
 
 /**
@@ -1046,6 +1082,7 @@ export const McplMethod = {
   ChannelsList: 'channels/list',
   ChannelsOpen: 'channels/open',
   ChannelsClose: 'channels/close',
+  ChannelsAcknowledge: 'channels/acknowledge',
   ChannelsOutgoingChunk: 'channels/outgoing/chunk',
   ChannelsOutgoingComplete: 'channels/outgoing/complete',
   ChannelsPublish: 'channels/publish',

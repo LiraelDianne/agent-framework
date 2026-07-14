@@ -220,7 +220,7 @@ test('buildChannelContext advertises the active triggering channel as defaultOut
   assert.equal(ctx?.defaultOutgoing?.channelId, 'chanA');
 });
 
-test('ensureChannelRegistered opens a DM channel so the reply can route back to it (item-3 redux DM sub-case)', async () => {
+test('ensureChannelRegistered keeps a DM closed while making its one-shot reply routable', async () => {
   // A Discord DM arrives via push/event (channel closed), so it is never
   // registered and never updates defaultPublishChannel — routeSpeech would drop
   // the reply. Registering it on inbound makes it a publishable locus; the
@@ -242,6 +242,7 @@ test('ensureChannelRegistered opens a DM channel so the reply can route back to 
   const entry = lookup(dm);
   assert.ok(entry, 'the DM channel should be registered');
   assert.equal(entry!.serverId, 'discord');
+  assert.equal(entry!.open, false, 'one-shot reachability is not a subscription');
   assert.ok(traces.some((t) => t.type === 'mcpl:channel-lazy-registered'));
 
   const res = await registry.routeSpeech('scout', 'replying in the DM');
@@ -250,15 +251,15 @@ test('ensureChannelRegistered opens a DM channel so the reply can route back to 
   assert.equal(publishCalls.at(-1)?.channelId, dm);
 });
 
-test('ensureChannelRegistered is idempotent and re-opens a closed channel', () => {
+test('ensureChannelRegistered is idempotent and does not reopen a closed channel', () => {
   const { registry, lookup } = makeRegistry({ delivered: true });
   registry.ensureChannelRegistered('discord', 'discord:guild:7', '#cairn');
   const first = lookup('discord:guild:7');
   assert.ok(first);
-  // Force it closed, then re-ensure — should re-open, not duplicate.
+  // Force it closed, then re-ensure — a direct push must not mutate lifecycle.
   first!.open = false;
   registry.ensureChannelRegistered('discord', 'discord:guild:7', '#cairn');
   const second = lookup('discord:guild:7');
   assert.equal(second, first, 'must reuse the same entry');
-  assert.equal(second!.open, true, 'a previously-closed channel is re-opened');
+  assert.equal(second!.open, false, 'a direct push must not mutate lifecycle');
 });

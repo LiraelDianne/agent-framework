@@ -126,17 +126,19 @@ describe('ChannelRegistry + EventGate roundtrip', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ChannelRegistry: per-server channelSubscription policy gates auto-open
+// ChannelRegistry: legacy policy seeds durable desired state exactly once
 // ---------------------------------------------------------------------------
 
 describe('ChannelRegistry subscriptionPolicy', () => {
   function makeServerStub() {
     const opens: Array<{ type: string; address: unknown }> = [];
+    const closes: Array<{ channelId: string }> = [];
     const server = {
       sendChannelsOpen: async (args: { type: string; address: unknown }) => { opens.push(args); },
+      sendChannelsClose: async (args: { channelId: string }) => { closes.push(args); return { closed: true }; },
     };
     const serverRegistry = { getServer: () => server } as unknown as ConstructorParameters<typeof ChannelRegistry>[0];
-    return { opens, serverRegistry };
+    return { opens, closes, serverRegistry };
   }
 
   const channels = [
@@ -146,23 +148,25 @@ describe('ChannelRegistry subscriptionPolicy', () => {
   ];
   const registerParams = { channels } as unknown as ChannelsIncomingParams;
 
-  it("default 'auto' opens every registered channel", async () => {
-    const { opens, serverRegistry } = makeServerStub();
+  it('defaults closed when there is no legacy policy or server bootstrap preference', async () => {
+    const { opens, closes, serverRegistry } = makeServerStub();
     const registry = new ChannelRegistry(serverRegistry, {} as never, () => {}, () => {});
 
     await registry.handleRegister('zulip', registerParams as never);
 
-    assert.strictEqual(opens.length, 3);
+    assert.strictEqual(opens.length, 0);
+    assert.strictEqual(closes.length, 3);
   });
 
   it("'manual' opens nothing but still registers the channels", async () => {
-    const { opens, serverRegistry } = makeServerStub();
+    const { opens, closes, serverRegistry } = makeServerStub();
     const registry = new ChannelRegistry(serverRegistry, {} as never, () => {}, () => {});
     registry.setSubscriptionPolicy('zulip', 'manual');
 
     await registry.handleRegister('zulip', registerParams as never);
 
     assert.strictEqual(opens.length, 0);
+    assert.strictEqual(closes.length, 3);
     assert.strictEqual(registry.getOpenChannels().length, 0);
   });
 
@@ -176,4 +180,154 @@ describe('ChannelRegistry subscriptionPolicy', () => {
     assert.strictEqual(opens.length, 1);
     assert.deepStrictEqual(opens[0].address, { streamId: 1 });
   });
+
+  it("legacy 'auto' opens every channel during migration", async () => {
+    const { opens, serverRegistry } = makeServerStub();
+    const registry = new ChannelRegistry(serverRegistry, {} as never, () => {}, () => {});
+    registry.setSubscriptionPolicy('zulip', 'auto');
+
+    await registry.handleRegister('zulip', registerParams as never);
+
+    assert.strictEqual(opens.length, 3);
+  });
+
+  it('does not apply a migrated allow-list to channels discovered later', async () => {
+    const { opens, closes, serverRegistry } = makeServerStub();
+    const registry = new ChannelRegistry(serverRegistry, {} as never, () => {}, () => {});
+    registry.setSubscriptionPolicy('zulip', ['zulip:tracker-miner-f']);
+    await registry.handleRegister('zulip', registerParams as never);
+
+    await registry.handleChanged('zulip', {
+      added: [{
+        id: 'zulip:new', type: 'zulip-stream', label: 'new', direction: 'bidirectional',
+        address: { streamId: 4 },
+      }],
+    });
+
+    assert.strictEqual(opens.filter((o) => (o.address as { streamId?: number }).streamId === 4).length, 0);
+    assert.ok(closes.some((c) => c.channelId === 'zulip:new'));
+  });
+});
+
+describe('ChannelRegistry durable lifecycle', () => {
+  const oneChannel = [{
+    id: 'discord:g1:c1',
+    type: 'discord',
+    label: '#general',
+    direction: 'bidirectional' as const,
+    address: { guildId: 'g1', channelId: 'c1' },
+  }];
+
+  function memoryStore() {
+    let registered = false;
+    const events: unknown[] = [];
+    return {
+      registerState: () => {
+        if (registered) throw new Error('State already exists');
+        registered = true;
+      },
+      getStateJson: () => events,
+      appendToStateJson: (_id: string, event: unknown) => events.push(event),
+    };
+  }
+
+  it('restores desired state from Chronicle and reconciles it after reconnect', async () => {
+    const store = memoryStore();
+    const first = makeLifecycleServer();
+    const registry1 = new ChannelRegistry(first.registry, {} as never, () => {}, () => {}, {
+      store: store as never,
+    });
+    registry1.setSubscriptionPolicy('discord', 'auto');
+    await registry1.handleRegister('discord', { channels: oneChannel });
+    await registry1.handleChannelToolCall('channel_close', { channelId: 'discord:g1:c1' });
+
+    const second = makeLifecycleServer();
+    const registry2 = new ChannelRegistry(second.registry, {} as never, () => {}, () => {}, {
+      store: store as never,
+    });
+    // Even a contradictory legacy setting cannot override a completed migration.
+    registry2.setSubscriptionPolicy('discord', 'auto');
+    await registry2.handleRegister('discord', { channels: oneChannel });
+
+    assert.deepStrictEqual(second.opens, []);
+    assert.deepStrictEqual(second.closes, ['discord:g1:c1']);
+    assert.strictEqual(registry2.getDesiredState('discord', 'discord:g1:c1'), 'closed');
+  });
+
+  it('declines a closed-channel invitation with an optional acknowledgment', async () => {
+    const server = makeLifecycleServer();
+    const registry = new ChannelRegistry(server.registry, {} as never, () => {}, () => {});
+    registry.setSubscriptionPolicy('discord', 'manual');
+    await registry.handleRegister('discord', { channels: oneChannel });
+
+    const result = await registry.handleChannelToolCall('channel_decline', {
+      channelId: 'discord:g1:c1',
+      messageId: 'm1',
+      acknowledge: '👀',
+    });
+
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(server.acks, [{
+      channelId: 'discord:g1:c1', messageId: 'm1', intent: 'seen-not-opening', value: '👀',
+    }]);
+    assert.strictEqual(registry.isChannelOpen('discord:g1:c1'), false);
+  });
+
+  it('requires serverId only when two MCPLs expose the same channel id', async () => {
+    const openedBy: string[] = [];
+    const servers = new Map(['alpha', 'beta'].map((serverId) => [serverId, {
+      sendChannelsOpen: async () => {
+        openedBy.push(serverId);
+        return { channel: { ...oneChannel[0], id: 'shared' } };
+      },
+      sendChannelsClose: async () => ({ closed: true }),
+    }]));
+    const registry = new ChannelRegistry(
+      { getServer: (id: string) => servers.get(id) } as never,
+      {} as never,
+      () => {},
+      () => {},
+    );
+    const descriptor = { ...oneChannel[0], id: 'shared' };
+    registry.setSubscriptionPolicy('alpha', 'manual');
+    registry.setSubscriptionPolicy('beta', 'manual');
+    await registry.handleRegister('alpha', { channels: [descriptor] });
+    await registry.handleRegister('beta', { channels: [descriptor] });
+
+    const ambiguous = await registry.handleChannelToolCall('channel_open', { channelId: 'shared' });
+    assert.strictEqual(ambiguous.success, false);
+    assert.match(ambiguous.error ?? '', /ambiguous/);
+
+    const exact = await registry.handleChannelToolCall('channel_open', {
+      channelId: 'shared', serverId: 'beta',
+    });
+    assert.strictEqual(exact.success, true);
+    assert.deepStrictEqual(openedBy, ['beta']);
+  });
+
+  function makeLifecycleServer() {
+    const opens: string[] = [];
+    const closes: string[] = [];
+    const acks: unknown[] = [];
+    const server = {
+      sendChannelsOpen: async (args: { channelId?: string }) => {
+        opens.push(args.channelId ?? '');
+        return { channel: oneChannel[0] };
+      },
+      sendChannelsClose: async (args: { channelId: string }) => {
+        closes.push(args.channelId);
+        return { closed: true };
+      },
+      sendChannelsAcknowledge: async (args: unknown) => {
+        acks.push(args);
+        return { acknowledged: true, representation: '👀' };
+      },
+    };
+    return {
+      opens,
+      closes,
+      acks,
+      registry: { getServer: () => server } as unknown as ConstructorParameters<typeof ChannelRegistry>[0],
+    };
+  }
 });

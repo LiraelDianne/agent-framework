@@ -226,6 +226,7 @@ export interface McplPushEvent {
   eventId: string;
   content: ContentBlock[];
   origin?: Record<string, unknown>;
+  tags?: string[];
   timestamp: string;
   inferenceId: string;
   triggerInference?: boolean;
@@ -249,4 +250,3 @@ export interface McplChannelIncomingEvent {
   triggerInference?: boolean;
   targetAgents?: string[];
 }
-

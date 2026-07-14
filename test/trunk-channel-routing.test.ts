@@ -33,6 +33,8 @@ function internals(framework: AgentFramework) {
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
     ): { channelId: string; label?: string } | undefined;
+    channelRegistry: unknown;
+    handleMcplPushEvent(event: unknown): void;
   };
 }
 
@@ -135,6 +137,47 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = internals(framework);
     assert.equal(i.derivePushEventChannel(undefined), undefined);
     assert.equal(i.derivePushEventChannel({ source: 'heartbeat', kind: 'tick' }), undefined);
+    await framework.stop();
+  });
+
+  it('adds an actionable invitation when addressed in a closed channel', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      stopAll: () => {},
+    };
+
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m1',
+      content: [{ type: 'text', text: 'Antra: can you look at this?' }],
+      origin: {
+        source: 'discord',
+        messageId: 'm1',
+        mcplChannelId: 'discord:G1:C7',
+        channelName: 'portables',
+      },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i1',
+      triggerInference: false,
+    });
+
+    const messages = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages;
+    const text = messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /Channel invitation/);
+    assert.match(text, /channel_open/);
+    assert.match(text, /backscroll \(0-80\)/);
+    assert.match(text, /channel_decline/);
+    assert.match(text, /optionally set acknowledge/);
     await framework.stop();
   });
 

@@ -31,6 +31,8 @@ import type {
   ChannelsOpenResult,
   ChannelsCloseParams,
   ChannelsCloseResult,
+  ChannelsAcknowledgeParams,
+  ChannelsAcknowledgeResult,
   ChannelsListResult,
   ChannelsPublishParams,
   ChannelsPublishResult,
@@ -395,6 +397,14 @@ export class McplServerConnection extends EventEmitter {
   /** Send `channels/close` request and await result. */
   sendChannelsClose(params: ChannelsCloseParams): Promise<ChannelsCloseResult> {
     return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>) as Promise<ChannelsCloseResult>;
+  }
+
+  /** Send `channels/acknowledge` request and await result. */
+  sendChannelsAcknowledge(params: ChannelsAcknowledgeParams): Promise<ChannelsAcknowledgeResult> {
+    return this.sendRequest(
+      McplMethod.ChannelsAcknowledge,
+      params as unknown as Record<string, unknown>,
+    ) as Promise<ChannelsAcknowledgeResult>;
   }
 
   /** Send `channels/list` request and await result. */

@@ -6,7 +6,7 @@
  *
  * Responsibilities:
  * - Register/unregister channel descriptors from MCPL servers
- * - Auto-open channels on registration
+ * - Reconcile actual channel state to Chronicle-backed desired state
  * - Route incoming messages to the processing queue
  * - Manage typing indicator timers (7s interval for Discord compatibility)
  * - Expose synthesized tools: channel_list, channel_open, channel_close, channel_publish
@@ -14,6 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import type { JsStore } from '@animalabs/chronicle';
 
 import type {
   ChannelDescriptor,
@@ -25,6 +26,8 @@ import type {
   ChannelsIncomingResult,
   ChannelIncomingMessageResult,
   ChannelsPublishParams,
+  ChannelsOpenResult,
+  ChannelHistoryRequest,
   McplContentBlock,
 } from './types.js';
 
@@ -37,6 +40,20 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 // ============================================================================
 
 const TYPING_INTERVAL_MS = 7_000;
+const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
+
+type DesiredChannelState = 'open' | 'closed';
+
+interface ChannelLifecycleEvent {
+  kind: 'desired-state' | 'legacy-policy-migrated' | 'invitation-declined';
+  serverId: string;
+  timestamp: string;
+  channelId?: string;
+  desired?: DesiredChannelState;
+  source?: string;
+  messageId?: string;
+  acknowledgment?: string;
+}
 
 function shallowEqualRecord(
   a: Record<string, unknown> | undefined,
@@ -141,13 +158,45 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_open',
-    description: 'Open a channel to start receiving messages',
+    description:
+      'Open a channel to start receiving its ordinary ongoing traffic. The MCPL ' +
+      'integration performs its own subscribe/join/attach operation. Optionally request ' +
+      'history preceding the message that invited you into the channel.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: 'ID of the channel to open' },
+        serverId: { type: 'string', description: 'Owning MCPL server; required only when channelId is ambiguous.' },
+        backscroll: {
+          type: 'number',
+          description: 'Number of earlier messages to return while opening (0-500; default 0).',
+        },
+        beforeMessageId: {
+          type: 'string',
+          description: 'Anchor message from the closed-channel notice; it is excluded from backscroll.',
+        },
       },
       required: ['channelId'],
+    },
+  },
+  {
+    name: 'channel_decline',
+    description:
+      'Deliberately remain closed after being addressed in a closed channel. Optionally ' +
+      'post a public acknowledgment through the MCPL integration. Acknowledgment is ' +
+      'opt-in; omitting it declines silently.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        channelId: { type: 'string', description: 'Channel from the invitation notice.' },
+        serverId: { type: 'string', description: 'Owning MCPL server from the invitation notice.' },
+        messageId: { type: 'string', description: 'Triggering message to acknowledge.' },
+        acknowledge: {
+          type: 'string',
+          description: 'Optional surface value such as 👀. Omit for a silent decline.',
+        },
+      },
+      required: ['channelId', 'messageId'],
     },
   },
   {
@@ -157,6 +206,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: 'ID of the channel to close' },
+        serverId: { type: 'string', description: 'Owning MCPL server; required only when channelId is ambiguous.' },
       },
       required: ['channelId'],
     },
@@ -218,6 +268,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 interface ChannelRegistryOptions {
+  /** Chronicle store used for durable desired channel lifecycle state. */
+  store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
   shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   /**
@@ -285,6 +337,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
+  private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
@@ -303,12 +356,12 @@ export class ChannelRegistry {
    *  server keeps getting the same routing hints (e.g. Zulip topic). */
   private typingMetadata = new Map<string, Record<string, unknown>>();
 
-  /**
-   * Per-server channel auto-open policy. Populated by the framework from
-   * each McplServerConfig at connect time; default ('auto') applies when
-   * unset.
-   */
-  private subscriptionPolicies = new Map<string, 'auto' | 'manual' | string[]>();
+  /** Chronicle-projected desired lifecycle state, keyed by server + channel. */
+  private desiredStates = new Map<string, DesiredChannelState>();
+
+  /** One-time migration inputs from the retired recipe auto-open policy. */
+  private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
+  private migratedLegacyPolicies = new Set<string>();
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -333,14 +386,17 @@ export class ChannelRegistry {
     this.onRouteFailure = options?.onRouteFailure;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.store = options?.store;
+    this.initializeLifecycleStore();
   }
 
   /**
-   * Set the channel auto-open policy for a server. Called by the framework
-   * when each MCPL server is registered.
+   * Supply a legacy recipe policy for one-time migration into Chronicle.
    */
   setSubscriptionPolicy(serverId: string, policy: 'auto' | 'manual' | string[]): void {
-    this.subscriptionPolicies.set(serverId, policy);
+    // Backward-compatible recipe ingestion only. The policy is consumed once
+    // to seed Chronicle, then never applied to newly discovered channels.
+    this.legacyPolicies.set(serverId, policy);
   }
 
   // ==========================================================================
@@ -350,7 +406,7 @@ export class ChannelRegistry {
   /**
    * Handle `channels/register` from a server.
    *
-   * Registers each channel descriptor in the map and auto-opens them.
+   * Registers descriptors and reconciles them to durable desired state.
    */
   async handleRegister(
     serverId: string,
@@ -369,13 +425,15 @@ export class ChannelRegistry {
       registeredIds.push(channel.id);
     }
 
-    // Respond before auto-opening — the server blocks on this response and
+    // Respond before reconciliation — the server blocks on this response and
     // can't process channels/open until it arrives.
     const result: ChannelsRegisterResult = { registered: registeredIds };
     responder?.respond(result);
 
-    // Auto-open all registered channels
-    await this.autoOpenChannels(serverId, params.channels);
+    // One-time migration from the retired recipe policy, then reconcile the
+    // server to Chronicle-backed desired state.
+    this.migrateLegacyPolicy(serverId, params.channels);
+    await this.reconcileChannels(serverId, params.channels);
 
     this.emitTraceFn({
       type: 'mcpl:channels-register',
@@ -388,7 +446,7 @@ export class ChannelRegistry {
   /**
    * Handle `channels/changed` notification from a server.
    *
-   * Processes added (register + auto-open), removed (delete + stop typing),
+   * Processes added (register + reconcile), removed (delete + stop typing),
    * and updated (replace descriptor) channels.
    */
   async handleChanged(
@@ -415,7 +473,7 @@ export class ChannelRegistry {
       }
     }
 
-    // Process added channels (register + auto-open)
+    // Process added channels (register + reconcile durable desired state)
     if (params.added) {
       for (const channel of params.added) {
         const key = `${serverId}:${channel.id}`;
@@ -425,7 +483,7 @@ export class ChannelRegistry {
           open: false,
         });
       }
-      await this.autoOpenChannels(serverId, params.added);
+      await this.reconcileChannels(serverId, params.added);
     }
 
     this.emitTraceFn({
@@ -494,6 +552,12 @@ export class ChannelRegistry {
           channelId: message.channelId,
           label: channelLabel,
         });
+      } else {
+        // A server sending channels/incoming is authoritative evidence that
+        // the transport is actually open. This repairs transient status only;
+        // durable desired state still changes exclusively through lifecycle
+        // operations.
+        this.channels.get(incomingKey)!.open = true;
       }
 
       // Determine whether to trigger inference
@@ -556,8 +620,9 @@ export class ChannelRegistry {
   }
 
   /**
-   * Ensure a channel is registered AND open so it can serve as an outbound
-   * routing locus, lazy-registering it if unseen and opening it if closed.
+   * Ensure a channel is registered so it can serve as an outbound routing
+   * locus. A push event from a closed channel must never mutate lifecycle
+   * state: direct-address events are intentionally usable without subscribing.
    *
    * Mirrors the lazy-registration inside handleIncoming(), but for channels
    * that only ever arrive as push/events rather than channels/incoming — the
@@ -567,15 +632,11 @@ export class ChannelRegistry {
    * silently dropped even though the inbound message proves the channel is
    * reachable (item-3 redux, DM sub-case). Idempotent: a later authoritative
    * channels/register or channels/changed overwrites this descriptor with the
-   * richer one; re-opening an already-open channel is a no-op.
+   * richer one.
    */
   ensureChannelRegistered(serverId: string, channelId: string, label?: string): void {
     const existing = this.findChannelEntry(channelId);
     if (existing) {
-      if (!existing.open) {
-        existing.open = true;
-        this.emitTraceFn({ type: 'mcpl:channel-opened', serverId: existing.serverId, channelId });
-      }
       return;
     }
 
@@ -589,7 +650,7 @@ export class ChannelRegistry {
         direction: 'bidirectional',
         metadata: { lazyRegistered: true },
       },
-      open: true,
+      open: false,
     });
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
@@ -713,6 +774,14 @@ export class ChannelRegistry {
     return this.findChannelEntry(channelId)?.descriptor;
   }
 
+  isChannelOpen(channelId: string): boolean {
+    return this.findChannelEntry(channelId)?.open === true;
+  }
+
+  getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
+    return this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+  }
+
   /**
    * Get all open channels.
    */
@@ -746,10 +815,23 @@ export class ChannelRegistry {
         return this.handleToolList();
 
       case 'channel_open':
-        return this.handleToolOpen(input as { channelId: string });
+        return this.handleToolOpen(input as {
+          channelId: string;
+          serverId?: string;
+          backscroll?: number;
+          beforeMessageId?: string;
+        });
 
       case 'channel_close':
-        return this.handleToolClose(input as { channelId: string });
+        return this.handleToolClose(input as { channelId: string; serverId?: string });
+
+      case 'channel_decline':
+        return this.handleToolDecline(input as {
+          channelId: string;
+          serverId?: string;
+          messageId: string;
+          acknowledge?: string;
+        });
 
       case 'channel_publish':
         return this.handleToolPublish(input as { channelId: string; content: string });
@@ -839,7 +921,7 @@ export class ChannelRegistry {
         this.defaultPublishThreadId = undefined;
       }
     }
-    this.subscriptionPolicies.delete(serverId);
+    // Desired state and migration markers deliberately survive disconnects.
   }
 
   /**
@@ -862,64 +944,152 @@ export class ChannelRegistry {
   }
 
   // ==========================================================================
-  // Private: Auto-open channels
+  // Private: Durable desired state and reconciliation
   // ==========================================================================
 
-  private async autoOpenChannels(
+  private lifecycleKey(serverId: string, channelId: string): string {
+    return `${serverId}\u0000${channelId}`;
+  }
+
+  private initializeLifecycleStore(): void {
+    if (!this.store) return;
+
+    try {
+      this.store.registerState({ id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
+        throw error;
+      }
+    }
+
+    const raw = this.store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
+    if (!Array.isArray(raw)) return;
+
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const event = item as Partial<ChannelLifecycleEvent>;
+      if (typeof event.serverId !== 'string') continue;
+      if (
+        event.kind === 'desired-state' &&
+        typeof event.channelId === 'string' &&
+        (event.desired === 'open' || event.desired === 'closed')
+      ) {
+        this.desiredStates.set(
+          this.lifecycleKey(event.serverId, event.channelId),
+          event.desired,
+        );
+      } else if (event.kind === 'legacy-policy-migrated') {
+        this.migratedLegacyPolicies.add(event.serverId);
+      }
+    }
+  }
+
+  private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
+    this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
+  }
+
+  private setDesiredState(
+    serverId: string,
+    channelId: string,
+    desired: DesiredChannelState,
+    source: string,
+  ): void {
+    const key = this.lifecycleKey(serverId, channelId);
+    if (this.desiredStates.get(key) === desired) return;
+    this.desiredStates.set(key, desired);
+    this.appendLifecycleEvent({
+      kind: 'desired-state',
+      serverId,
+      channelId,
+      desired,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Consume the old recipe policy exactly once. It seeds Chronicle for
+   * existing deployments, but is not an ongoing admission policy: channels
+   * discovered later use their server bootstrap preference, otherwise closed.
+   */
+  private migrateLegacyPolicy(serverId: string, channels: ChannelDescriptor[]): void {
+    if (this.migratedLegacyPolicies.has(serverId)) return;
+
+    const policy = this.legacyPolicies.get(serverId) ?? 'manual';
+    const allowList = Array.isArray(policy) ? new Set(policy) : undefined;
+    for (const channel of channels) {
+      if (this.getDesiredState(serverId, channel.id)) continue;
+      const desired: DesiredChannelState = channel.initiallyOpen === true ||
+        policy === 'auto' || allowList?.has(channel.id)
+        ? 'open'
+        : 'closed';
+      this.setDesiredState(serverId, channel.id, desired, 'legacy-recipe-migration');
+    }
+
+    this.migratedLegacyPolicies.add(serverId);
+    this.appendLifecycleEvent({
+      kind: 'legacy-policy-migrated',
+      serverId,
+      source: Array.isArray(policy) ? 'allow-list' : policy,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): void {
+    if (this.getDesiredState(serverId, channel.id)) return;
+    this.setDesiredState(
+      serverId,
+      channel.id,
+      channel.initiallyOpen === true ? 'open' : 'closed',
+      channel.initiallyOpen === true ? 'server-bootstrap' : 'default-closed',
+    );
+  }
+
+  private async reconcileChannels(
     serverId: string,
     channels: ChannelDescriptor[],
   ): Promise<void> {
     const server = this.serverRegistry.getServer(serverId);
     if (!server) return;
 
-    const policy = this.subscriptionPolicies.get(serverId) ?? 'auto';
-    if (policy === 'manual') {
-      this.emitTraceFn({
-        type: 'mcpl:channels-auto-open-skipped',
-        serverId,
-        reason: 'manual',
-        count: channels.length,
-      });
-      return;
-    }
-
-    const allowList = Array.isArray(policy) ? new Set(policy) : null;
-    let opened = 0;
-
     for (const channel of channels) {
-      if (allowList && !allowList.has(channel.id)) continue;
-
+      this.ensureInitialDesiredState(serverId, channel);
       const key = `${serverId}:${channel.id}`;
+      const desired = this.getDesiredState(serverId, channel.id);
+      const entry = this.channels.get(key);
+      if (desired !== 'open') {
+        try {
+          await server.sendChannelsClose({ channelId: channel.id });
+          if (entry) entry.open = false;
+        } catch (err) {
+          this.emitTraceFn({
+            type: 'mcpl:channel-reconcile-failed',
+            serverId,
+            channelId: channel.id,
+            desired,
+            error: (err as Error).message,
+          });
+        }
+        continue;
+      }
+
       try {
         await server.sendChannelsOpen({
+          channelId: channel.id,
           type: channel.type,
           address: channel.address,
         });
-        const entry = this.channels.get(key);
-        if (entry) {
-          entry.open = true;
-        }
-        opened++;
+        if (entry) entry.open = true;
       } catch (err) {
+        if (entry) entry.open = false;
         this.emitTraceFn({
-          type: 'mcpl:channel-open-failed',
+          type: 'mcpl:channel-reconcile-failed',
           serverId,
           channelId: channel.id,
+          desired,
           error: (err as Error).message,
         });
       }
-    }
-
-    // Surface the common typo failure mode: allow-list set but nothing
-    // matched. Without this trace a one-char typo in a channel id looks
-    // identical to "MCPL didn't register the channel".
-    if (allowList && opened === 0 && channels.length > 0) {
-      this.emitTraceFn({
-        type: 'mcpl:channels-allow-list-empty',
-        serverId,
-        allowList: [...allowList],
-        registered: channels.map(c => c.id),
-      });
     }
   }
 
@@ -963,6 +1133,28 @@ export class ChannelRegistry {
     return undefined;
   }
 
+  private resolveToolChannelEntry(
+    channelId: string,
+    serverId?: string,
+  ): { entry?: ChannelEntry; error?: string } {
+    const matches = [...this.channels.values()].filter(
+      (entry) => entry.descriptor.id === channelId && (!serverId || entry.serverId === serverId),
+    );
+    if (matches.length === 0) {
+      return {
+        error: serverId
+          ? `Channel not found: ${channelId} on server ${serverId}`
+          : `Channel not found: ${channelId}`,
+      };
+    }
+    if (matches.length > 1) {
+      return {
+        error: `Channel id is ambiguous across MCPL servers: ${channelId}. Include serverId.`,
+      };
+    }
+    return { entry: matches[0] };
+  }
+
   /**
    * Find the composite key for a channel by its channelId.
    */
@@ -986,6 +1178,7 @@ export class ChannelRegistry {
       label: string;
       direction: string;
       open: boolean;
+      desired: DesiredChannelState | 'unknown';
       serverId: string;
     }> = [];
 
@@ -996,6 +1189,7 @@ export class ChannelRegistry {
         label: entry.descriptor.label,
         direction: entry.descriptor.direction,
         open: entry.open,
+        desired: this.getDesiredState(entry.serverId, entry.descriptor.id) ?? 'unknown',
         serverId: entry.serverId,
       });
     }
@@ -1006,22 +1200,31 @@ export class ChannelRegistry {
     };
   }
 
-  private async handleToolOpen(input: { channelId: string }): Promise<ToolResult> {
-    const entry = this.findChannelEntry(input.channelId);
+  private async handleToolOpen(input: {
+    channelId: string;
+    serverId?: string;
+    backscroll?: number;
+    beforeMessageId?: string;
+  }): Promise<ToolResult> {
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
+    const entry = resolved.entry;
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${input.channelId}`,
+        error: resolved.error,
         isError: true,
       };
     }
 
-    if (entry.open) {
+    const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
+    if (entry.open && alreadyDesiredOpen && !input.backscroll) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already open' },
       };
     }
+
+    this.setDesiredState(entry.serverId, input.channelId, 'open', 'agent-tool');
 
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
@@ -1033,14 +1236,27 @@ export class ChannelRegistry {
     }
 
     try {
-      await server.sendChannelsOpen({
+      const history: ChannelHistoryRequest | undefined = input.backscroll
+        ? {
+            limit: Math.max(0, Math.min(500, Math.floor(input.backscroll))),
+            ...(input.beforeMessageId ? { beforeMessageId: input.beforeMessageId } : {}),
+          }
+        : undefined;
+      const result: ChannelsOpenResult = await server.sendChannelsOpen({
+        channelId: entry.descriptor.id,
         type: entry.descriptor.type,
         address: entry.descriptor.address,
+        ...(history ? { history } : {}),
       });
       entry.open = true;
       return {
         success: true,
-        data: { channelId: input.channelId, status: 'opened' },
+        data: {
+          channelId: input.channelId,
+          status: alreadyDesiredOpen ? 'reconciled' : 'opened',
+          ...(result.history ? { history: result.history } : {}),
+          ...(result.historyTruncated ? { historyTruncated: true } : {}),
+        },
       };
     } catch (err) {
       return {
@@ -1051,22 +1267,27 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(input: { channelId: string }): Promise<ToolResult> {
-    const entry = this.findChannelEntry(input.channelId);
+  private async handleToolClose(input: { channelId: string; serverId?: string }): Promise<ToolResult> {
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
+    const entry = resolved.entry;
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${input.channelId}`,
+        error: resolved.error,
         isError: true,
       };
     }
 
-    if (!entry.open) {
+    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
+    if (!entry.open && alreadyDesiredClosed) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already closed' },
       };
     }
+
+    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'agent-tool');
+    this.stopTyping(input.channelId);
 
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
@@ -1080,7 +1301,6 @@ export class ChannelRegistry {
     try {
       await server.sendChannelsClose({ channelId: input.channelId });
       entry.open = false;
-      this.stopTyping(input.channelId);
       return {
         success: true,
         data: { channelId: input.channelId, status: 'closed' },
@@ -1092,6 +1312,76 @@ export class ChannelRegistry {
         isError: true,
       };
     }
+  }
+
+  private async handleToolDecline(input: {
+    channelId: string;
+    serverId?: string;
+    messageId: string;
+    acknowledge?: string;
+  }): Promise<ToolResult> {
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
+    const entry = resolved.entry;
+    if (!entry) {
+      return { success: false, error: resolved.error, isError: true };
+    }
+    if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
+      return {
+        success: false,
+        error: `Channel is already open: ${input.channelId}. Use channel_close to leave it.`,
+        isError: true,
+      };
+    }
+
+    // The lifecycle decision is authoritative even if the optional public
+    // acknowledgment cannot be rendered by the surface.
+    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'invitation-declined');
+
+    let acknowledged = false;
+    let representation: string | undefined;
+    let acknowledgmentError: string | undefined;
+    if (input.acknowledge) {
+      const server = this.serverRegistry.getServer(entry.serverId);
+      if (!server) {
+        acknowledgmentError = `Server not found: ${entry.serverId}`;
+      } else {
+        try {
+          const result = await server.sendChannelsAcknowledge({
+            channelId: input.channelId,
+            messageId: input.messageId,
+            intent: 'seen-not-opening',
+            value: input.acknowledge,
+          });
+          acknowledged = result.acknowledged;
+          representation = result.representation;
+          if (!acknowledged) {
+            acknowledgmentError = result.reason ??
+              'The channel integration could not post the acknowledgment.';
+          }
+        } catch (error) {
+          acknowledgmentError = (error as Error).message;
+        }
+      }
+    }
+
+    this.appendLifecycleEvent({
+      kind: 'invitation-declined',
+      serverId: entry.serverId,
+      channelId: input.channelId,
+      messageId: input.messageId,
+      acknowledgment: representation ?? input.acknowledge,
+      timestamp: new Date().toISOString(),
+    });
+    return {
+      success: true,
+      data: {
+        channelId: input.channelId,
+        status: 'remained closed',
+        acknowledged,
+        ...(representation ? { representation } : {}),
+        ...(acknowledgmentError ? { acknowledgmentError } : {}),
+      },
+    };
   }
 
   /**

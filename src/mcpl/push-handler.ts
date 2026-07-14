@@ -35,6 +35,7 @@ export interface McplPushEvent {
   eventId: string;
   content: ContentBlock[];
   origin?: Record<string, unknown>;
+  tags?: string[];
   timestamp: string;
   inferenceId: string;
   triggerInference?: boolean;
@@ -217,6 +218,7 @@ export class PushHandler {
       eventId: params.eventId,
       content,
       origin: params.origin,
+      tags: params.tags,
       timestamp: params.timestamp,
       inferenceId,
       triggerInference,

@@ -3229,22 +3229,6 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): void {
-    const metadata: Record<string, unknown> = {
-      ...event.origin,
-      serverId: event.serverId,
-      featureSet: event.featureSet,
-      eventId: event.eventId,
-      triggered: event.triggerInference ?? false,
-    };
-
-    const id = this.addMessage('user', event.content, metadata);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
-
-    // Some push events carry a channel of origin (Discord DMs arrive here, not
-    // via channels/incoming, because discord-mcpl forwards them with the channel
-    // closed). Register + open that channel so routeSpeech can resolve it, and
-    // thread it onto the wake request so the reply routes back to it instead of
-    // the global locus (item-3 redux, DM sub-case).
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -3253,6 +3237,47 @@ export class AgentFramework {
         triggerChannel.label,
       );
     }
+
+    const metadata: Record<string, unknown> = {
+      ...event.origin,
+      serverId: event.serverId,
+      featureSet: event.featureSet,
+      eventId: event.eventId,
+      triggered: event.triggerInference ?? false,
+    };
+
+    const content = [...event.content];
+    const addressedWhileClosed = triggerChannel &&
+      event.tags?.includes('chat:addressed') &&
+      this.channelRegistry &&
+      !this.channelRegistry.isChannelOpen(triggerChannel.channelId);
+    if (addressedWhileClosed) {
+      const descriptor = this.channelRegistry!.getDescriptor(triggerChannel.channelId);
+      const messageId = typeof event.origin?.messageId === 'string'
+        ? event.origin.messageId
+        : event.eventId;
+      const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
+      content.push({
+        type: 'text',
+        text:
+          `\n[Channel invitation] You were addressed in closed channel ` +
+          `"${triggerChannel.label ?? triggerChannel.channelId}" (${triggerChannel.channelId}, server ${event.serverId}). ` +
+          `You received this one message without subscribing. ` +
+          (maxBackscroll > 0
+            ? `To subscribe, call channel_open with channelId, serverId "${event.serverId}", backscroll (0-${maxBackscroll}), and beforeMessageId "${messageId}". `
+            : `To subscribe, call channel_open with this channelId and serverId "${event.serverId}". `) +
+          `You may reply once without subscribing. To remain closed, call channel_decline ` +
+          `with channelId, serverId "${event.serverId}", and messageId "${messageId}"; ` +
+          `optionally set acknowledge to a surface value such as 👀.`,
+      });
+      metadata.channelInvitation = true;
+      metadata.channelOpen = false;
+      metadata.channelId = triggerChannel.channelId;
+      metadata.invitationMessageId = messageId;
+    }
+
+    const id = this.addMessage('user', content, metadata);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
     if (event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
@@ -3526,7 +3551,9 @@ export class AgentFramework {
     // responding to, for the whole duration of this turn. Started here (paired
     // with the finally below, so it can never leak) and refreshed on a 7s
     // interval by the ChannelRegistry until stopped on any exit path.
-    const typingChannel = this.channelRegistry?.getDefaultPublishChannel();
+    const typingChannel = this.channelRegistry
+      ? trigger?.channelId ?? this.channelRegistry.getDefaultPublishChannel()
+      : null;
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
     try {
@@ -5004,6 +5031,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
+        store: this.store,
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -5108,8 +5136,11 @@ export class AgentFramework {
 
     // Record per-server channel subscription policy before the server
     // registers channels — handleRegister fires during the handshake.
-    if (config.channelSubscription !== undefined && this.channelRegistry) {
-      this.channelRegistry.setSubscriptionPolicy(config.id, config.channelSubscription);
+    if (this.channelRegistry) {
+      this.channelRegistry.setSubscriptionPolicy(
+        config.id,
+        config.channelSubscription ?? 'manual',
+      );
     }
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
