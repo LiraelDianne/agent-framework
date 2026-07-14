@@ -182,6 +182,16 @@ export type ErrorAction =
   | { retry: false; emit?: ProcessEvent };
 
 /**
+ * Terminal result for a framework-driven ephemeral agent run.
+ */
+export interface AgentSettleResult {
+  stopReason: 'completed' | 'turn_ended' | 'exhausted';
+  speech: string;
+  toolCallsCount: number;
+  error?: string;
+}
+
+/**
  * Framework state exposed to policies.
  */
 export interface FrameworkState {
