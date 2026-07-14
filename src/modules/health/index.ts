@@ -167,10 +167,20 @@ export class HealthModule implements Module {
     const recent = this.framework.queryInferenceLogs({ limit: lookback });
     const recentEntries = recent.entries ?? [];
 
+    // Presentation-boundary guard: queryInferenceLogs casts raw persisted
+    // JSON without validation, so a legacy/corrupt record can carry a missing
+    // or non-numeric timestamp. formatZonedDateTime throws on invalid dates
+    // (correctly — misuse should be loud), but one bad record must not sink
+    // the whole snapshot: degrade to the raw value (or null) instead.
+    const safeZoned = (ts: unknown): unknown =>
+      typeof ts === 'number' && Number.isFinite(ts)
+        ? formatZonedDateTime(ts, this.config.timeZone)
+        : ts ?? null;
+
     const projectSummary = (e: typeof recentEntries[number]) => {
       const s = e.summary ?? e.entry;
       return {
-        timestamp: formatZonedDateTime(s.timestamp, this.config.timeZone),
+        timestamp: safeZoned(s.timestamp),
         agentName: s.agentName,
         success: s.success,
         error: s.error,
