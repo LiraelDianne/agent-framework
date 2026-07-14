@@ -236,7 +236,12 @@ interface Deferred<T> {
   reject: (reason?: unknown) => void;
 }
 
-interface AgentSettleProgress {
+/** Per-run state for a framework-driven ephemeral agent: the settle signal
+ *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
+ *  the stream driver share. One map entry per run — created and torn down in
+ *  runEphemeralToCompletion — so the pieces cannot desync. */
+interface EphemeralRun {
+  settle: Deferred<AgentSettleResult>;
   inferenceStarted: boolean;
   lastActivity: number;
   toolCallsCount: number;
@@ -288,9 +293,17 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
-  private turnEndedStreams: Set<string> = new Set();
-  private agentSettles: Map<string, Deferred<AgentSettleResult>> = new Map();
-  private agentSettleProgress: Map<string, AgentSettleProgress> = new Map();
+  /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
+   *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
+   *  restart. The membrane still delivers an `aborted` event for these, and
+   *  without the marker the abort handler would treat it as a terminal
+   *  failure — settling ephemerals with a rejection and emitting a spurious
+   *  `inference:exhausted` (which also pollutes the failure streak). Kept
+   *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
+   *  for resident agents too, and the key is per-stream, not per-agent. */
+  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+  /** Active runEphemeralToCompletion runs, keyed by agent name. */
+  private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
@@ -1210,35 +1223,42 @@ export class AgentFramework {
     return { promise, resolve, reject };
   }
 
-  private touchAgentSettle(agentName: string, inferenceStarted = false): void {
-    const progress = this.agentSettleProgress.get(agentName);
-    if (!progress) return;
+  /** Liveness ping for an active ephemeral run (no-op otherwise). */
+  private touchEphemeralRun(agentName: string, inferenceStarted = false): void {
+    const run = this.ephemeralRuns.get(agentName);
+    if (!run) return;
     if (inferenceStarted) {
-      progress.inferenceStarted = true;
+      run.inferenceStarted = true;
     }
-    progress.lastActivity = Date.now();
+    run.lastActivity = Date.now();
   }
 
-  private recordAgentSettleToolCalls(agentName: string, count: number): void {
-    const progress = this.agentSettleProgress.get(agentName);
-    if (!progress) return;
-    progress.toolCallsCount += count;
-    progress.lastActivity = Date.now();
+  private recordEphemeralToolCalls(agentName: string, count: number): void {
+    const run = this.ephemeralRuns.get(agentName);
+    if (!run) return;
+    run.toolCallsCount += count;
+    run.lastActivity = Date.now();
   }
 
-  private getAgentSettleToolCalls(agentName: string): number {
-    return this.agentSettleProgress.get(agentName)?.toolCallsCount ?? 0;
-  }
-
-  private settleAgent(agentName: string, result: AgentSettleResult): void {
-    const settle = this.agentSettles.get(agentName);
-    if (!settle) return;
-    this.touchAgentSettle(agentName);
-    if (result.stopReason === 'exhausted') {
-      settle.reject(new Error(result.error ?? 'Unknown error'));
+  /** Settle an active ephemeral run (no-op for resident agents). The tool-call
+   *  count comes from the run's own counter — the single source of truth,
+   *  which unlike a per-stream local survives budget restarts. */
+  private settleAgent(
+    agentName: string,
+    outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+  ): void {
+    const run = this.ephemeralRuns.get(agentName);
+    if (!run) return;
+    run.lastActivity = Date.now();
+    if (outcome.stopReason === 'exhausted') {
+      run.settle.reject(new Error(outcome.error ?? 'Unknown error'));
       return;
     }
-    settle.resolve(result);
+    run.settle.resolve({
+      stopReason: outcome.stopReason,
+      speech: outcome.speech,
+      toolCallsCount: run.toolCallsCount,
+    });
   }
 
   /**
@@ -1254,30 +1274,31 @@ export class AgentFramework {
   async runEphemeralToCompletion(
     agent: Agent,
     contextManager: ContextManager,
+    watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
-    const settle = this.createDeferred<AgentSettleResult>();
-    this.agentSettles.set(agent.name, settle);
-    this.agentSettleProgress.set(agent.name, {
+    const run: EphemeralRun = {
+      settle: this.createDeferred<AgentSettleResult>(),
       inferenceStarted: false,
       lastActivity: Date.now(),
       toolCallsCount: 0,
-    });
+    };
+    this.ephemeralRuns.set(agent.name, run);
 
-    const STARTUP_TIMEOUT_MS = 30_000;
+    const STARTUP_TIMEOUT_MS = watchdogs?.startupTimeoutMs ?? 30_000;
     // After inference has started, give it 15 minutes of activity-bounded
     // life. The stream driver refreshes the deadline as it makes progress;
     // sustained silence trips it.
-    const COMPLETION_IDLE_TIMEOUT_MS = 15 * 60_000;
+    const COMPLETION_IDLE_TIMEOUT_MS = watchdogs?.idleTimeoutMs ?? 15 * 60_000;
+    const IDLE_POLL_MS = watchdogs?.idlePollMs ?? 30_000;
 
     let startupWatchdog: ReturnType<typeof setTimeout> | null = null;
     let completionWatchdog: ReturnType<typeof setInterval> | null = null;
 
     const startupTimeout = new Promise<never>((_, reject) => {
       startupWatchdog = setTimeout(() => {
-        const progress = this.agentSettleProgress.get(agent.name);
-        if (!progress?.inferenceStarted) {
+        if (!run.inferenceStarted) {
           reject(new Error(
             `Ephemeral agent "${agent.name}" failed to start inference within ` +
             `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
@@ -1289,9 +1310,8 @@ export class AgentFramework {
 
     const completionIdleTimeout = new Promise<never>((_, reject) => {
       completionWatchdog = setInterval(() => {
-        const progress = this.agentSettleProgress.get(agent.name);
-        if (!progress?.inferenceStarted) return;
-        const idle = Date.now() - progress.lastActivity;
+        if (!run.inferenceStarted) return;
+        const idle = Date.now() - run.lastActivity;
         if (idle > COMPLETION_IDLE_TIMEOUT_MS) {
           reject(new Error(
             `Ephemeral agent "${agent.name}" stalled: no stream-driver activity for ` +
@@ -1300,7 +1320,7 @@ export class AgentFramework {
             `dropped or terminal event was lost.`
           ));
         }
-      }, 30_000);
+      }, IDLE_POLL_MS);
     });
 
     try {
@@ -1313,7 +1333,7 @@ export class AgentFramework {
       });
 
       const result = await Promise.race([
-        settle.promise,
+        run.settle.promise,
         startupTimeout,
         completionIdleTimeout,
       ]);
@@ -1321,8 +1341,7 @@ export class AgentFramework {
     } finally {
       if (startupWatchdog) clearTimeout(startupWatchdog);
       if (completionWatchdog) clearInterval(completionWatchdog);
-      this.agentSettles.delete(agent.name);
-      this.agentSettleProgress.delete(agent.name);
+      this.ephemeralRuns.delete(agent.name);
       this.agents.delete(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
       // ephemeral agents leave checkpoint-tree keys and diagnostics map
@@ -2618,7 +2637,7 @@ export class AgentFramework {
     if (event.type === 'tool-result') {
       const agent = this.agents.get(event.agentName);
       if (agent) {
-        this.touchAgentSettle(event.agentName, true);
+        this.touchEphemeralRun(event.agentName, true);
       }
       if (!agent) {
         console.warn(
@@ -2694,18 +2713,28 @@ export class AgentFramework {
           if (shouldEndTurn) {
             // endTurn: messages already stored above, cancel stream, reset to idle.
             if (currentState.stream) {
-              this.turnEndedStreams.add(`${agent.name}:${agent.streamId}`);
+              this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'turn_ended');
               currentState.stream.cancel();
             }
             agent.reset();
-            this.settleAgent(agent.name, {
-              stopReason: 'turn_ended',
-              speech: '',
-              toolCallsCount: this.getAgentSettleToolCalls(agent.name),
-            });
+            // The turn is over — release the gate here, not just in the abort
+            // handler: the membrane's aborted event is asynchronous and the
+            // agent must be wakeable the moment it goes idle. (Idempotent;
+            // driveStream's finally is the backstop.)
+            this.eventGate?.onInferenceEnded(agent.name);
+            this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (overBudget) {
-            // Context budget exceeded: break the stream, let compile() compress
+            // Context budget exceeded: break the stream, let compile() compress.
+            // Mark the cancel as framework-initiated BEFORE cancelling: the
+            // membrane delivers `aborted` before the restart bumps streamId,
+            // and without the marker the abort handler treats the restart as
+            // a terminal failure — rejecting an ephemeral's promise mid-run
+            // and emitting a spurious inference:exhausted (same race shape as
+            // endTurn above).
+            if (currentState.stream) {
+              this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
+            }
             agent.cancelStream();
             this.emitTrace({
               type: 'inference:stream_restarted',
@@ -2786,7 +2815,7 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
-      this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {
@@ -3371,7 +3400,7 @@ export class AgentFramework {
       this.activeTriggerChannels.delete(agent.name);
     }
 
-    this.touchAgentSettle(agent.name, true);
+    this.touchEphemeralRun(agent.name, true);
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
@@ -3439,7 +3468,6 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          toolCallsCount: this.getAgentSettleToolCalls(agent.name),
           error: err.message,
         });
         this.emitTrace({
@@ -3474,7 +3502,6 @@ export class AgentFramework {
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
-    let toolCallsCount = 0;
 
     // Typing indicator: show "<agent> is typing…" in the channel she's
     // responding to, for the whole duration of this turn. Started here (paired
@@ -3485,7 +3512,7 @@ export class AgentFramework {
 
     try {
       for await (const event of stream) {
-        this.touchAgentSettle(agent.name, true);
+        this.touchEphemeralRun(agent.name, true);
         switch (event.type) {
           case 'tokens':
             this.emitTrace({
@@ -3511,8 +3538,7 @@ export class AgentFramework {
 
           case 'tool-calls': {
             hadToolCalls = true;
-            toolCallsCount += event.calls.length;
-            this.recordAgentSettleToolCalls(agent.name, event.calls.length);
+            this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
@@ -3692,9 +3718,6 @@ export class AgentFramework {
                 .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
                 .map((block) => block.text)
                 .join('\n'),
-              toolCallsCount: this.agentSettleProgress.has(agent.name)
-                ? this.getAgentSettleToolCalls(agent.name)
-                : toolCallsCount,
             });
 
             this.emitTrace({
@@ -3974,9 +3997,6 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                toolCallsCount: this.agentSettleProgress.has(agent.name)
-                  ? this.getAgentSettleToolCalls(agent.name)
-                  : toolCallsCount,
                 error: err.message,
               });
               this.emitTrace({
@@ -3998,7 +4018,14 @@ export class AgentFramework {
           }
 
           case 'aborted': {
-            if (this.turnEndedStreams.delete(`${agent.name}:${myStreamId}`)) {
+            // Framework-initiated, non-terminal cancels (endTurn tool result,
+            // context-budget restart) also surface here as `aborted` — but
+            // the turn either already settled (endTurn) or a replacement
+            // stream is queued (budget restart). Neither is a failure: no
+            // reset, no settle, no spurious inference:exhausted (which would
+            // reject an ephemeral's promise mid-run and bump the failure
+            // streak). Gate release + stream teardown happen in `finally`.
+            if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
               this.eventGate?.onInferenceEnded(agent.name);
               return;
             }
@@ -4011,9 +4038,6 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                toolCallsCount: this.agentSettleProgress.has(agent.name)
-                  ? this.getAgentSettleToolCalls(agent.name)
-                  : toolCallsCount,
                 error: `Stream aborted: ${reason}`,
               });
               this.emitTrace({
@@ -4094,9 +4118,6 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        toolCallsCount: this.agentSettleProgress.has(agent.name)
-          ? this.getAgentSettleToolCalls(agent.name)
-          : toolCallsCount,
         error: err.message,
       });
       this.emitTrace({
@@ -4133,7 +4154,7 @@ export class AgentFramework {
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
       this.channelRegistry?.stopTyping();
-      this.turnEndedStreams.delete(`${agent.name}:${myStreamId}`);
+      this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       this.activeStreams.delete(agent.name);
       this.pendingAssistantBlocks.delete(agent.name);
 

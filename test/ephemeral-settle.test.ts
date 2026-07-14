@@ -17,7 +17,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 class EphemeralToolModule implements Module {
   readonly name = 'test';
@@ -292,45 +292,80 @@ describe('runEphemeralToCompletion settle signal', () => {
       syncIntervalMs: 0,
     });
 
-    const originalSetTimeout = globalThis.setTimeout;
-    const originalSetInterval = globalThis.setInterval;
-    const originalClearTimeout = globalThis.clearTimeout;
-    const originalClearInterval = globalThis.clearInterval;
-    let startupCallback: (() => void) | null = null;
-
-    globalThis.setTimeout = ((
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ): ReturnType<typeof setTimeout> => {
-      if (delay === 30_000 && typeof callback === 'function') {
-        startupCallback = () => callback(...args);
-      }
-      return 1 as unknown as ReturnType<typeof setTimeout>;
-    }) as typeof setTimeout;
-    globalThis.setInterval = ((
-      _callback: (...args: unknown[]) => void,
-      _delay?: number,
-      ..._args: unknown[]
-    ): ReturnType<typeof setInterval> => 2 as unknown as ReturnType<typeof setInterval>) as typeof setInterval;
-    globalThis.clearTimeout = ((_timeout?: ReturnType<typeof setTimeout>) => undefined) as typeof clearTimeout;
-    globalThis.clearInterval = ((_interval?: ReturnType<typeof setInterval>) => undefined) as typeof clearInterval;
-
     try {
       const { agent, contextManager } = await createEphemeral(framework);
-      const run = framework.runEphemeralToCompletion(agent, contextManager);
-      const rejection = assert.rejects(run, /failed to start inference/);
+      // Framework deliberately NOT started: the inference request is queued
+      // but nothing drives it, so the (injected, short) startup watchdog is
+      // the only thing that can end the run.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, {
+        startupTimeoutMs: 50,
+      });
 
-      assert.ok(startupCallback, 'startup watchdog should be registered');
-      (startupCallback as () => void)();
-
-      await rejection;
+      await assert.rejects(run, /failed to start inference/);
       assert.strictEqual(framework.getAgent(agent.name), null);
     } finally {
-      globalThis.setTimeout = originalSetTimeout;
-      globalThis.setInterval = originalSetInterval;
-      globalThis.clearTimeout = originalClearTimeout;
-      globalThis.clearInterval = originalClearInterval;
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it('a context-budget restart mid-run neither rejects nor loses the tool count', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-budget-');
+    // Serve exactly one queued response per stream: the budget restart opens
+    // a SECOND stream, and the stock mock hands all remaining responses to
+    // the first one.
+    class SequentialStreamMembrane extends MockMembrane {
+      private streamIdx = 0;
+      streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+        this.calls.push(request);
+        const stream = new MockYieldingStream(this.responses.slice(this.streamIdx, ++this.streamIdx));
+        this.lastStream = stream;
+        return stream;
+      }
+    }
+    const membrane = new SequentialStreamMembrane();
+    const tools = new EphemeralToolModule();
+
+    // Stream 1: a tool round whose usage event (10 input tokens) exceeds the
+    // agent's maxStreamTokens below → after the tool result lands, the
+    // framework cancels the stream and queues a context_budget_restart.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Working…' },
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: { message: 'one' } },
+    ], 'tool_use'));
+    // Stream 2 (post-restart): the final answer.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Recovered final answer' },
+    ]));
+
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'worker',
+        model: 'test-model',
+        systemPrompt: 'Do the task.',
+        allowedTools: 'all',
+        maxStreamTokens: 5,
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+
+      // Without the framework-cancel marker, the restart's aborted event
+      // settles the run as exhausted ("Stream aborted: user") instead.
+      const result = await runStartedEphemeral(framework, created.agent, created.contextManager);
+
+      assert.deepStrictEqual(result, {
+        speech: 'Recovered final answer',
+        toolCallsCount: 1,
+      });
+      assert.strictEqual(membrane.calls.length, 2, 'restart should open a second stream');
+      assert.strictEqual(framework.getAgent(created.agent.name), null);
+    } finally {
       await stopAndRemove(framework, tempDir);
     }
   });
@@ -340,9 +375,13 @@ describe('trace control-flow guard', () => {
   it('does not use this.onTrace inside src control flow', () => {
     const root = process.cwd();
     const srcRoot = join(root, 'src');
-    const allowed = new Set([
-      'src/framework.ts:onTrace: (listener) => this.onTrace(listener),',
-    ]);
+    // Structural allowance, not an exact source line (which breaks on any
+    // reformat and turns the guard into a boy-who-cried-wolf): re-EXPOSING
+    // the subscription API — forwarding a caller-supplied listener, as the
+    // ModuleContext plumbing does — is fine. What the guard forbids is the
+    // framework subscribing its OWN listener to drive control flow.
+    const isSubscriptionPlumbing = (line: string) =>
+      /onTrace:\s*\([^)]*\)\s*=>\s*this\.onTrace\(/.test(line);
     const matches: string[] = [];
 
     const visit = (dir: string) => {
@@ -358,10 +397,8 @@ describe('trace control-flow guard', () => {
         const lines = readFileSync(path, 'utf8').split('\n');
         lines.forEach((line, index) => {
           if (!line.includes('this.onTrace(')) return;
-          const key = `${rel}:${line.trim()}`;
-          if (!allowed.has(key)) {
-            matches.push(`${rel}:${index + 1}: ${line.trim()}`);
-          }
+          if (isSubscriptionPlumbing(line)) return;
+          matches.push(`${rel}:${index + 1}: ${line.trim()}`);
         });
       }
     };
