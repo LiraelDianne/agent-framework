@@ -15,6 +15,11 @@ function makeHarness() {
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>(); // upstream last-inference tracking; noteInferenceExhausted writes it
   fw.pendingRequests = [];
+  // opsAlert plumbing (hard-down now routes through it): trace fan-out +
+  // webhook cooldown state. No CONNECTOME_OPS_WEBHOOK in env → no fetch.
+  fw.traceListeners = [];
+  fw.opsAlertLastSent = new Map<string, number>();
+  fw.opsAlertCooldownMs = 15 * 60_000;
 
   const markers: Array<{ text: string; meta: any }> = [];
   fw.agents = new Map([['cairn', {

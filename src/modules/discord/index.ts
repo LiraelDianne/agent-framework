@@ -41,6 +41,7 @@ import type {
   ListChannelsInput,
   FetchHistoryInput,
 } from './types.js';
+import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
@@ -99,6 +100,7 @@ export class DiscordModule implements Module {
   readonly name = 'discord';
 
   private config: DiscordModuleConfig;
+  private readonly timeZone: string;
   private ctx: ModuleContext | null = null;
   private client: DiscordClientInterface;
   private state: DiscordModuleState = {
@@ -126,6 +128,7 @@ export class DiscordModule implements Module {
   constructor(client: DiscordClientInterface, config: DiscordModuleConfig) {
     this.client = client;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.timeZone = resolveTimeZone(config.timeZone);
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -1190,7 +1193,7 @@ export class DiscordModule implements Module {
           authorId: m.authorId,
           isBot: m.isBot,
           content: m.content,
-          timestamp: m.timestamp.toISOString(),
+          timestamp: formatZonedDateTime(m.timestamp, this.timeZone),
           replyTo: m.replyTo,
         })),
       },

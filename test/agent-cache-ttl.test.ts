@@ -26,10 +26,28 @@ describe('Agent cacheTtl forwarding', () => {
     assert.equal(request.cacheTtl, '1h');
   });
 
-  it('omits cacheTtl entirely when unset, leaving the provider default', async () => {
+  it('defaults cacheTtl to 1h when unset', async () => {
     const agent = createAgent({});
     const request = await agent.buildActivationRequest([]);
     assert.equal(request.promptCaching, true);
-    assert.equal('cacheTtl' in request, false);
+    assert.equal(request.cacheTtl, '1h');
+  });
+
+  it('preserves an explicit 5m override', async () => {
+    const agent = createAgent({ cacheTtl: '5m' });
+    const request = await agent.buildActivationRequest([]);
+    assert.equal(request.cacheTtl, '5m');
+  });
+});
+
+describe('Agent provider parameter forwarding', () => {
+  it('forwards stateless Responses reasoning and compaction settings unchanged', async () => {
+    const providerParams = {
+      reasoning: { effort: 'high', context: 'all_turns' },
+      context_management: [{ type: 'compaction', compact_threshold: 850000 }],
+    };
+    const agent = createAgent({ providerParams });
+    const request = await agent.buildActivationRequest([]);
+    assert.deepEqual(request.providerParams, providerParams);
   });
 });

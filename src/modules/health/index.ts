@@ -24,8 +24,12 @@ import type { Module, ModuleContext } from '../../types/module.js';
 import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../types/events.js';
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { AgentFramework } from '../../framework.js';
+import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
 
 export interface HealthModuleConfig {
+  /** IANA zone for timestamps returned by the snapshot tool. */
+  timeZone?: string;
+
   /**
    * Default number of recent inferences to summarize when the tool is
    * called without an explicit limit. Default: 20.
@@ -70,6 +74,7 @@ export class HealthModule implements Module {
 
   constructor(config: HealthModuleConfig = {}) {
     this.config = {
+      timeZone: resolveTimeZone(config.timeZone),
       defaultLookback: config.defaultLookback ?? 20,
       subagentStateId: config.subagentStateId ?? 'modules/subagent/state',
     };
@@ -162,10 +167,20 @@ export class HealthModule implements Module {
     const recent = this.framework.queryInferenceLogs({ limit: lookback });
     const recentEntries = recent.entries ?? [];
 
+    // Presentation-boundary guard: queryInferenceLogs casts raw persisted
+    // JSON without validation, so a legacy/corrupt record can carry a missing
+    // or non-numeric timestamp. formatZonedDateTime throws on invalid dates
+    // (correctly — misuse should be loud), but one bad record must not sink
+    // the whole snapshot: degrade to the raw value (or null) instead.
+    const safeZoned = (ts: unknown): unknown =>
+      typeof ts === 'number' && Number.isFinite(ts)
+        ? formatZonedDateTime(ts, this.config.timeZone)
+        : ts ?? null;
+
     const projectSummary = (e: typeof recentEntries[number]) => {
       const s = e.summary ?? e.entry;
       return {
-        timestamp: s.timestamp,
+        timestamp: safeZoned(s.timestamp),
         agentName: s.agentName,
         success: s.success,
         error: s.error,
@@ -224,8 +239,8 @@ export class HealthModule implements Module {
               name: sa.name,
               type: sa.type,
               status: sa.status,
-              startedAt: startedAt > 0 ? new Date(startedAt).toISOString() : null,
-              lastActivityAt: lastActivityAt > 0 ? new Date(lastActivityAt).toISOString() : null,
+              startedAt: startedAt > 0 ? formatZonedDateTime(startedAt, this.config.timeZone) : null,
+              lastActivityAt: lastActivityAt > 0 ? formatZonedDateTime(lastActivityAt, this.config.timeZone) : null,
               runtimeSeconds: startedAt > 0 ? Math.floor((now - startedAt) / 1000) : null,
               silentSeconds: lastActivityAt > 0 ? Math.floor((now - lastActivityAt) / 1000) : null,
               toolCallsCount: sa.toolCallsCount,
@@ -244,7 +259,8 @@ export class HealthModule implements Module {
     const modules = this.ctx ? this.listModulesViaContext() : [];
 
     return {
-      timestamp: new Date().toISOString(),
+      timestamp: formatZonedDateTime(Date.now(), this.config.timeZone),
+      timeZone: this.config.timeZone,
       window: {
         lookback,
         inferencesInWindow: recentEntries.length,
