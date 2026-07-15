@@ -1413,6 +1413,12 @@ export class ChannelRegistry {
   private handleToolSkipReply(input: { reason?: string }): ToolResult {
     return {
       success: true,
+      // The note says "ended the turn" — make it TRUE. Without endTurn the
+      // framework resumes the stream after the tool result, and a model with
+      // nothing to say (told its turn already ended) just calls skip_reply
+      // again: observed as a 40+ round skip_reply loop on Fable 5, burning a
+      // round-trip + ~70 tokens per iteration until something kills the turn.
+      endTurn: true,
       data: {
         skipped: true,
         note: 'Ended the turn without replying — nothing was sent to any channel.',
