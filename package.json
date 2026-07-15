@@ -21,10 +21,12 @@
     "src"
   ],
   "bin": {
-    "agent-framework-mcp": "./dist/src/api/mcp-server.js"
+    "agent-framework-mcp": "./dist/src/api/mcp-server.js",
+    "agent-framework-recover": "./dist/src/recovery/recover-cli.js"
   },
   "scripts": {
     "build": "tsc",
+    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755)\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",

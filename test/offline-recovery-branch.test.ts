@@ -1,0 +1,191 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager } from '@animalabs/context-manager';
+import { createOfflineRecoveryBranch } from '../src/recovery/offline-branch.js';
+import {
+  DiscordAwarenessOutbox,
+  defaultDiscordAwarenessOutboxPath,
+} from '../src/recovery/discord-awareness-outbox.js';
+
+test('offline recovery branches without compiling and queues discarded Discord refs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'safe' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'never echo this one' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-toxic-1',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'or this one' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-toxic-2',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-safe',
+      branchName: 'recovery/cairn/toxic-tail',
+    });
+
+    assert.equal(result.sourceBranch, 'main');
+    assert.equal(result.targetBranch, 'recovery/cairn/toxic-tail');
+    assert.equal(result.messagesRemoved, 2);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-toxic-1', 'm-toxic-2']);
+
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    assert.equal(recoveredStore.currentBranch().name, 'recovery/cairn/toxic-tail');
+    const recoveredCm = await ContextManager.open({
+      store: recoveredStore,
+      namespace: 'agents/cairn',
+    });
+    assert.equal(recoveredCm.getMessageCount(), 1);
+    assert.equal(recoveredCm.getMessageWindow(0, 1, { resolveBlobs: false }).messages[0].metadata?.messageId, 'm-safe');
+    recoveredCm.close();
+    recoveredStore.close();
+
+    const batches = new DiscordAwarenessOutbox(
+      defaultDiscordAwarenessOutboxPath(storePath),
+    ).pending('discord');
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].refs.map((ref) => ref.messageId), ['m-toxic-1', 'm-toxic-2']);
+
+    // The outbox is metadata-only: quarantined text must never leak to it.
+    const rawOutbox = await import('node:fs').then(({ readFileSync }) =>
+      readFileSync(defaultDiscordAwarenessOutboxPath(storePath), 'utf8'));
+    assert.ok(!rawOutbox.includes('never echo this one'));
+    assert.ok(!rawOutbox.includes('or this one'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('offline recovery can branch at the current message and suppress an exact list', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-list-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep first' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'suppress A' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-a',
+    });
+    cm.addMessage('assistant', [{ type: 'text', text: 'keep between' }]);
+    cm.addMessage('user', [{ type: 'text', text: 'suppress B' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-b',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'current anchor' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressMessageIds: ['m-a', 'm-b'],
+      branchName: 'recovery/cairn/exact-list',
+    });
+
+    assert.equal(result.messagesRemoved, 0);
+    assert.equal(result.messagesSuppressed, 2);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-a', 'm-b']);
+
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({
+      store: recoveredStore,
+      namespace: 'agents/cairn',
+    });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId ?? message.participant),
+      ['m-keep', 'assistant', 'm-current'],
+    );
+
+    await recoveredCm.switchBranch('main');
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId ?? message.participant),
+      ['m-keep', 'm-a', 'assistant', 'm-b', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('offline recovery suppresses inclusive ranges in context order', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-range-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep first' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'range start' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-from',
+    });
+    cm.addMessage('assistant', [{ type: 'text', text: 'also suppressed by range' }]);
+    cm.addMessage('user', [{ type: 'text', text: 'inside range' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-inside',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'range end' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-to',
+    });
+    cm.addMessage('user', [{ type: 'text', text: 'current anchor' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      // Reversed endpoints should still mean the inclusive context interval.
+      suppressRanges: [{ fromMessageId: 'm-to', toMessageId: 'm-from' }],
+      branchName: 'recovery/cairn/range',
+    });
+
+    assert.equal(result.messagesRemoved, 0);
+    assert.equal(result.messagesSuppressed, 4);
+    assert.deepEqual(
+      result.refs.map((ref) => ref.messageId),
+      ['m-from', 'm-inside', 'm-to'],
+    );
+
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({
+      store: recoveredStore,
+      namespace: 'agents/cairn',
+    });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-keep', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+
+    const batches = new DiscordAwarenessOutbox(
+      defaultDiscordAwarenessOutboxPath(storePath),
+    ).pending('discord');
+    assert.equal(batches.length, 1);
+    assert.deepEqual(
+      batches[0].refs.map((ref) => ref.messageId),
+      ['m-from', 'm-inside', 'm-to'],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

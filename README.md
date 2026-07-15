@@ -141,6 +141,57 @@ All state is persisted in a [Chronicle](https://github.com/antra-tess/chronicle)
 
 Chronicle's branching support enables time-travel and what-if exploration across all state.
 
+#### Offline recovery from a poisoned context tail
+
+If an inference API rejects message history and the normal host must remain
+stopped, create a safe branch with the recovery CLI:
+
+```bash
+agent-framework-recover \
+  --store ./data/agent-store \
+  --agent cairn \
+  --message-id 123456789012345678 \
+  --branch recovery/cairn/poisoned-tail
+```
+
+The specified Discord message is the last message the agent will still see;
+everything after it is left on the old branch. The command scans in bounded
+windows, never compiles message content, activates
+the new Chronicle branch, and writes only Discord `{serverId, channelId,
+messageId}` metadata to
+`<store>/recovery/discord-awareness-outbox.json`. When the host and that
+agent's `discord-mcpl` bot reconnect, each addressable discarded message is
+marked with 💤. Successful markers are acknowledged individually; failures
+remain queued for the next reconnect. Portal and other non-Discord records are
+ignored.
+
+Use `--dry-run` to inspect the proposed branch and message IDs without writing.
+`--message-id` also accepts a Discord message link. The older `--messages N`
+mode remains available when a count of internal context entries is genuinely
+desired.
+
+To branch at the current message while suppressing selected earlier messages
+only on the new branch:
+
+```bash
+agent-framework-recover \
+  --store ./data/agent-store \
+  --agent cairn \
+  --message-id <current-discord-message-id> \
+  --suppress <message-id-to-hide> \
+  --suppress <another-message-id>
+```
+
+`--suppress` may be repeated or given a comma-separated list.
+`--suppress-range <first>..<last>` suppresses the inclusive context interval
+between two Discord messages, including intervening agent/tool entries. These
+removals exist only on the recovery branch; the source branch remains intact.
+Suppressed Discord messages are queued for the same 💤 awareness marker.
+For old stores whose messages lack `metadata.serverId`, supply
+`--discord-server discord` (or the configured Discord MCPL server id). The
+normal agent host must be stopped while this command has the Chronicle store
+open.
+
 ### MCPL (MCP Live)
 
 Optional host-side implementation of the MCP Live protocol. External servers (game engines, dev tools, etc.) can:

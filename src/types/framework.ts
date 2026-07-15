@@ -42,6 +42,13 @@ export interface FrameworkConfig {
   /** Path to Chronicle store */
   storePath?: string;
 
+  /**
+   * Branch-independent Discord awareness-marker outbox. Defaults to
+   * `<storePath>/recovery/discord-awareness-outbox.json`. Set explicitly when
+   * providing an app-owned `store` without `storePath`; omit to disable.
+   */
+  discordAwarenessOutboxPath?: string;
+
   /** Or existing store (app-owned) */
   store?: JsStore;
 

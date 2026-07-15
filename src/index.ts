@@ -91,3 +91,20 @@ export type { ContextManager, ContextStrategy, TokenBudget } from '@animalabs/co
 export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from '@animalabs/context-manager';
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
+
+// Offline outage recovery and branch-independent Discord awareness markers
+export {
+  DiscordAwarenessOutbox,
+  DEFAULT_DISCORD_AWARENESS_EMOJI,
+  defaultDiscordAwarenessOutboxPath,
+  extractDiscordAwarenessRefs,
+} from './recovery/discord-awareness-outbox.js';
+export type {
+  DiscordAwarenessBatch,
+  DiscordAwarenessRef,
+} from './recovery/discord-awareness-outbox.js';
+export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
+export type {
+  OfflineRecoveryBranchOptions,
+  OfflineRecoveryBranchResult,
+} from './recovery/offline-branch.js';
