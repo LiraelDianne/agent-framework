@@ -5643,19 +5643,28 @@ export class AgentFramework {
   }
 
   private beginDiscordAwarenessBarrier(serverId: string): Promise<void> {
-    const barrier = this.syncDiscordAwarenessMarkers(serverId);
-    this.discordAwarenessBarriers.set(serverId, barrier);
+    if (!this.discordAwarenessOutbox) return Promise.resolve();
+    this.discordAwarenessOutbox.reconcileForBranch(
+      this.store.currentBranch().name,
+      this.store.listBranches(),
+    );
+    if (this.discordAwarenessOutbox.pending(serverId).length === 0) {
+      return Promise.resolve();
+    }
+    const barrier = this.drainDiscordAwarenessOutbox(serverId);
+    const barriers = this.discordAwarenessBarriers ??= new Map();
+    barriers.set(serverId, barrier);
     const cleanup = () => {
-      if (this.discordAwarenessBarriers.get(serverId) === barrier) {
-        this.discordAwarenessBarriers.delete(serverId);
+      if (barriers.get(serverId) === barrier) {
+        barriers.delete(serverId);
       }
     };
     void barrier.then(cleanup, cleanup);
     return barrier;
   }
 
-  private async waitForDiscordAwarenessBarrier(serverId: string): Promise<void> {
-    await this.discordAwarenessBarriers.get(serverId);
+  private getDiscordAwarenessBarrier(serverId: string): Promise<void> | undefined {
+    return this.discordAwarenessBarriers?.get(serverId);
   }
 
   /**
@@ -5915,7 +5924,8 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      await this.waitForDiscordAwarenessBarrier(connection.id);
+      const barrier = this.getDiscordAwarenessBarrier(connection.id);
+      if (barrier) await barrier;
       this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
@@ -5925,7 +5935,8 @@ export class AgentFramework {
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (this.inferenceRouter && responder) {
-        await this.waitForDiscordAwarenessBarrier(connection.id);
+        const barrier = this.getDiscordAwarenessBarrier(connection.id);
+        if (barrier) await barrier;
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
           respondError: responder.respondError,
@@ -5952,7 +5963,8 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.waitForDiscordAwarenessBarrier(connection.id);
+      const barrier = this.getDiscordAwarenessBarrier(connection.id);
+      if (barrier) await barrier;
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -5963,7 +5975,8 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
-        await this.waitForDiscordAwarenessBarrier(connection.id);
+        const barrier = this.getDiscordAwarenessBarrier(connection.id);
+        if (barrier) await barrier;
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
       } catch (error) {
