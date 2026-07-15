@@ -5120,6 +5120,17 @@ export class AgentFramework {
     return {};
   }
 
+  /**
+   * Public entry to the ops-alert pipeline (failures.log + ops:alert trace +
+   * throttled webhook) for host-level detectors OUTSIDE the framework's own
+   * inference driver — e.g. the host's logging adapter catching refusals on
+   * off-path calls (compression/summarizer, maintenance) that noteRefusal
+   * never sees. Same per-(agent,kind) cooldown as everything else.
+   */
+  notifyOpsAlert(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
+    this.opsAlert(kind, agentName, message, { data });
+  }
+
   private noteInferenceExhausted(
     agentName: string,
     reason: string,
