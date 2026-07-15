@@ -74,12 +74,11 @@ import { splitProseSegments } from './prose-segments.js';
  * `think` is deliberately NOT here: it is silent *reasoning*, but prose
  * written around a think is the agent's actual voice and must be delivered.
  *
- * Scope: mid-turn rounds apply this PER ROUND (a round's prose is suppressed
- * only by a silencing tool in that same round — live delivery can't be
- * retracted by a later round's skip_reply); the turn's TRAILING prose keeps
- * the historical turn-wide rule (any silencing tool anywhere in the turn
- * suppresses it), preserving the "send_message then 'sent it.' postscript"
- * double-post guard.
+ * Scope: an explicit delivery suppresses prose from that round onward until
+ * another external message is injected. The suppression prevents a
+ * `send_message` followed by "sent it" from double-posting, but a new message
+ * starts a new conversational round and must be answerable with plain prose.
+ * `skip_reply` ends the turn at the tool-result boundary.
  */
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
@@ -323,9 +322,17 @@ export class AgentFramework {
   /** Per-agent output locus pinned for the CURRENT logical turn (see
    *  resolveTurnLocus in driveStream). Lives here — not in driveStream
    *  locals — so the pin survives a context-budget stream restart, which
-   *  continues the same logical turn in a fresh driveStream. Cleared at the
-   *  start of every non-restart turn. */
+   *  continues the same logical turn in a fresh driveStream. A mid-turn
+   *  injected channel message replaces the pin for the next conversational
+   *  round; otherwise it remains stable. Cleared at the start of every
+   *  non-restart turn. */
   private turnLocusPins: Map<string, string> = new Map();
+  /** A tool boundary injected fresh external input into the live stream.
+   *  Presence (including a null value) tells driveStream to clear sticky
+   *  explicit-send suppression before handling the next model round. A
+   *  string also moves that round's reply locus to the newest injected
+   *  channel. */
+  private midTurnRoutingResets: Map<string, string | null> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -2883,6 +2890,25 @@ export class AgentFramework {
             }
           }
 
+          // A newly injected message begins a new conversational round inside
+          // the same provider inference. Remember that boundary for
+          // driveStream: an explicit send in the preceding round must not
+          // silence the reply, and the newest channel-bearing injection is
+          // now the reply locus. Map presence matters even without a channel
+          // (CLI/module input): it still clears the prior send suppression.
+          if (midTurnInjections.length > 0) {
+            const injectedChannelId = midTurnInjections.reduce<string | null>(
+              (latest, injection) => {
+                const candidate = injection.metadata?.channelId;
+                return typeof candidate === 'string' && candidate.length > 0
+                  ? candidate
+                  : latest;
+              },
+              null,
+            );
+            this.midTurnRoutingResets.set(agent.name, injectedChannelId);
+          }
+
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
@@ -3720,17 +3746,15 @@ export class AgentFramework {
     let hadToolCalls = false;
 
     // ---- Present-while-acting turn state ---------------------------------
-    // Output locus for THIS turn: resolved lazily at the first routed prose
-    // segment and pinned for the rest of the turn (mid-turn rounds AND the
-    // trailing prose at 'complete'), so one turn's voice stays in one channel
-    // even when a queued inbound from another channel overwrites the
-    // per-agent triggering channel between segments (PR #32). The pin lives
-    // in `turnLocusPins` so it survives a context-budget stream restart. A
-    // null resolution is NOT pinned — a turn whose locus is unresolvable
-    // early (e.g. heartbeat-triggered) may still resolve a channel by the
-    // time later prose routes.
+    // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
+    // kept stable across tool-only rounds. A channel message injected at a
+    // tool boundary replaces the pin before the next model round, because a
+    // single provider inference can now contain several conversations. The
+    // pin lives in `turnLocusPins` so it survives a context-budget restart. A
+    // null resolution is not pinned.
     if (trigger?.reason !== 'context_budget_restart') {
       this.turnLocusPins.delete(agent.name);
+      this.midTurnRoutingResets.delete(agent.name);
     }
     const resolveTurnLocus = (): string | null => {
       let locus = this.turnLocusPins.get(agent.name) ?? null;
@@ -3757,10 +3781,9 @@ export class AgentFramework {
         .catch((err) => console.error('mid-turn speech routing failed:', err));
     };
 
-    // Sticky silencing: once any round uses a SILENCING_TOOLS member,
-    // prose from that round ONWARD is suppressed — skip_reply means "stay
-    // silent", an explicit send means "I deliver my own words". Earlier
-    // rounds' prose was already delivered live and cannot be retracted.
+    // Sticky explicit-send suppression: prose after send_message stays quiet
+    // to prevent a redundant "sent it" postscript. Fresh injected input
+    // clears it, because the following prose is a reply to a new message.
     let turnSilenced = false;
 
     // Live routing is only trusted when the membrane provides verbatim
@@ -3777,10 +3800,29 @@ export class AgentFramework {
     // responding to, for the whole duration of this turn. Started here (paired
     // with the finally below, so it can never leak) and refreshed on a 7s
     // interval by the ChannelRegistry until stopped on any exit path.
-    const typingChannel = this.channelRegistry
+    let typingChannel = this.channelRegistry
       ? trigger?.channelId ?? this.channelRegistry.getDefaultPublishChannel()
       : null;
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+
+    const adoptInjectedRound = (): void => {
+      if (!this.midTurnRoutingResets.has(agent.name)) return;
+      const nextLocus = this.midTurnRoutingResets.get(agent.name) ?? null;
+      this.midTurnRoutingResets.delete(agent.name);
+
+      // A new human/agent message, not merely a tool result, means any earlier
+      // explicit delivery has completed its conversational job.
+      turnSilenced = false;
+
+      if (nextLocus) {
+        this.turnLocusPins.set(agent.name, nextLocus);
+        if (typingChannel !== nextLocus) {
+          if (typingChannel) this.channelRegistry?.stopTyping(typingChannel);
+          typingChannel = nextLocus;
+          this.channelRegistry?.startTyping(nextLocus);
+        }
+      }
+    };
 
     try {
       for await (const event of stream) {
@@ -3809,6 +3851,7 @@ export class AgentFramework {
           }
 
           case 'tool-calls': {
+            adoptInjectedRound();
             hadToolCalls = true;
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
@@ -3894,6 +3937,7 @@ export class AgentFramework {
           }
 
           case 'complete': {
+            adoptInjectedRound();
             const durationMs = Date.now() - startTime;
             const response = event.response;
 
@@ -4209,15 +4253,17 @@ export class AgentFramework {
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
-              // Silencing here is the sticky flag ∪ turn-wide scan: the scan
-              // (over the whole turn's tool_use blocks) covers the fallback
-              // path and the "send_message then a 'sent it.' postscript"
-              // double-post guard; the sticky flag is its live-rounds twin.
+              // Native round routing uses the live sticky flag, which a fresh
+              // injected message can reset. The legacy/fallback path has no
+              // reliable round boundaries, so retain its historical turn-wide
+              // scan to avoid double-posting.
               const toolNames = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => (b as unknown as { name?: string }).name)
                 .filter((n): n is string => typeof n === 'string');
-              const silenced = turnSilenced || toolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)));
+              const silenced = liveProseRouting
+                ? turnSilenced
+                : turnSilenced || toolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)));
 
               const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
 

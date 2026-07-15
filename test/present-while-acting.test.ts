@@ -3,8 +3,9 @@
  * alive during a long tool-using turn.
  *
  * SPEAK-while-acting — each round's prose is routed to the locus LIVE when
- * the round yields its tool calls (per-round SILENCING_TOOLS rule), and the
- * 'complete' case routes only the TRAILING prose (turn-wide silencing rule).
+ * the round yields its tool calls. Explicit-send suppression lasts until new
+ * external input begins another conversational round; the 'complete' case
+ * routes only trailing prose.
  * Previously all segments were batched to the end of the turn.
  *
  * HEAR-while-acting — messages arriving mid-turn (deferred by addMessage
@@ -45,6 +46,8 @@ class RobotModule implements Module {
    *  BEFORE returning its result (simulating a chat reply arriving while the
    *  tool executes). */
   interjection: string | null = null;
+  /** Optional routing locus attached to the interjected message. */
+  interjectionChannelId: string | null = null;
   /** Delay tool completion so live routing deterministically precedes it. */
   toolDelayMs = 0;
 
@@ -77,7 +80,9 @@ class RobotModule implements Module {
         type: 'external-message',
         source: 'test',
         content: text,
-        metadata: {},
+        metadata: this.interjectionChannelId
+          ? { channelId: this.interjectionChannelId }
+          : {},
       } as unknown as ProcessEvent);
       // Give the run loop a beat to process the queued message while this
       // tool round is still pending (pendingAssistantBlocks non-empty), so
@@ -90,11 +95,13 @@ class RobotModule implements Module {
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type === 'external-message') {
       const text = String((event as { content?: unknown }).content);
+      const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
       return {
         addMessages: [
           {
             participant: 'Antra',
             content: [{ type: 'text', text }],
+            ...(metadata ? { metadata } : {}),
           },
         ],
         // Only the initial 'go' starts a turn. Mid-turn interjections must
@@ -276,6 +283,32 @@ describe('present while acting', () => {
       ['Round one narration.'],
       'round-1 prose delivered live; round-2 (silencing) and trailing suppressed',
     );
+
+    await framework.stop();
+  });
+
+  it('new injected channel input resets send suppression and moves the reply locus', async () => {
+    // Exact shape of the Fable incident: while handling one channel, the agent
+    // explicitly sends that response; a message from another channel arrives
+    // during the send, and the terminal prose answers the new message.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Yes, I want to try the VR space.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.interjection = 'Want to try a VR space?';
+    module.interjectionChannelId = 'discord:guild:fable';
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Yes, I want to try the VR space.', locus: 'discord:guild:fable' },
+    ]);
 
     await framework.stop();
   });
