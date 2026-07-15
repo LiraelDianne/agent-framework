@@ -356,8 +356,10 @@ export class ChannelRegistry {
    *  server keeps getting the same routing hints (e.g. Zulip topic). */
   private typingMetadata = new Map<string, Record<string, unknown>>();
 
-  /** Chronicle-projected desired lifecycle state, keyed by server + channel. */
-  private desiredStates = new Map<string, DesiredChannelState>();
+  /** Chronicle-projected desired lifecycle state, keyed by server + channel.
+   *  Provenance is kept so reconcile can tell a pure default (nobody ever
+   *  decided) from a real decision (agent-tool, invitation-declined, …). */
+  private desiredStates = new Map<string, { state: DesiredChannelState; source: string }>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -779,7 +781,7 @@ export class ChannelRegistry {
   }
 
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
-    return this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    return this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.state;
   }
 
   /**
@@ -976,7 +978,7 @@ export class ChannelRegistry {
       ) {
         this.desiredStates.set(
           this.lifecycleKey(event.serverId, event.channelId),
-          event.desired,
+          { state: event.desired, source: typeof event.source === "string" ? event.source : "unknown" },
         );
       } else if (event.kind === 'legacy-policy-migrated') {
         this.migratedLegacyPolicies.add(event.serverId);
@@ -995,8 +997,8 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    if (this.desiredStates.get(key) === desired) return;
-    this.desiredStates.set(key, desired);
+    if (this.desiredStates.get(key)?.state === desired) return;
+    this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1036,7 +1038,16 @@ export class ChannelRegistry {
   }
 
   private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): void {
-    if (this.getDesiredState(serverId, channel.id)) return;
+    const existing = this.desiredStates.get(this.lifecycleKey(serverId, channel.id));
+    if (existing) {
+      // A server upgrading its descriptor to initiallyOpen may lift a pure
+      // default — 'default-closed' means nobody ever decided. Real decisions
+      // (agent-tool, invitation-declined, legacy migration, …) always stick.
+      if (channel.initiallyOpen === true && existing.state === 'closed' && existing.source === 'default-closed') {
+        this.setDesiredState(serverId, channel.id, 'open', 'server-bootstrap');
+      }
+      return;
+    }
     this.setDesiredState(
       serverId,
       channel.id,
