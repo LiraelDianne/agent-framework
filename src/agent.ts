@@ -6,7 +6,14 @@ export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
 }
-import type { ContextManager, TokenBudget, ContextInjection, CompileResult } from '@animalabs/context-manager';
+import type {
+  ContextManager,
+  TokenBudget,
+  ContextInjection,
+  CompileResult,
+  HotContextSettingsStatus,
+  HotContextSettingsUpdate,
+} from '@animalabs/context-manager';
 import type {
   AgentConfig,
   AgentState,
@@ -19,7 +26,13 @@ import type {
   AgentInfo,
   InferenceResult,
   InferenceOptions,
+  AgentRuntimeSettingsPatch,
+  AgentRuntimeSettingsSnapshot,
+  AgentRuntimeSettingsOverrides,
 } from './types/index.js';
+
+const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -60,6 +73,11 @@ export class Agent {
    * ContextManager's built-in default applies. reserveForResponse uses
    * this agent's maxTokens. */
   contextBudgetTokens?: number;
+  private readonly configuredContextBudgetTokens?: number;
+  private readonly configuredTailTokens?: number;
+  private readonly configuredTransitionPaceTokens?: number;
+  private contextBudgetTargetTokens?: number;
+  private runtimeSettingsOverrides: AgentRuntimeSettingsOverrides = {};
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -81,8 +99,12 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
+    this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
     this.membrane = membrane;
+    const hot = this.getHotContextSettings();
+    this.configuredTailTokens = hot?.tailTokens;
+    this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
   }
 
   /**
@@ -148,8 +170,203 @@ export class Agent {
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
+  /** Structural compatibility keeps lightweight test/host ContextManager
+   * doubles working while making the new capability optional at runtime. */
+  private getHotContextSettings(): HotContextSettingsStatus | null {
+    const manager = this.contextManager as ContextManager & {
+      getHotContextSettings?: () => HotContextSettingsStatus | null;
+    };
+    return typeof manager.getHotContextSettings === 'function'
+      ? manager.getHotContextSettings()
+      : null;
+  }
+
+  private updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    const manager = this.contextManager as ContextManager & {
+      updateHotContextSettings?: (value: HotContextSettingsUpdate) => HotContextSettingsStatus;
+    };
+    if (typeof manager.updateHotContextSettings !== 'function') {
+      throw new Error('The active context strategy does not support live context settings');
+    }
+    return manager.updateHotContextSettings(update);
+  }
+
+  getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
+    const hot = this.getHotContextSettings();
+    return {
+      contextBudgetTokens:
+        this.contextBudgetTargetTokens ??
+        this.contextBudgetTokens ??
+        DEFAULT_CONTEXT_BUDGET_TOKENS,
+      ...(hot ? { tailTokens: hot.tailTokens } : {}),
+      ...(hot?.transitionPaceTokens !== undefined
+        ? { transitionPaceTokens: hot.transitionPaceTokens }
+        : {}),
+      transition: this.contextBudgetTargetTokens === undefined
+        ? 'stable'
+        : hot?.blocked
+          ? 'blocked'
+          : 'converging',
+      ...(hot?.blocked === 'transition-pace-floor'
+        ? { transitionReason: 'transition_pace_too_small' as const }
+        : hot?.blocked === 'prepared-window-floor'
+          ? { transitionReason: 'protected_context_exceeds_target' as const }
+          : {}),
+    };
+  }
+
+  getRuntimeSettingsOverrides(): AgentRuntimeSettingsOverrides {
+    return { ...this.runtimeSettingsOverrides };
+  }
+
+  updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
+    this.validateRuntimeSettingsPatch(patch);
+    let nextContextBudget = this.contextBudgetTokens;
+    let nextContextTarget = this.contextBudgetTargetTokens;
+    let appliedDefaultPace = false;
+    const hotPatch: {
+      tailTokens?: number;
+      transitionPaceTokens?: number | null;
+      preparedWindowTokens?: number | null;
+    } = {};
+    if (patch.tailTokens !== undefined) hotPatch.tailTokens = patch.tailTokens;
+    if (patch.transitionPaceTokens !== undefined) {
+      hotPatch.transitionPaceTokens = patch.transitionPaceTokens;
+    }
+
+    if (patch.contextBudgetTokens !== undefined) {
+      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      if (patch.contextBudgetTokens >= live) {
+        nextContextBudget = patch.contextBudgetTokens;
+        nextContextTarget = undefined;
+        if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
+      } else {
+        const hot = this.getHotContextSettings();
+        if (!hot) {
+          throw new Error('The active context strategy cannot prepare a smaller window live');
+        }
+        if (patch.transitionPaceTokens === undefined && hot.transitionPaceTokens === undefined) {
+          hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
+          appliedDefaultPace = true;
+        }
+        hotPatch.preparedWindowTokens = patch.contextBudgetTokens - this.maxTokens;
+        nextContextTarget = patch.contextBudgetTokens;
+      }
+    }
+
+    if (Object.keys(hotPatch).length > 0) {
+      this.updateHotContextSettings(hotPatch);
+    }
+    this.contextBudgetTokens = nextContextBudget;
+    this.contextBudgetTargetTokens = nextContextTarget;
+    if (appliedDefaultPace) {
+      this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
+    }
+    for (const [key, value] of Object.entries(patch)) {
+      if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, number>)[key] = value;
+    }
+    return this.getRuntimeSettings();
+  }
+
+  resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens']);
+    let nextContextBudget = this.contextBudgetTokens;
+    let nextContextTarget = this.contextBudgetTargetTokens;
+    const hotPatch: {
+      tailTokens?: number;
+      transitionPaceTokens?: number | null;
+      preparedWindowTokens?: number | null;
+    } = {};
+
+    if (reset.has('contextBudgetTokens')) {
+      const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      if (configured < live) {
+        const hot = this.getHotContextSettings();
+        if (!hot) throw new Error('The active context strategy cannot prepare a smaller window live');
+        hotPatch.preparedWindowTokens = configured - this.maxTokens;
+        if (hot.transitionPaceTokens === undefined) {
+          hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
+        }
+        nextContextTarget = configured;
+      } else {
+        nextContextBudget = this.configuredContextBudgetTokens;
+        nextContextTarget = undefined;
+        if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
+      }
+    }
+    if (reset.has('tailTokens')) {
+      if (this.configuredTailTokens !== undefined) hotPatch.tailTokens = this.configuredTailTokens;
+    }
+    if (reset.has('transitionPaceTokens') && this.getHotContextSettings()) {
+      hotPatch.transitionPaceTokens =
+        nextContextTarget !== undefined && this.configuredTransitionPaceTokens === undefined
+          ? DEFAULT_TRANSITION_PACE_TOKENS
+          : this.configuredTransitionPaceTokens ?? null;
+    }
+    if (Object.keys(hotPatch).length > 0) this.updateHotContextSettings(hotPatch);
+    this.contextBudgetTokens = nextContextBudget;
+    this.contextBudgetTargetTokens = nextContextTarget;
+    if (reset.has('contextBudgetTokens')) delete this.runtimeSettingsOverrides.contextBudgetTokens;
+    if (reset.has('tailTokens')) delete this.runtimeSettingsOverrides.tailTokens;
+    if (reset.has('transitionPaceTokens')) {
+      delete this.runtimeSettingsOverrides.transitionPaceTokens;
+    }
+    return this.getRuntimeSettings();
+  }
+
+  cancelRuntimeSettingsTransition(): AgentRuntimeSettingsSnapshot {
+    if (this.contextBudgetTargetTokens !== undefined) {
+      this.updateHotContextSettings({ preparedWindowTokens: null });
+      this.contextBudgetTargetTokens = undefined;
+      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      if (live === (this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)) {
+        delete this.runtimeSettingsOverrides.contextBudgetTokens;
+      } else {
+        this.runtimeSettingsOverrides.contextBudgetTokens = live;
+      }
+    }
+    return this.getRuntimeSettings();
+  }
+
+  restoreRuntimeSettings(overrides: AgentRuntimeSettingsOverrides): AgentRuntimeSettingsSnapshot {
+    return this.updateRuntimeSettings(overrides);
+  }
+
+  private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
+    if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
+    if (patch.contextBudgetTokens !== undefined) {
+      if (!Number.isSafeInteger(patch.contextBudgetTokens) || patch.contextBudgetTokens <= this.maxTokens) {
+        throw new Error(`contextBudgetTokens must be a safe integer greater than max response tokens (${this.maxTokens})`);
+      }
+    }
+    if (patch.tailTokens !== undefined &&
+        (!Number.isSafeInteger(patch.tailTokens) || patch.tailTokens < 0)) {
+      throw new Error('tailTokens must be a non-negative safe integer');
+    }
+    if (patch.transitionPaceTokens !== undefined &&
+        (!Number.isSafeInteger(patch.transitionPaceTokens) || patch.transitionPaceTokens <= 0)) {
+      throw new Error('transitionPaceTokens must be a positive safe integer');
+    }
+    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
+        !this.getHotContextSettings()) {
+      throw new Error('The active context strategy does not support live tail/transition settings');
+    }
+  }
+
+  private settleRuntimeSettingsTransition(): void {
+    if (this.contextBudgetTargetTokens === undefined) return;
+    const hot = this.getHotContextSettings();
+    if (!hot?.prepared) return;
+    this.contextBudgetTokens = this.contextBudgetTargetTokens;
+    this.contextBudgetTargetTokens = undefined;
+    this.updateHotContextSettings({ preparedWindowTokens: null });
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    return this.contextManager.compile(this.resolveBudget(budget));
+    const result = await this.contextManager.compile(this.resolveBudget(budget));
+    if (!budget) this.settleRuntimeSettingsTransition();
+    return result;
   }
 
   /**
@@ -161,7 +378,9 @@ export class Agent {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    return this.contextManager.compile(this.resolveBudget(budget), injections);
+    const result = await this.contextManager.compile(this.resolveBudget(budget), injections);
+    if (!budget) this.settleRuntimeSettingsTransition();
+    return result;
   }
 
   // ==========================================================================

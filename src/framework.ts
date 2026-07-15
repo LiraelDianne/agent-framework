@@ -44,6 +44,9 @@ import type {
   ContextMaintenanceRun,
   ContextMaintenanceAgentRun,
   ContextMaintenanceSnapshot,
+  AgentRuntimeSettingsPatch,
+  AgentRuntimeSettingsOverrides,
+  AgentRuntimeSettingsSnapshot,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -1020,10 +1023,49 @@ export class AgentFramework {
           AgentFramework.EVENT_TAGS_TOOL,
         ]
       : [];
-    if (this.mcplTools.length === 0 && channelTools.length === 0 && gateTools.length === 0) {
-      return moduleTools;
-    }
-    return [...moduleTools, ...this.mcplTools, ...channelTools, ...gateTools];
+    return [
+      ...moduleTools,
+      ...this.mcplTools,
+      ...channelTools,
+      ...gateTools,
+      AgentFramework.AGENT_SETTINGS_TOOL,
+    ];
+  }
+
+  getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    return agent.getRuntimeSettings();
+  }
+
+  updateAgentRuntimeSettings(
+    agentName: string,
+    patch: AgentRuntimeSettingsPatch,
+  ): AgentRuntimeSettingsSnapshot {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const result = agent.updateRuntimeSettings(patch);
+    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    return result;
+  }
+
+  resetAgentRuntimeSettings(
+    agentName: string,
+    keys?: Array<keyof AgentRuntimeSettingsPatch>,
+  ): AgentRuntimeSettingsSnapshot {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const result = agent.resetRuntimeSettings(keys);
+    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    return result;
+  }
+
+  cancelAgentRuntimeSettingsTransition(agentName: string): AgentRuntimeSettingsSnapshot {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const result = agent.cancelRuntimeSettingsTransition();
+    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    return result;
   }
 
   /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
@@ -1223,6 +1265,33 @@ export class AgentFramework {
     } catch {
       // Non-fatal — usage tracking is best-effort
     }
+  }
+
+  private readAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsOverrides | null {
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
+        agentRuntimeSettings?: Record<string, AgentRuntimeSettingsOverrides>;
+      } | null;
+      const stored = data?.agentRuntimeSettings?.[agentName];
+      return stored ? { ...stored } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private persistAgentRuntimeSettings(
+    agentName: string,
+    overrides: AgentRuntimeSettingsOverrides,
+  ): void {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    const all = {
+      ...((state.agentRuntimeSettings as Record<string, AgentRuntimeSettingsOverrides> | undefined) ?? {}),
+    };
+    if (Object.keys(overrides).length === 0) delete all[agentName];
+    else all[agentName] = { ...overrides };
+    state.agentRuntimeSettings = all;
+    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
   /**
@@ -1562,6 +1631,31 @@ export class AgentFramework {
       'gate (gate.js). Use these tag names in gate.json policies (tagsAny / ' +
       'tagsAll / tagsNone) or in gate.js.',
     inputSchema: { type: 'object' },
+  };
+
+  private static readonly AGENT_SETTINGS_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'agent_settings',
+    description:
+      'Read or change your hot runtime settings. This intentionally exposes only ' +
+      'context budget, recent raw tail size, and transition pace; model, prompts, ' +
+      'folding strategy, and other restart-bound configuration are not mutable here. ' +
+      'Lower context budgets converge gradually under the transition pace before ' +
+      'becoming the hard live limit; increases take effect immediately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'update', 'reset', 'cancel'] },
+        context_budget_tokens: { type: 'number', description: 'Total input context budget, including the reserved response allowance.' },
+        tail_tokens: { type: 'number', description: 'Recent raw context retained verbatim.' },
+        transition_pace_tokens: { type: 'number', description: 'Maximum ordinary KV re-read/perturbation per compile while converging.' },
+        settings: {
+          type: 'array',
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens'] },
+          description: 'For reset: settings to restore to recipe values. Omit to reset all.',
+        },
+      },
+      required: ['action'],
+    },
   };
 
   /** Reserved chat:* core vocabulary (MCPL RFC-001 §4) — short descriptions so
@@ -2632,6 +2726,8 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    const restoredSettings = this.readAgentRuntimeSettings(config.name);
+    if (restoredSettings) agent.restoreRuntimeSettings(restoredSettings);
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
 
@@ -4574,6 +4670,12 @@ export class AgentFramework {
       return;
     }
 
+    // Route the agent's typed, allowlisted hot-settings surface.
+    if (enrichedCall.name === 'agent_settings') {
+      this.dispatchAgentSettingsToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route gate_status tool
     if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
@@ -6123,6 +6225,88 @@ export class AgentFramework {
         timeZone: this.timeZone,
       },
       endTurn: true,
+    });
+  }
+
+  private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({
+      type: 'tool:started',
+      module: 'agent',
+      tool: call.name,
+      callId: call.id,
+      input: call.input,
+    });
+    let result: ToolResult;
+    try {
+      const input = (call.input ?? {}) as {
+        action?: unknown;
+        context_budget_tokens?: unknown;
+        tail_tokens?: unknown;
+        transition_pace_tokens?: unknown;
+        settings?: unknown;
+      };
+      switch (input.action) {
+        case 'get':
+          result = { success: true, data: this.getAgentRuntimeSettings(agentName) };
+          break;
+        case 'cancel':
+          result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
+          break;
+        case 'update': {
+          const patch: AgentRuntimeSettingsPatch = {};
+          if (input.context_budget_tokens !== undefined) {
+            patch.contextBudgetTokens = Number(input.context_budget_tokens);
+          }
+          if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
+          if (input.transition_pace_tokens !== undefined) {
+            patch.transitionPaceTokens = Number(input.transition_pace_tokens);
+          }
+          result = { success: true, data: this.updateAgentRuntimeSettings(agentName, patch) };
+          break;
+        }
+        case 'reset': {
+          let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
+          if (input.settings !== undefined) {
+            if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
+            const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
+              context_budget_tokens: 'contextBudgetTokens',
+              tail_tokens: 'tailTokens',
+              transition_pace_tokens: 'transitionPaceTokens',
+            };
+            keys = input.settings.map((name) => {
+              if (typeof name !== 'string' || !names[name]) {
+                throw new Error(`Unknown reset setting: ${String(name)}`);
+              }
+              return names[name];
+            });
+          }
+          result = { success: true, data: this.resetAgentRuntimeSettings(agentName, keys) };
+          break;
+        }
+        default:
+          throw new Error('agent_settings: action must be get, update, reset, or cancel');
+      }
+    } catch (error) {
+      result = {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+    this.emitTrace({
+      type: result.isError ? 'tool:failed' : 'tool:completed',
+      module: 'agent',
+      tool: call.name,
+      callId: call.id,
+      durationMs: 0,
+      ...(result.isError ? { error: result.error } : {}),
+    });
+    this.pushEvent({
+      type: 'tool-result',
+      callId: call.id,
+      agentName,
+      moduleName: 'agent',
+      result,
     });
   }
 

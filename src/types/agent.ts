@@ -107,6 +107,24 @@ export interface AgentConfig {
   };
 }
 
+/** The intentionally small set of agent settings that may change in-process. */
+export interface AgentRuntimeSettingsPatch {
+  contextBudgetTokens?: number;
+  tailTokens?: number;
+  transitionPaceTokens?: number;
+}
+
+export interface AgentRuntimeSettingsSnapshot {
+  contextBudgetTokens: number;
+  tailTokens?: number;
+  transitionPaceTokens?: number;
+  transition: 'stable' | 'converging' | 'blocked';
+  transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
+}
+
+/** Persisted values differ from recipe defaults; omitted keys inherit config. */
+export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch;
+
 /**
  * Result of running inference.
  */
