@@ -101,7 +101,10 @@ export {
 } from './recovery/discord-awareness-outbox.js';
 export type {
   DiscordAwarenessBatch,
+  DiscordAwarenessEntry,
+  DiscordAwarenessOperation,
   DiscordAwarenessRef,
+  DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {

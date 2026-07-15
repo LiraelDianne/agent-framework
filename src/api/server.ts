@@ -468,6 +468,10 @@ export class ApiServer {
     store.switchBranch(params.name);
     this.currentBranch = params.name;
 
+    // Reversible Discord awareness markers are part of the branch projection.
+    // Do not acknowledge the switch until add/remove operations were attempted.
+    await this.framework.syncDiscordAwarenessMarkers();
+
     // Materialize config files from the new branch
     const ws = this.framework.getModule('workspace');
     if (ws && 'materializeMount' in ws) {
@@ -511,7 +515,7 @@ export class ApiServer {
   // Undo/Redo Commands
   // ==========================================================================
 
-  private cmdUndo(params: { agentName: string }): unknown {
+  private async cmdUndo(params: { agentName: string }): Promise<unknown> {
     if (!params.agentName) {
       throw new Error('agentName is required');
     }
@@ -520,6 +524,7 @@ export class ApiServer {
 
     if (result.undone) {
       this.currentBranch = result.toBranch!;
+      await this.framework.syncDiscordAwarenessMarkers();
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -530,7 +535,7 @@ export class ApiServer {
     return result;
   }
 
-  private cmdRedo(params: { agentName: string }): unknown {
+  private async cmdRedo(params: { agentName: string }): Promise<unknown> {
     if (!params.agentName) {
       throw new Error('agentName is required');
     }
@@ -539,6 +544,7 @@ export class ApiServer {
 
     if (result.redone) {
       this.currentBranch = result.toBranch!;
+      await this.framework.syncDiscordAwarenessMarkers();
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

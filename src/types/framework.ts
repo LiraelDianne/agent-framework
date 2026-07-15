@@ -49,6 +49,9 @@ export interface FrameworkConfig {
    */
   discordAwarenessOutboxPath?: string;
 
+  /** Emoji used for branch-awareness markers (default: 💤). */
+  discordAwarenessEmoji?: string;
+
   /** Or existing store (app-owned) */
   store?: JsStore;
 

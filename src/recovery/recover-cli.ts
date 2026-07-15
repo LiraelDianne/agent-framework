@@ -6,6 +6,7 @@ interface CliOptions {
   storePath?: string;
   agentName?: string;
   messageId?: string;
+  contextId?: string;
   messages?: number;
   suppressMessageIds: string[];
   suppressRanges: Array<{ fromMessageId: string; toMessageId: string }>;
@@ -19,7 +20,7 @@ interface CliOptions {
 
 function usage(): string {
   return `Usage:
-  agent-framework-recover --store <path> --agent <name> --message-id <discord-id> [options]
+  agent-framework-recover --store <path> --agent <name> <anchor> [options]
 
 Creates and activates a Chronicle recovery branch while the normal host is down,
 then queues Discord reactions for addressable messages removed from awareness.
@@ -27,6 +28,7 @@ Message content is never compiled or written to the recovery outbox.
 
 Options:
   --message-id <id|link>      Last Discord message the agent should still see
+  --context-id <internal-id>  Exact internal context message to retain as anchor
   --messages <count>          Legacy alternative: remove N context entries
   --suppress <id|link>        Suppress one Discord message; repeat or comma-separate
   --suppress-range <a>..<b>   Suppress an inclusive context range; repeatable
@@ -55,6 +57,7 @@ function parseArgs(args: string[]): CliOptions {
       case '--agent': options.agentName = value(); break;
       case '--message-id':
       case '--message': options.messageId = value(); break;
+      case '--context-id': options.contextId = value(); break;
       case '--messages': options.messages = Number(value()); break;
       case '--suppress':
       case '--suppress-message':
@@ -90,14 +93,19 @@ function parseArgs(args: string[]): CliOptions {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  if (!options.storePath || !options.agentName || (!options.messageId && options.messages === undefined)) {
-    throw new Error(`--store, --agent, and either --message-id or --messages are required\n\n${usage()}`);
+  if (
+    !options.storePath
+    || !options.agentName
+    || (!options.messageId && !options.contextId && options.messages === undefined)
+  ) {
+    throw new Error(`--store, --agent, and one anchor (--message-id, --context-id, or --messages) are required\n\n${usage()}`);
   }
 
   const result = await createOfflineRecoveryBranch({
     storePath: options.storePath,
     agentName: options.agentName,
     messageId: options.messageId,
+    contextId: options.contextId,
     messages: options.messages,
     suppressMessageIds: options.suppressMessageIds,
     suppressRanges: options.suppressRanges,

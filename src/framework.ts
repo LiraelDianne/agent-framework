@@ -108,6 +108,7 @@ import type {
 import type { ContextInjection } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 import {
+  DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
@@ -147,6 +148,11 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
+}
+
+function isPermanentDiscordReactionFailure(message: string): boolean {
+  return /unknown message|unknown channel|missing access|missing permissions|missing permission|cannot access|channel .* not found|message .* not found/i
+    .test(message);
 }
 
 /**
@@ -453,8 +459,11 @@ export class AgentFramework {
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
+  private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<void>> = new Map();
+  /** Reconnect traffic waits for the marker reconciliation started by that reconnect. */
+  private discordAwarenessBarriers: Map<string, Promise<void>> = new Map();
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
@@ -476,6 +485,7 @@ export class AgentFramework {
     processLoggingBroadcast: boolean,
     timeZone: string,
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
+    discordAwarenessEmoji: string,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -488,6 +498,7 @@ export class AgentFramework {
     this.processLoggingBroadcast = processLoggingBroadcast;
     this.timeZone = timeZone;
     this.discordAwarenessOutbox = discordAwarenessOutbox;
+    this.discordAwarenessEmoji = discordAwarenessEmoji;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -587,6 +598,7 @@ export class AgentFramework {
       processLoggingBroadcast,
       resolveTimeZone(config.timeZone),
       discordAwarenessOutbox,
+      config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
     );
 
     // If an offline recovery process crashed after switching Chronicle but
@@ -596,6 +608,7 @@ export class AgentFramework {
       try {
         const activated = discordAwarenessOutbox.activatePreparedForBranch(
           store.currentBranch().name,
+          store.listBranches(),
         );
         if (activated > 0) {
           console.error(
@@ -619,6 +632,10 @@ export class AgentFramework {
     for (const agentConfig of config.agents) {
       await framework.createAgent(agentConfig);
     }
+
+    // Finish any branch-local suppression interrupted after Chronicle switched
+    // branches. This runs before modules, MCPL connections, or inbound traffic.
+    await framework.resumePreparedDiscordSuppressions();
 
     // Add modules
     for (const module of config.modules) {
@@ -2153,17 +2170,13 @@ export class AgentFramework {
         sourceBranch,
         targetBranch,
         refs: removedRefs,
+        emoji: this.discordAwarenessEmoji,
       }) ?? null;
 
       const branchName = cm.branchAt(target.id, targetBranch);
       await cm.switchBranch(branchName);
       if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-
-      // Best-effort now; the durable batch remains until every successful
-      // reaction is acknowledged, and reconnect/startup retry it otherwise.
-      for (const server of new Set(removedRefs.map((ref) => ref.serverId))) {
-        void this.drainDiscordAwarenessOutbox(server);
-      }
+      await this.syncDiscordAwarenessMarkers();
 
       // Materialize config files from the new branch (fire-and-forget; gate
       // picks up via mtime) — mirrors undoLastTurn.
@@ -2211,6 +2224,8 @@ export class AgentFramework {
     if (undone === 0) {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
+
+    await this.syncDiscordAwarenessMarkers();
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -5502,11 +5517,55 @@ export class AgentFramework {
     await this.refreshMcplTools();
   }
 
+  /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
+  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+    if (!this.discordAwarenessOutbox) return;
+    this.discordAwarenessOutbox.reconcileForBranch(
+      this.store.currentBranch().name,
+      this.store.listBranches(),
+    );
+    const serverIds = onlyServerId
+      ? [onlyServerId]
+      : [...new Set(this.discordAwarenessOutbox.pending().map((operation) => operation.ref.serverId))];
+    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
+  }
+
+  private async resumePreparedDiscordSuppressions(): Promise<void> {
+    if (!this.discordAwarenessOutbox) return;
+    const batches = this.discordAwarenessOutbox.preparedSuppressionsForBranch(
+      this.store.currentBranch().name,
+      this.store.listBranches(),
+    );
+    for (const batch of batches) {
+      const agent = this.agents.get(batch.agentName);
+      if (!agent) {
+        throw new Error(
+          `Cannot resume Discord suppression ${batch.id}: agent ${batch.agentName} is not configured`,
+        );
+      }
+      const cm = agent.getContextManager();
+      for (const interval of [...(batch.suppressionIntervals ?? [])].reverse()) {
+        const from = cm.getMessage(interval.fromId as MessageId);
+        const to = cm.getMessage(interval.toId as MessageId);
+        if (!from && !to) continue; // This interval committed before the crash.
+        if (!from || !to) {
+          throw new Error(
+            `Cannot safely resume Discord suppression ${batch.id}: interval ` +
+              `${interval.fromId}..${interval.toId} is only partially present`,
+          );
+        }
+        if (interval.fromId === interval.toId) cm.removeMessage(from.id);
+        else cm.removeMessages(from.id, to.id);
+      }
+      this.discordAwarenessOutbox.activate(batch.id);
+      console.error(`[discord-awareness] resumed suppression batch ${batch.id}`);
+    }
+  }
+
   /**
-   * Deliver branch-awareness reactions queued while Discord or the host was
-   * unavailable. Successful refs are acknowledged one-by-one; a crash or
-   * transport failure therefore retries only the unacknowledged suffix, and
-   * Discord's same-bot same-emoji reaction is idempotent.
+   * Deliver every due ref independently. Permanent Discord failures are kept
+   * in the ledger for audit but do not block later operations; retryable
+   * failures remain pending for the next reconnect/list-change attempt.
    */
   private drainDiscordAwarenessOutbox(serverId: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return Promise.resolve();
@@ -5518,41 +5577,61 @@ export class AgentFramework {
       if (!connection?.isConnected) return;
 
       let delivered = 0;
-      try {
-        const batches = this.discordAwarenessOutbox!.pending(serverId);
-        for (const batch of batches) {
-          for (const ref of batch.refs) {
-            // MCPL Discord channel ids are `discord:<guild|dm>:<rawId>`;
-            // add_reaction takes the raw Discord channel/thread id.
-            const channelId = ref.channelId.startsWith('discord:')
-              ? ref.channelId.split(':').at(-1)!
-              : ref.channelId;
-            const result = await connection.sendToolsCall('add_reaction', {
+      let failed = 0;
+      const attempted = new Set<string>();
+      while (true) {
+        const operations = this.discordAwarenessOutbox!.pending(serverId).filter((operation) => {
+          const key = `${operation.batchId}\0${operation.ref.channelId}\0${operation.ref.messageId}\0${operation.action}`;
+          if (attempted.has(key)) return false;
+          attempted.add(key);
+          return true;
+        });
+        if (operations.length === 0) break;
+        for (const operation of operations) {
+          const ref = operation.ref;
+          const channelId = ref.channelId.startsWith('discord:')
+            ? ref.channelId.split(':').at(-1)!
+            : ref.channelId;
+          try {
+            const tool = operation.action === 'add' ? 'add_reaction' : 'remove_reaction';
+            const result = await connection.sendToolsCall(tool, {
               channelId,
               messageId: ref.messageId,
-              emoji: batch.emoji,
+              emoji: operation.emoji,
             });
             if (result.isError) {
               throw new Error(
                 result.content.map((content) => content.text ?? '').filter(Boolean).join('; ')
-                  || 'Discord add_reaction returned an error',
+                  || `Discord ${tool} returned an error`,
               );
             }
-            this.discordAwarenessOutbox!.acknowledge(batch.id, ref);
+            this.discordAwarenessOutbox!.recordSuccess(
+              operation.batchId,
+              ref,
+              operation.action,
+            );
             delivered++;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const permanent = isPermanentDiscordReactionFailure(message);
+            this.discordAwarenessOutbox!.recordFailure(
+              operation.batchId,
+              ref,
+              operation.action,
+              message,
+              permanent,
+            );
+            failed++;
+            console.error(
+              `[discord-awareness] ${operation.action} failed for ${ref.channelId}/${ref.messageId}` +
+                ` (${permanent ? 'permanent' : 'retryable'}): ${message}`,
+            );
           }
         }
-        if (delivered > 0) {
-          console.error(
-            `[discord-awareness] marked ${delivered} message(s) removed from active awareness via ${serverId}`,
-          );
-        }
-      } catch (error) {
-        // Leave the failing ref and remaining batches in the outbox. The next
-        // reconnect/startup (or online undo) retries them.
+      }
+      if (delivered > 0 || failed > 0) {
         console.error(
-          `[discord-awareness] delivery via ${serverId} paused after ${delivered} message(s):`,
-          error instanceof Error ? error.message : error,
+          `[discord-awareness] ${serverId}: delivered=${delivered} failed=${failed}`,
         );
       }
     })().finally(() => {
@@ -5561,6 +5640,22 @@ export class AgentFramework {
 
     this.discordAwarenessDrains.set(serverId, drain);
     return drain;
+  }
+
+  private beginDiscordAwarenessBarrier(serverId: string): Promise<void> {
+    const barrier = this.syncDiscordAwarenessMarkers(serverId);
+    this.discordAwarenessBarriers.set(serverId, barrier);
+    const cleanup = () => {
+      if (this.discordAwarenessBarriers.get(serverId) === barrier) {
+        this.discordAwarenessBarriers.delete(serverId);
+      }
+    };
+    void barrier.then(cleanup, cleanup);
+    return barrier;
+  }
+
+  private async waitForDiscordAwarenessBarrier(serverId: string): Promise<void> {
+    await this.discordAwarenessBarriers.get(serverId);
   }
 
   /**
@@ -5593,18 +5688,15 @@ export class AgentFramework {
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
 
-    // Wire event listeners then flush any events that arrived during the
-    // handshake window (between setupMessageRouting and now).
+    // Wire listeners, but do not release events buffered during the handshake
+    // until branch-awareness markers have been reconciled and attempted.
     this.wireMcplEvents(connection);
-    connection.ready();
 
     // Initialize feature sets if server advertises MCPL capabilities
     this.registerMcplServerFeatures(config, connection);
 
-    // The Discord bot may have been down when an offline recovery branch was
-    // created. Drain only this server's durable marker work now that its MCP
-    // tools are reachable.
-    void this.drainDiscordAwarenessOutbox(config.id);
+    await this.beginDiscordAwarenessBarrier(config.id);
+    connection.ready();
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
@@ -5819,10 +5911,11 @@ export class AgentFramework {
     });
 
     // Handle push events (Step 6)
-    connection.on('push-event', (
+    connection.on('push-event', async (
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      await this.waitForDiscordAwarenessBarrier(connection.id);
       this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
@@ -5832,6 +5925,7 @@ export class AgentFramework {
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (this.inferenceRouter && responder) {
+        await this.waitForDiscordAwarenessBarrier(connection.id);
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
           respondError: responder.respondError,
@@ -5854,10 +5948,11 @@ export class AgentFramework {
     });
 
     // Handle incoming channel messages (Step 7)
-    connection.on('channels-incoming', (
+    connection.on('channels-incoming', async (
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
+      await this.waitForDiscordAwarenessBarrier(connection.id);
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -5868,6 +5963,7 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
+        await this.waitForDiscordAwarenessBarrier(connection.id);
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
       } catch (error) {
@@ -5879,7 +5975,12 @@ export class AgentFramework {
     // Handle dynamic tool list changes (notifications/tools/list_changed)
     connection.on('tools-list-changed', () => {
       this.handleToolsListChanged(connection.id);
-      void this.drainDiscordAwarenessOutbox(connection.id);
+      void this.beginDiscordAwarenessBarrier(connection.id).catch((error) => {
+        console.error(
+          `[discord-awareness] tools-list reconciliation failed for ${connection.id}:`,
+          error instanceof Error ? error.message : error,
+        );
+      });
     });
 
     // Re-establish full server registration on reconnect. The 'close' handler
@@ -5890,6 +5991,9 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
+      // Install the barrier synchronously so any inbound event emitted after
+      // reconnect observes it before doing work that could wake an agent.
+      const awarenessBarrier = this.beginDiscordAwarenessBarrier(connection.id);
       try {
         const config = this.mcplServerConfigs.get(connection.id);
         if (config) {
@@ -5902,15 +6006,21 @@ export class AgentFramework {
         );
       }
       this.handleToolsListChanged(connection.id);
-      void this.drainDiscordAwarenessOutbox(connection.id);
-      this.emitTrace({
-        type: 'mcpl:server-reconnected',
-        serverId: connection.id,
-        attempts: info?.attempts ?? 0,
+      void awarenessBarrier.then(() => {
+        this.emitTrace({
+          type: 'mcpl:server-reconnected',
+          serverId: connection.id,
+          attempts: info?.attempts ?? 0,
+        });
+        // Mirror the module:removed emitted on 'close' so module-lifecycle
+        // consumers see the server come back, not just vanish.
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
+      }).catch((error) => {
+        console.error(
+          `[discord-awareness] reconnect reconciliation failed for ${connection.id}:`,
+          error instanceof Error ? error.message : error,
+        );
       });
-      // Mirror the module:removed emitted on 'close' so module-lifecycle
-      // consumers see the server come back, not just vanish.
-      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
     });
 
     // Surface connect/reconnect failures. Before these traces existed the

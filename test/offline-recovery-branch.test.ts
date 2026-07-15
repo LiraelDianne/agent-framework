@@ -55,8 +55,8 @@ test('offline recovery branches without compiling and queues discarded Discord r
     const batches = new DiscordAwarenessOutbox(
       defaultDiscordAwarenessOutboxPath(storePath),
     ).pending('discord');
-    assert.equal(batches.length, 1);
-    assert.deepEqual(batches[0].refs.map((ref) => ref.messageId), ['m-toxic-1', 'm-toxic-2']);
+    assert.equal(batches.length, 2);
+    assert.deepEqual(batches.map((operation) => operation.ref.messageId), ['m-toxic-1', 'm-toxic-2']);
 
     // The outbox is metadata-only: quarantined text must never leak to it.
     const rawOutbox = await import('node:fs').then(({ readFileSync }) =>
@@ -180,10 +180,89 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
     const batches = new DiscordAwarenessOutbox(
       defaultDiscordAwarenessOutboxPath(storePath),
     ).pending('discord');
-    assert.equal(batches.length, 1);
+    assert.equal(batches.length, 3);
     assert.deepEqual(
-      batches[0].refs.map((ref) => ref.messageId),
+      batches.map((operation) => operation.ref.messageId),
       ['m-from', 'm-inside', 'm-to'],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('offline recovery accepts an exact internal context ID anchor', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-context-id-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'prompt' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-prompt',
+    });
+    const coherentAssistantId = cm.addMessage('assistant', [{ type: 'text', text: 'safe answer' }]);
+    cm.addMessage('user', [{ type: 'text', text: 'poison' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-poison',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      contextId: String(coherentAssistantId),
+      branchName: 'recovery/cairn/internal-anchor',
+    });
+
+    assert.equal(result.messagesRemoved, 1);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-poison']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({
+      store: recoveredStore,
+      namespace: 'agents/cairn',
+    });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.participant),
+      ['user', 'assistant'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('suppression rejects a range that splits a tool exchange', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-tool-integrity-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'range start' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-from',
+    });
+    cm.addMessage('assistant', [
+      { type: 'tool_use', id: 'tool-1', name: 'shell', input: {} },
+    ]);
+    cm.addMessage('user', [{ type: 'text', text: 'range end' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-to',
+    });
+    cm.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'tool-1', content: 'result' },
+    ]);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath,
+        agentName: 'cairn',
+        messageId: 'm-current',
+        suppressRanges: [{ fromMessageId: 'm-from', toMessageId: 'm-to' }],
+      }),
+      /split tool exchange tool-1/,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

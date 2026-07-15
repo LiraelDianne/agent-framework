@@ -13,6 +13,8 @@ export interface OfflineRecoveryBranchOptions {
   agentName: string;
   /** Preferred: Discord message that remains as the last visible anchor. */
   messageId?: string;
+  /** Exact internal ContextManager message ID that remains as the anchor. */
+  contextId?: string;
   /** Backward-compatible alternative: remove the newest N context entries. */
   messages?: number;
   /** Exact Discord messages to suppress on the new branch. */
@@ -50,8 +52,11 @@ export interface OfflineRecoveryBranchResult {
 export async function createOfflineRecoveryBranch(
   options: OfflineRecoveryBranchOptions,
 ): Promise<OfflineRecoveryBranchResult> {
-  if (!!options.messageId === (options.messages !== undefined)) {
-    throw new Error('Specify exactly one of messageId or messages');
+  const anchorCount = Number(!!options.messageId)
+    + Number(!!options.contextId)
+    + Number(options.messages !== undefined);
+  if (anchorCount !== 1) {
+    throw new Error('Specify exactly one of messageId, contextId, or messages');
   }
   const count = options.messages === undefined ? undefined : Math.floor(options.messages);
   if (count !== undefined && (!Number.isFinite(count) || count < 1)) {
@@ -99,6 +104,20 @@ export async function createOfflineRecoveryBranch(
         total,
         options.discordServerId,
       );
+    } else if (options.contextId) {
+      const located = findInternalMessageFromTail(contextManager, total, options.contextId.trim());
+      if (!located) {
+        throw new Error(`Internal context message ${options.contextId} was not found.`);
+      }
+      target = located.message;
+      targetIndex = located.index;
+      removedCount = total - located.index - 1;
+      refs = collectDiscordRefs(
+        contextManager,
+        located.index + 1,
+        total,
+        options.discordServerId,
+      );
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
@@ -116,12 +135,27 @@ export async function createOfflineRecoveryBranch(
       refs = extractDiscordAwarenessRefs(discarded, options.discordServerId);
     }
 
+    validateAnchorBoundary(contextManager, targetIndex, total, target);
+
     const suppression = buildSuppressionPlan(
       contextManager,
       targetIndex,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
       options.discordServerId,
+    );
+    validateRemovalIntegrity(
+      contextManager,
+      total,
+      [
+        ...(removedCount > 0 ? [{
+          start: targetIndex + 1,
+          end: total - 1,
+          fromId: '',
+          toId: '',
+        }] : []),
+        ...suppression.intervals,
+      ],
     );
     refs = dedupeDiscordRefs([...refs, ...suppression.refs]);
 
@@ -157,6 +191,10 @@ export async function createOfflineRecoveryBranch(
       // suppressions finished. Only the recovery operation may activate this
       // batch after every removal below succeeds.
       activationPolicy: suppression.intervals.length > 0 ? 'explicit' : 'target-branch',
+      suppressionIntervals: suppression.intervals.map((interval) => ({
+        fromId: String(interval.fromId),
+        toId: String(interval.toId),
+      })),
     });
 
     // branchAt uses the target message's origin sequence. No message content is
@@ -232,6 +270,97 @@ function findDiscordMessageFromTail(
     end = start;
   }
   return null;
+}
+
+function findInternalMessageFromTail(
+  contextManager: ContextManager,
+  total: number,
+  contextId: string,
+): { message: StoredWindowMessage; index: number } | null {
+  let end = total;
+  while (end > 0) {
+    const start = Math.max(0, end - RECOVERY_SCAN_WINDOW);
+    const messages = contextManager.getMessageWindow(start, end - start, {
+      resolveBlobs: false,
+    }).messages;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (String(messages[i].id) === contextId) {
+        return { message: messages[i], index: start + i };
+      }
+    }
+    end = start;
+  }
+  return null;
+}
+
+function validateAnchorBoundary(
+  contextManager: ContextManager,
+  targetIndex: number,
+  total: number,
+  target: StoredWindowMessage,
+): void {
+  const groupId = (target as StoredWindowMessage & { bodyGroupId?: string }).bodyGroupId;
+  if (!groupId || targetIndex + 1 >= total) return;
+  const next = contextManager.getMessageWindow(targetIndex + 1, 1, {
+    resolveBlobs: false,
+  }).messages[0] as (StoredWindowMessage & { bodyGroupId?: string }) | undefined;
+  if (next?.bodyGroupId === groupId) {
+    throw new Error(
+      `Recovery anchor ${String(target.id)} splits body group ${groupId}; choose its final shard.`,
+    );
+  }
+}
+
+function validateRemovalIntegrity(
+  contextManager: ContextManager,
+  total: number,
+  intervals: SuppressionInterval[],
+): void {
+  if (intervals.length === 0) return;
+  const removed = (index: number) => intervals.some((interval) =>
+    index >= interval.start && index <= interval.end);
+  const toolUses = new Map<string, boolean>();
+  const toolResults = new Map<string, boolean>();
+  const groupMembership = new Map<string, boolean>();
+
+  for (let offset = 0; offset < total; offset += RECOVERY_SCAN_WINDOW) {
+    const messages = contextManager.getMessageWindow(
+      offset,
+      Math.min(RECOVERY_SCAN_WINDOW, total - offset),
+      { resolveBlobs: false },
+    ).messages;
+    for (let i = 0; i < messages.length; i++) {
+      const index = offset + i;
+      const isRemoved = removed(index);
+      const message = messages[i] as StoredWindowMessage & { bodyGroupId?: string };
+      if (message.bodyGroupId) {
+        const prior = groupMembership.get(message.bodyGroupId);
+        if (prior !== undefined && prior !== isRemoved) {
+          throw new Error(
+            `Recovery selection splits body group ${message.bodyGroupId}; adjust the anchor or suppression boundary.`,
+          );
+        }
+        groupMembership.set(message.bodyGroupId, isRemoved);
+      }
+      for (const rawBlock of message.content) {
+        const block = rawBlock as { type?: unknown; id?: unknown; toolUseId?: unknown };
+        if (block.type === 'tool_use' && typeof block.id === 'string') {
+          toolUses.set(block.id, isRemoved);
+        } else if (block.type === 'tool_result' && typeof block.toolUseId === 'string') {
+          toolResults.set(block.toolUseId, isRemoved);
+        }
+      }
+    }
+  }
+
+  for (const [toolUseId, useRemoved] of toolUses) {
+    const resultRemoved = toolResults.get(toolUseId);
+    if (resultRemoved !== undefined && resultRemoved !== useRemoved) {
+      throw new Error(
+        `Recovery selection would split tool exchange ${toolUseId}; suppress or retain both tool_use and tool_result.`,
+      );
+    }
+  }
 }
 
 function buildSuppressionPlan(

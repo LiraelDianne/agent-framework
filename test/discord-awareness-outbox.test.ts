@@ -22,7 +22,7 @@ test('extractDiscordAwarenessRefs keeps only direct Discord addressing metadata'
   ]);
 });
 
-test('prepared batches survive restart, activate by branch, and acknowledge per ref', () => {
+test('ledger survives restart and reverses completed markers on source branch', () => {
   const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-outbox-'));
   const path = join(dir, 'outbox.json');
   try {
@@ -44,15 +44,30 @@ test('prepared batches survive restart, activate by branch, and acknowledge per 
     const reopened = new DiscordAwarenessOutbox(path);
     assert.equal(reopened.activatePreparedForBranch('some-other-branch'), 0);
     assert.equal(reopened.activatePreparedForBranch('recovery/cairn/1'), 1);
-    assert.equal(reopened.pending('discord')[0].refs.length, 2);
+    assert.deepEqual(
+      reopened.pending('discord').map((operation) => operation.ref.messageId),
+      ['m1', 'm2'],
+    );
 
-    reopened.acknowledge(batch.id, batch.refs[0]);
-    assert.deepEqual(reopened.pending('discord')[0].refs.map((ref) => ref.messageId), ['m2']);
-    reopened.acknowledge(batch.id, batch.refs[1]);
+    reopened.recordSuccess(batch.id, batch.refs[0], 'add');
+    assert.deepEqual(reopened.pending('discord').map((op) => op.ref.messageId), ['m2']);
+    reopened.recordSuccess(batch.id, batch.refs[1], 'add');
     assert.equal(reopened.pending('discord').length, 0);
 
-    const stored = JSON.parse(readFileSync(path, 'utf8')) as { batches: unknown[] };
-    assert.deepEqual(stored.batches, []);
+    // Completed work remains durable and switching back queues removals.
+    reopened.reconcileForBranch('main');
+    const removals = reopened.pending('discord');
+    assert.deepEqual(removals.map((op) => op.action), ['remove', 'remove']);
+    for (const operation of removals) {
+      reopened.recordSuccess(operation.batchId, operation.ref, operation.action);
+    }
+    assert.equal(reopened.pending('discord').length, 0);
+    assert.equal(reopened.batches().length, 1);
+    assert.ok(reopened.batches()[0].refs.every((ref) => !ref.markerPresent));
+
+    const stored = JSON.parse(readFileSync(path, 'utf8')) as { version: number; batches: unknown[] };
+    assert.equal(stored.version, 2);
+    assert.equal(stored.batches.length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -82,7 +97,52 @@ test('explicit batches are not activated merely because their target branch is c
   }
 });
 
-test('framework drain sends raw Discord addresses and retains failed work', async () => {
+test('framework resumes an interrupted suppression before activating its markers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-resume-'));
+  const path = join(dir, 'outbox.json');
+  try {
+    const outbox = new DiscordAwarenessOutbox(path);
+    const batch = outbox.prepare({
+      agentName: 'cairn',
+      sourceBranch: 'main',
+      targetBranch: 'recovery/cairn/suppressed',
+      activationPolicy: 'explicit',
+      suppressionIntervals: [
+        { fromId: 'i1', toId: 'i2' },
+        { fromId: 'i3', toId: 'i3' },
+      ],
+      refs: [
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' },
+      ],
+    })!;
+    const present = new Set(['i1', 'i2']); // i3 interval committed before crash.
+    const removals: string[] = [];
+    const cm = {
+      getMessage: (id: string) => present.has(id) ? { id } : null,
+      removeMessage: (id: string) => { present.delete(id); removals.push(id); },
+      removeMessages: (from: string, to: string) => {
+        present.delete(from); present.delete(to); removals.push(`${from}..${to}`);
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = outbox;
+    framework.store = {
+      currentBranch: () => ({ name: 'recovery/cairn/suppressed' }),
+      listBranches: () => [],
+    };
+    framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+
+    await framework.resumePreparedDiscordSuppressions();
+
+    assert.deepEqual(removals, ['i1..i2']);
+    assert.equal(outbox.batches().find((candidate) => candidate.id === batch.id)?.status, 'active');
+    assert.deepEqual(outbox.pending('discord').map((operation) => operation.ref.messageId), ['m1']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('framework drain records failures per ref and continues past permanent failures', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-drain-'));
   const path = join(dir, 'outbox.json');
   try {
@@ -94,17 +154,22 @@ test('framework drain sends raw Discord addresses and retains failed work', asyn
       refs: [
         { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' },
         { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm2' },
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm3' },
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm4' },
       ],
     })!;
     outbox.activate(batch.id);
 
     const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
-    let failSecond = true;
+    let retryableFailure = true;
     const connection = {
       isConnected: true,
       sendToolsCall: async (name: string, args: Record<string, unknown>) => {
         calls.push({ name, args });
-        if (args.messageId === 'm2' && failSecond) throw new Error('Discord unavailable');
+        if (args.messageId === 'm2') {
+          return { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] };
+        }
+        if (args.messageId === 'm3' && retryableFailure) throw new Error('Discord unavailable');
         return { content: [{ type: 'text', text: 'Reaction added' }] };
       },
     };
@@ -124,11 +189,26 @@ test('framework drain sends raw Discord addresses and retains failed work', asyn
       name: 'add_reaction',
       args: { channelId: 'c1', messageId: 'm1', emoji: '💤' },
     });
-    assert.deepEqual(outbox.pending('discord')[0].refs.map((ref) => ref.messageId), ['m2']);
+    assert.deepEqual(outbox.pending('discord').map((operation) => operation.ref.messageId), ['m3']);
+    assert.deepEqual(calls.map((call) => call.args.messageId), ['m1', 'm2', 'm3', 'm4']);
+    const entries = outbox.batches()[0].refs;
+    assert.equal(entries.find((entry) => entry.messageId === 'm2')?.deliveryStatus, 'permanent-failure');
+    assert.equal(entries.find((entry) => entry.messageId === 'm3')?.deliveryStatus, 'pending');
+    assert.equal(entries.find((entry) => entry.messageId === 'm4')?.deliveryStatus, 'applied');
 
-    failSecond = false;
+    retryableFailure = false;
     await framework.drainDiscordAwarenessOutbox('discord');
     assert.equal(outbox.pending('discord').length, 0);
+
+    outbox.reconcileForBranch('main');
+    calls.length = 0;
+    await framework.drainDiscordAwarenessOutbox('discord');
+    assert.deepEqual(calls.map((call) => [call.name, call.args.messageId]), [
+      ['remove_reaction', 'm1'],
+      ['remove_reaction', 'm3'],
+      ['remove_reaction', 'm4'],
+    ]);
+    assert.ok(outbox.batches()[0].refs.every((entry) => !entry.markerPresent));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -144,18 +224,26 @@ test('message-granular undo prepares markers before switching branches', async (
       { id: 'i2', metadata: { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm2' } },
     ];
     const calls: string[] = [];
+    let currentBranch = 'main';
     const contextManager = {
       getAllMessages: () => messages,
       branchAt: (_id: string, name: string) => { calls.push(`branch:${name}`); return name; },
-      switchBranch: async (name: string) => { calls.push(`switch:${name}`); },
+      switchBranch: async (name: string) => { calls.push(`switch:${name}`); currentBranch = name; },
     };
     const framework = Object.create(AgentFramework.prototype) as any;
     framework.agents = new Map([['cairn', {
       state: { status: 'idle' },
       getContextManager: () => contextManager,
     }]]);
-    framework.store = { currentBranch: () => ({ name: 'main' }) };
+    framework.store = {
+      currentBranch: () => ({ name: currentBranch }),
+      listBranches: () => [
+        { id: 'b-main', name: 'main' },
+        { id: 'b-undo', name: currentBranch, parentId: 'b-main' },
+      ],
+    };
     framework.discordAwarenessOutbox = new DiscordAwarenessOutbox(path);
+    framework.discordAwarenessEmoji = '🫥';
     framework.discordAwarenessDrains = new Map();
     framework.mcplServerRegistry = null;
     framework.moduleRegistry = { getModule: () => null };
@@ -168,9 +256,12 @@ test('message-granular undo prepares markers before switching branches', async (
     assert.deepEqual(result.removedRefs.map((ref: { messageId: string }) => ref.messageId), ['m1', 'm2']);
     assert.deepEqual(calls.map((call) => call.split('/')[0]), ['branch:undo-msgs', 'switch:undo-msgs']);
     assert.deepEqual(
-      framework.discordAwarenessOutbox.pending('discord')[0].refs.map((ref: { messageId: string }) => ref.messageId),
+      framework.discordAwarenessOutbox.pending('discord').map((operation: { ref: { messageId: string } }) => operation.ref.messageId),
       ['m1', 'm2'],
     );
+    assert.ok(framework.discordAwarenessOutbox.pending('discord').every(
+      (operation: { emoji: string }) => operation.emoji === '🫥',
+    ));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

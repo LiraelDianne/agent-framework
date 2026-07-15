@@ -161,9 +161,20 @@ the new Chronicle branch, and writes only Discord `{serverId, channelId,
 messageId}` metadata to
 `<store>/recovery/discord-awareness-outbox.json`. When the host and that
 agent's `discord-mcpl` bot reconnect, each addressable discarded message is
-marked with 💤. Successful markers are acknowledged individually; failures
-remain queued for the next reconnect. Portal and other non-Discord records are
-ignored.
+marked with 💤. Delivery state is recorded per message: retryable failures
+remain queued, permanent deleted/inaccessible-message failures remain in the
+audit ledger without blocking later markers. Portal and other non-Discord
+records are ignored.
+
+When the safe point is an assistant/tool-side record rather than a Discord
+message, use its exact ContextManager message ID:
+
+```bash
+agent-framework-recover \
+  --store ./data/agent-store \
+  --agent cairn \
+  --context-id 15184
+```
 
 Use `--dry-run` to inspect the proposed branch and message IDs without writing.
 `--message-id` also accepts a Discord message link. The older `--messages N`
@@ -187,10 +198,21 @@ agent-framework-recover \
 between two Discord messages, including intervening agent/tool entries. These
 removals exist only on the recovery branch; the source branch remains intact.
 Suppressed Discord messages are queued for the same 💤 awareness marker.
+Selections that split a sharded body group or a tool-use/tool-result exchange
+are rejected. The suppression plan is journaled before the branch switch; if
+the recovery process is interrupted between interval removals, framework
+startup resumes the remaining atomic intervals before connecting MCPL.
 For old stores whose messages lack `metadata.serverId`, supply
 `--discord-server discord` (or the configured Discord MCPL server id). The
 normal agent host must be stopped while this command has the Chronicle store
 open.
+
+The marker sidecar is a retained operation ledger, not a delete-on-success
+queue. Switching back to the source branch queues removal of the bot's marker;
+returning to the recovery branch queues it again. Initial MCPL events remain
+buffered until the ledger has been reconciled, and reconnect traffic waits on
+the same per-server barrier. Configure the online marker with
+`discordAwarenessEmoji`; the offline CLI accepts `--emoji`.
 
 ### MCPL (MCP Live)
 
