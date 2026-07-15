@@ -365,9 +365,32 @@ describe('debounce', () => {
     assert.strictEqual(messages.length, 1);
     const text = (messages[0].content as Array<{ text: string }>)[0].text;
     assert.ok(text.includes('3 event'));
-    assert.ok(text.includes('[editor]'));
+    // MCPL events (push-event / channel-incoming) are stored in the context
+    // window AT ARRIVAL by the framework, so the batched wake references them
+    // instead of re-quoting — a re-quote minutes later reads as fresh, stale
+    // duplicate input (observed live: Sol's "step was a bit too small" echo).
+    assert.ok(text.includes('already shown above'));
+    assert.ok(!text.includes('edit 1'), 'must not re-quote in-context event content');
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].agentName, 'agent');
+  });
+
+  it('quotes content for non-MCPL events (no context entry of their own)', async () => {
+    const path = writeConfig('debounce-quote.json', {
+      policies: [
+        { name: 'editor', match: { scope: ['module:custom'] }, behavior: { debounce: 150 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+
+    gate.evaluate(event({ content: 'compile finished', eventType: 'module:custom' }));
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.strictEqual(messages.length, 1);
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes('[editor]'));
+    assert.ok(text.includes('compile finished'), 'non-MCPL events carry their content');
   });
 
   it('resets timer on new events', async () => {

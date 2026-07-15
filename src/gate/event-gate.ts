@@ -65,6 +65,13 @@ interface PendingEvent {
   content: string;
   eventType: string;
   timestamp: number;
+  /** The framework stores MCPL event content in the context window AT ARRIVAL
+   *  (channel-incoming and push-event both addMessage before the gate decides
+   *  anything). For those, the debounced wake must NOT re-quote the content —
+   *  a [Gate:] copy delivered minutes later reads as a fresh, stale duplicate
+   *  of a message the agent may have long since handled. */
+  inContext: boolean;
+  channelId?: string;
 }
 
 interface DebounceState {
@@ -1020,6 +1027,8 @@ export class EventGate {
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
+      inContext: info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event',
+      channelId: info.channelId || undefined,
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1067,11 +1076,36 @@ export class EventGate {
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
-    const lines = events
-      .map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`)
-      .join('\n');
 
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines}`;
+    // Events whose content the framework already stored at arrival (MCPL
+    // channel-incoming / push-event) get a compact REFERENCE — re-quoting
+    // them here would inject a duplicate copy of the message minutes after
+    // the fact, reading as fresh input the agent may have already handled.
+    // Only events with no context entry of their own carry their content.
+    const quoted = events.filter(e => !e.inContext);
+    const referenced = events.filter(e => e.inContext);
+
+    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    if (referenced.length > 0) {
+      const byChannel = new Map<string, { count: number; oldest: number }>();
+      for (const e of referenced) {
+        const key = e.channelId ?? '(unknown channel)';
+        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp };
+        entry.count += 1;
+        entry.oldest = Math.min(entry.oldest, e.timestamp);
+        byChannel.set(key, entry);
+      }
+      for (const [channel, { count, oldest }] of byChannel) {
+        const age = Math.round((Date.now() - oldest) / 1000);
+        lines.push(
+          `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
+          `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
+          `batched wake, not new content`,
+        );
+      }
+    }
+
+    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
 
     this.addMessageFn('user', [{ type: 'text', text }], {
       source: 'gate:debounce',
