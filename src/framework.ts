@@ -5107,6 +5107,22 @@ export class AgentFramework {
    *     every ~15 min instead of flooding the channel on every occurrence.
    * See connectome docs/observability.md.
    */
+  /**
+   * Public ops-alert entry point for host-wired alarms that originate
+   * OUTSIDE the framework (e.g. context-manager's repeating
+   * compression-quarantine klaxon, wired in the host at strategy
+   * construction). Same sinks and cooldown as internal alerts:
+   * failures.log + ops:alert trace + CONNECTOME_OPS_WEBHOOK.
+   */
+  notifyOps(
+    kind: string,
+    agentName: string,
+    message: string,
+    data?: Record<string, unknown>,
+  ): void {
+    this.opsAlert(kind, agentName, message, { data });
+  }
+
   private opsAlert(
     kind: string,
     agentName: string,
